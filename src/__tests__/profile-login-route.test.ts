@@ -198,7 +198,7 @@ describe("profile login routes", () => {
       async (input: Parameters<typeof fetch>[0]) => {
         const url = String(input)
         if (url === "https://api.anthropic.com/api/oauth/profile") return Response.json({ organization: { organization_type: "claude_max" } })
-        if (url === "https://api.anthropic.com/api/oauth/usage") {
+        if (url === "https://api.anthropic.com/api/oauth/usage?cedar_ember=1") {
           usageAsked = true
           await usageHeld
           return Response.json({ five_hour: { utilization: 10, resets_at: null } })

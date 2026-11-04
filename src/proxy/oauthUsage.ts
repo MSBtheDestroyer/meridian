@@ -29,6 +29,7 @@ import { parseRetryAfterMs } from "./retryAfter"
 import { createPlatformCredentialStore, refreshOAuthToken, type CredentialStore } from "./tokenRefresh"
 import { followedUsageSnapshot } from "./followUsage"
 import { noteApiRejected, noteProviderAccepted } from "./authLifecycle"
+import { normalizeClaudeResets, type ClaudeResets } from "./claudeResets"
 
 const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 const OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -71,6 +72,7 @@ interface RawOAuthUsageResponse {
   omelette_promotional?: RawOAuthWindow | null
   limits?: RawOAuthLimit[] | null
   extra_usage?: RawOAuthExtraUsage | null
+  cedar_ember?: unknown
 }
 
 export interface OAuthUsageWindow {
@@ -90,6 +92,7 @@ export interface OAuthExtraUsageInfo {
 export interface OAuthUsageSnapshot {
   windows: OAuthUsageWindow[]
   extraUsage: OAuthExtraUsageInfo | null
+  claudeResets?: ClaudeResets | null
   fetchedAt: number
   /** Set when this is a previous snapshot served because a fresh fetch
    *  failed transiently (credential-read blip, upstream error). */
@@ -154,6 +157,7 @@ export interface OAuthUsageResult extends RawUsageResult {
 export interface UsageEntryFields {
   windows: OAuthUsageWindow[]
   extraUsage: OAuthExtraUsageInfo | null
+  claudeResets?: ClaudeResets | null
   fetchedAt: number | null
   /** True when the figures are a previous reading rather than one taken by the
    *  check that just ran. */
@@ -180,6 +184,7 @@ export function toUsageEntry(result: OAuthUsageResult): UsageEntryFields {
   return {
     windows: shown?.windows ?? [],
     extraUsage: shown?.extraUsage ?? null,
+    claudeResets: shown?.claudeResets ?? null,
     fetchedAt: shown?.fetchedAt ?? null,
     stale: shown != null && (result.snapshot === null || result.snapshot.stale === true),
     error: result.error,
@@ -309,7 +314,7 @@ function buildSnapshot(raw: RawOAuthUsageResponse): OAuthUsageSnapshot {
       }
     : null
 
-  return { windows, extraUsage, fetchedAt: Date.now() }
+  return { windows, extraUsage, claudeResets: normalizeClaudeResets(raw.cedar_ember), fetchedAt: Date.now() }
 }
 
 async function readAccessToken(store: CredentialStore): Promise<string | null> {
@@ -375,7 +380,9 @@ async function callAnthropic(
   fetchImpl: FetchLike,
   signal?: AbortSignal,
 ): Promise<RawOAuthUsageResponse | { __status: number; retryAfterMs: number | null }> {
-  const res = await fetchImpl(OAUTH_USAGE_URL, {
+  const url = new URL(OAUTH_USAGE_URL)
+  url.searchParams.set("cedar_ember", "1")
+  const res = await fetchImpl(url.href, {
     headers: {
       Authorization: `Bearer ${token}`,
       "anthropic-beta": OAUTH_BETA_HEADER,
