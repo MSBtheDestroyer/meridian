@@ -16,7 +16,7 @@ import {
   resetFollowedUsage,
   setFollowedUsageForTesting,
 } from "../proxy/followUsage"
-import type { OAuthUsageSnapshot } from "../proxy/oauthUsage"
+import { fetchOAuthUsageResult, resetOAuthUsageCache, toUsageEntry, type OAuthUsageSnapshot } from "../proxy/oauthUsage"
 
 const FLAG = "MERIDIAN_FOLLOW_ACTIVE"
 
@@ -36,6 +36,7 @@ afterEach(() => {
   delete process.env[FLAG]
   delete process.env.CLAUDE_PROXY_FOLLOW_ACTIVE
   resetFollowedUsage()
+  resetOAuthUsageCache()
 })
 
 describe("readFollowedUsage", () => {
@@ -60,6 +61,67 @@ describe("readFollowedUsage", () => {
       { type: "seven_day", utilization: 0.1, resetsAt: null },
     ])
     expect(personal.fetchedAt).toBe(999)
+    expect(personal.claudeResets).toBeNull()
+  })
+
+  test("preserves three peer resets through follower acquisition without identifiers or upstream reads", async () => {
+    process.env[FLAG] = "http://127.0.0.1:3456"
+    const parsed = readFollowedUsage(quotaBody([{
+      id: "reset-peer",
+      windows: [{ type: "five_hour", utilization: 0.4, resetsAt: 1800018000000 }],
+      fetchedAt: 1800000000000,
+      claudeResets: {
+        eligible: true, unreadableGrants: 1, accountId: "private-account",
+        grants: [{ remainingResets: 3, paused: false, startsAt: null, endsAt: 1800086400000, id: "redemption-handle", label: "private-label" }],
+      },
+    }]))
+    setFollowedUsageForTesting(parsed)
+
+    const entry = toUsageEntry(await fetchOAuthUsageResult({
+      profileId: "reset-peer",
+      store: {
+        async read() { throw new Error("Follower must not read credentials") },
+        async write() { throw new Error("Follower must not write credentials") },
+      },
+      fetchImpl: async () => { throw new Error("Follower must not fetch upstream") },
+    }))
+
+    expect(parsed.size).toBe(1)
+    expect(entry.claudeResets).toEqual({
+      eligible: true, unreadableGrants: 1,
+      grants: [{ remainingResets: 3, paused: false, startsAt: null, endsAt: 1800086400000 }],
+    })
+    expect(entry.windows).toEqual([{ type: "five_hour", utilization: 0.4, resetsAt: 1800018000000 }])
+    expect(entry.fetchedAt).toBe(1800000000000)
+    expect(entry.error).toBeNull()
+  })
+
+  const peerGrant = { remainingResets: 3, paused: false, startsAt: null, endsAt: null }
+  test.each([
+    undefined, null, {},
+    { eligible: "true", grants: [], unreadableGrants: 0 },
+    { eligible: true, grants: [], unreadableGrants: -1 },
+    { eligible: true, grants: [], unreadableGrants: 0.5 },
+    { eligible: true, grants: [peerGrant] },
+    { eligible: true, grants: [{ ...peerGrant, remainingResets: -1 }], unreadableGrants: 0 },
+    { eligible: true, grants: [{ ...peerGrant, paused: "false" }], unreadableGrants: 0 },
+    { eligible: true, grants: [{ ...peerGrant, endsAt: "2099-01-01T00:00:00Z" }], unreadableGrants: 0 },
+    { eligible: true, grants: [{ ...peerGrant, startsAt: Infinity }], unreadableGrants: 0 },
+    { eligible: true, grants: Array.from({ length: 201 }, () => peerGrant), unreadableGrants: 0 },
+    { eligible: true, grants: [peerGrant], unreadableGrants: 200 },
+  ])("keeps windows but reports unknown inventory for malformed peer data: %j", claudeResets => {
+    const parsed = readFollowedUsage(quotaBody([{ id: "peer", ...snapshot(0.4), claudeResets }]))
+    expect(parsed.get("peer")?.claudeResets).toBeNull()
+    expect(parsed.get("peer")?.windows).toEqual([{ type: "five_hour", utilization: 0.4, resetsAt: null }])
+  })
+
+  test("retains an ineligible peer snapshot and all 200 readable records at the cap", () => {
+    const parsed = readFollowedUsage(quotaBody([
+      { id: "ineligible", ...snapshot(0.4), claudeResets: { eligible: false, grants: [], unreadableGrants: 0 } },
+      { id: "bounded", ...snapshot(0.4), claudeResets: { eligible: true, grants: Array.from({ length: 200 }, () => peerGrant), unreadableGrants: 0 } },
+    ]))
+    expect(parsed.get("ineligible")?.claudeResets).toEqual({ eligible: false, grants: [], unreadableGrants: 0 })
+    expect(parsed.get("bounded")?.claudeResets?.grants).toHaveLength(200)
   })
 
   test("drops a profile the followed instance itself could not read", () => {

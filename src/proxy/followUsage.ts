@@ -30,6 +30,7 @@
 
 import { followTarget } from "./followActive"
 import { claudeLog } from "../logger"
+import { readClaudeResets } from "./claudeResets"
 import type { OAuthUsageSnapshot, OAuthUsageWindow, OAuthExtraUsageInfo } from "./oauthUsage"
 
 /**
@@ -96,6 +97,7 @@ export function readFollowedUsage(body: unknown): Map<string, OAuthUsageSnapshot
       id?: unknown
       windows?: unknown
       extraUsage?: unknown
+      claudeResets?: unknown
       fetchedAt?: unknown
       error?: unknown
     }
@@ -119,6 +121,7 @@ export function readFollowedUsage(body: unknown): Map<string, OAuthUsageSnapshot
     out.set(id, {
       windows,
       extraUsage: (entry.extraUsage ?? null) as OAuthExtraUsageInfo | null,
+      claudeResets: readClaudeResets(entry.claudeResets),
       fetchedAt: asFiniteOrNull(entry.fetchedAt) ?? Date.now(),
     })
   }

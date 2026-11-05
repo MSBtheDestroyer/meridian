@@ -13,6 +13,22 @@ export interface ClaudeResets {
   readonly unreadableGrants: number
 }
 
+const peerInventorySchema = z.object({
+  eligible: z.boolean(),
+  grants: z.array(z.object({
+    remainingResets: z.number().int().nonnegative(),
+    paused: z.boolean(),
+    startsAt: z.number().int().nullable(),
+    endsAt: z.number().int().nullable(),
+  })).max(200),
+  unreadableGrants: z.number().int().nonnegative(),
+}).refine(inventory => inventory.grants.length + inventory.unreadableGrants <= 200)
+
+export function readClaudeResets(raw: unknown): ClaudeResets | null {
+  const parsed = peerInventorySchema.safeParse(raw)
+  return parsed.success ? parsed.data : null
+}
+
 const statusSchema = z.object({
   eligible: z.boolean(),
   grants: z.array(z.unknown()).max(200),
