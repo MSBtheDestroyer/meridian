@@ -144,6 +144,14 @@ function keyDigest(key: string): string {
 function keySlot(key: string): string {
   // At most 65,536 counters are persisted. A collision can reject safe work,
   // but can never admit stale work because the full key digest is in the token.
+  //
+  // A mapping's slot advances only when the mapping is removed. Absence is
+  // the only generation a slot names: a present mapping's generation is its
+  // own generationId, so creating or rewriting one already changes every
+  // generation that could see it, and only a removal can return a key to an
+  // absence that looks like the one it left. Advancing on every write made
+  // each turn of one busy conversation fail the fresh turn of another whose
+  // absent key happened to hash to the same slot.
   return keyDigest(key).slice(0, 4)
 }
 
@@ -1409,7 +1417,6 @@ export async function storeSharedSession(
       delete store[candidate]
       advanceKeySlot(candidate, meta)
     }
-    advanceKeySlot(key, meta)
     storedGeneration = getStoredSessionGeneration(store[key]!, key)
     if (meta.version === PRIORITY_STORE_META_VERSION) {
       for (const [routeKey, assignment] of Object.entries(meta.priorityAssignments)) {
@@ -1718,7 +1725,6 @@ export async function storeSharedSessionAndPriorityAssignment(
       ...(previousClaudeSessionId ? { previousClaudeSessionId } : {}),
     }
     document.sessions[options.key] = stored
-    advanceKeySlot(options.key, document.meta)
     const mappingGeneration = getStoredSessionGeneration(stored, options.key)
 
     if (document.meta.version === STORE_META_VERSION) {
@@ -1947,8 +1953,8 @@ export async function rollbackSharedSessionAndPriorityAssignment(
       document.sessions[options.key] = restoredMapping
     } else {
       delete document.sessions[options.key]
+      advanceKeySlot(options.key, document.meta)
     }
-    advanceKeySlot(options.key, document.meta)
     const mappingGeneration = keyGeneration(options.key, restoredMapping ?? undefined, document.meta)
 
     let restoredAssignment: DurablePriorityAssignment | null = null
@@ -2015,7 +2021,6 @@ export async function attachSharedTranscriptLocator(
         generationId: randomUUID(),
       }
       store[key] = attached
-      advanceKeySlot(key, meta)
       attachedGeneration = getStoredSessionGeneration(attached, key)
       if (meta.version === PRIORITY_STORE_META_VERSION) {
         for (const [routeKey, assignment] of Object.entries(meta.priorityAssignments)) {
