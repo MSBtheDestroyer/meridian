@@ -140,7 +140,7 @@ import { buildRuntime } from "./buildRuntime"
 import { checkPluginsNow, getLatestVersion, isUpdateCheckEnabled, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
 import { getPluginUpdates, trackPlugins } from "./pluginUpdateCheck"
 import { createAuthStatusOwner } from "./authStatusOwnership"
-import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, isExtendedContextKnownUnavailable, subscriptionIncludesExtendedContext } from "./models"
+import { mapModelToClaudeModel, claudeModelFamily, type ClaudeModelFamily, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, isExtendedContextKnownUnavailable, subscriptionIncludesExtendedContext } from "./models"
 import { livenessReport, readinessReport, renderProbe } from "./probes"
 import { UpstreamReachability, DEFAULT_OVERRIDE_TTL_MS, MAX_OVERRIDE_TTL_MS, unreachableDetail, withReachability } from "./upstreamReachability"
 import { resolveReachabilityThresholds } from "./upstreamReachabilityConfig"
@@ -211,6 +211,8 @@ import {
   resolveCooldownUntil,
   cooldownCapMs,
   findCooldownReset,
+  findModelCooldownReset,
+  perModelRefusalFamily,
   parseWeeklyReserves,
   WeeklyReserveTracker,
   WEEKLY_RESERVE_WINDOW,
@@ -789,6 +791,8 @@ type PriorityDispatchOptions = {
   readonly wantsStream: boolean
   readonly currentProfileId: string | undefined
   readonly routing?: RoutingMode
+  /** The requested model's tier: a per-model weekly bench skips a profile only for this family. */
+  readonly modelFamily: ClaudeModelFamily
   readonly turnWatchdogSignal?: AbortSignal
   readonly requestAbortLink?: RequestAbortLink
   readonly publicationTurn?: {
@@ -1572,7 +1576,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       accountBlock: (recipe) => cacheKeepaliveAccountBlock({
         profileType: recipe.profileType,
         rateLimits: rateLimitStore.getAll(recipe.profileId),
-        coolingDown: priorityExhaustion.isExhausted(recipe.profileId),
+        coolingDown: priorityExhaustion.isExhausted(recipe.profileId, claudeModelFamily(recipe.model)),
         spent: spentProfiles.get(recipe.profileId) !== undefined,
         benched: recipe.extendedContext && isExtendedContextKnownUnavailable(recipe.profileId, recipe.benchSessionKey),
         reserveHeld: currentWeeklyReserveHolds([recipe.profileId]).has(recipe.profileId),
@@ -1903,7 +1907,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
    *  it's skipped too — the conservative default is the safer thing to
    *  leave standing. `sharedWith` are the profiles the refusal also benched
    *  (`quotaSharedWith`): one account, so the refined reset is theirs too. */
-  function refinePriorityCooldown(profileId: string, sharedWith: readonly string[] = []): void {
+  function refinePriorityCooldown(profileId: string, sharedWith: readonly string[] = [], model?: { bucket: string; family: ClaudeModelFamily }): void {
     const profiles = getEffectiveProfiles(finalConfig.profiles)
     const target = profiles.find(p => p.id === profileId)
     // Only `claude-max` profiles have credentials this can consult. `api`
@@ -1928,6 +1932,14 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           resetsAt: w.resetsAt,
           exhausted: (w.utilization ?? 0) >= 1,
         }))
+        // A per-model refusal also learns when its own bucket reopens, which
+        // the account-wide resolution below never reads.
+        const modelUntil = model ? findModelCooldownReset(model.bucket, null, windows, now) : null
+        if (model && modelUntil !== null) {
+          priorityExhaustion.markModel(profileId, model.family, modelUntil, "rate_limit_error")
+          for (const twin of sharedWith) priorityExhaustion.markModel(twin, model.family, modelUntil, "rate_limit_error")
+          claudeLog("priority.cooldown_refined", { profile: profileId, until: modelUntil, modelFamily: model.family, source: "oauth_usage", ...(sharedWith.length > 0 ? { sharedWith } : {}) })
+        }
         // Sentinel: resolveCooldownUntil falls back to `now + defaultMs` when
         // nothing is exhausted. Passing 0 makes that fallback identifiable, so
         // a snapshot showing a healthy account refines nothing and tier 3's
@@ -2039,24 +2051,51 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return current.filter((id): id is string => id !== null && id !== profileId)
   }
 
-  /** `sharedQuota` collects the profiles this refusal also spoke for, so the
-   *  request's remaining candidates can skip them. */
-  async function markPriorityFailure(candidate: string, reason: string, sharedQuota: Set<string>): Promise<number> {
-    const quotaRefusal = isQuotaRefusal(reason)
-    const until = quotaRefusal
-      ? priorityCooldownUntil(candidate, Date.now())
-      : Date.now() + PRIORITY_DEFAULT_COOLDOWN_MS
-    priorityExhaustion.mark(candidate, until, reason)
-    claudeLog("priority.exhausted", { profile: candidate, until, reason })
-    if (!quotaRefusal) return until
-    // A failed lookup costs only the attempts it would have saved.
-    const twins = await quotaSharedWith(candidate).catch((error: unknown) => {
+  /** `quotaSharedWith`, where a failed lookup costs only the attempts it would have saved. */
+  function sharedQuotaTwins(candidate: string): Promise<string[]> {
+    return quotaSharedWith(candidate).catch((error: unknown) => {
       claudeLog("priority.shared_quota_failed", {
         profile: candidate,
         error: error instanceof Error ? error.message : String(error),
       })
       return []
     })
+  }
+
+  /** `sharedQuota` collects the profiles this refusal also spoke for, so the
+   *  request's remaining candidates can skip them. */
+  async function markPriorityFailure(candidate: string, reason: string, sharedQuota: Set<string>, requestFamily: ClaudeModelFamily): Promise<number> {
+    const quotaRefusal = isQuotaRefusal(reason)
+    const now = Date.now()
+    const spent = quotaRefusal ? spentProfiles.get(candidate) : undefined
+    const modelFamily = perModelRefusalFamily(spent?.diagnosis, requestFamily)
+    if (spent?.diagnosis.bucket && modelFamily) {
+      // A per-model weekly budget ran out: other models keep using this
+      // account, and this one waits for its own bucket, not the default.
+      const bucket = spent.diagnosis.bucket
+      const until = findModelCooldownReset(bucket, spent.diagnosis.resetsAt, profileCooldownWindows(candidate), now)
+        ?? now + PRIORITY_DEFAULT_COOLDOWN_MS
+      priorityExhaustion.markModel(candidate, modelFamily, until, reason)
+      // Clients read this to tell a model-only bench from a profile-wide one;
+      // the diagnosis alone can name a bucket this refusal was not benched for.
+      spent.modelFamily = modelFamily
+      claudeLog("priority.exhausted", { profile: candidate, until, reason, modelFamily })
+      const twins = await sharedQuotaTwins(candidate)
+      for (const twin of twins) {
+        priorityExhaustion.markModel(twin, modelFamily, until, reason)
+        sharedQuota.add(twin)
+        claudeLog("priority.exhausted", { profile: twin, until, reason, modelFamily, sharedWith: candidate })
+      }
+      refinePriorityCooldown(candidate, twins, { bucket, family: modelFamily })
+      return until
+    }
+    const until = quotaRefusal
+      ? priorityCooldownUntil(candidate, now)
+      : now + PRIORITY_DEFAULT_COOLDOWN_MS
+    priorityExhaustion.mark(candidate, until, reason)
+    claudeLog("priority.exhausted", { profile: candidate, until, reason })
+    if (!quotaRefusal) return until
+    const twins = await sharedQuotaTwins(candidate)
     for (const twin of twins) {
       priorityExhaustion.mark(twin, until, reason)
       sharedQuota.add(twin)
@@ -2144,7 +2183,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               await verdict.discard()
               await responseCompletions.get(inner)?.catch(() => {})
               const reason = verdict.errorType
-              const cooldownUntil = await markPriorityFailure(candidate, reason, start.sharedQuota)
+              const cooldownUntil = await markPriorityFailure(candidate, reason, start.sharedQuota, options.modelFamily)
               if (isCancelled()) break
               earliestPoolReset = Math.min(earliestPoolReset ?? cooldownUntil, cooldownUntil)
               lastError = verdict.errorPayload
@@ -2385,7 +2424,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const reason = sniffed.errorType
       // Only a quota refusal has a reset to look up. Both cooldown tiers read
       // the account's five-hour window, which says nothing about entitlement.
-      const cooldownUntil = await markPriorityFailure(candidate, reason, sharedQuota)
+      const cooldownUntil = await markPriorityFailure(candidate, reason, sharedQuota, options.modelFamily)
       if (earliestPoolReset === null || cooldownUntil < earliestPoolReset) {
         earliestPoolReset = cooldownUntil
       }
@@ -2938,7 +2977,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               if (!reserveHolds.has(id)) reserveHolds.set(id, claudeReserveHold(id, reserves))
               return reserveHolds.get(id) ?? null
             }
-            const unavailable = (id: string) => priorityExhaustion.isExhausted(id) || weeklyHolds.has(id) || heldBy(id) !== null
+            // A per-model weekly bench (#1524) skips a profile only for
+            // requests of that model; profile-wide marks skip it for every request.
+            const modelFamily = claudeModelFamily(typeof body.model === "string" ? body.model : "sonnet")
+            const benched = (id: string) => priorityExhaustion.isExhausted(id, modelFamily)
+            const unavailable = (id: string) => benched(id) || weeklyHolds.has(id) || heldBy(id) !== null
             const assignmentCwd = adapter.extractClientWorkingDirectory?.(body)
               ?? adapter.extractWorkingDirectory(body)
             // The durable route below stays on the request's own key: it is
@@ -3148,6 +3191,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 claimTurn: trustedTurn,
                 durableRoute,
                 routing: routingMode,
+                modelFamily,
               })
             }
           }
@@ -3199,7 +3243,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               if (other) holds.set(id, other)
               return other === null
             })
-            const next = unheld.find(id => !priorityExhaustion.isExhausted(id)) ?? unheld[0]
+            const modelFamily = claudeModelFamily(typeof body.model === "string" ? body.model : "sonnet")
+            const next = unheld.find(id => !priorityExhaustion.isExhausted(id, modelFamily)) ?? unheld[0]
             if (next === undefined) {
               claudeLog("routing.usage_reserve_refused", { held: [...holds.keys()], pinned: false })
               return usageReserveResponse(allHeldMessage(holds), soonestOpening([...holds.values()]), now)
@@ -11151,6 +11196,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             ...priorityExhaustion.snapshot(),
             ...chatGptExhaustion.snapshot().map(mark => ({ ...mark, id: chatGptProfiles?.profileIdFor(mark.id) ?? mark.id })),
           ],
+          // Additive: benches that skip a profile only for one model family
+          // (a per-model weekly budget such as `seven_day_fable`).
+          exhaustedModels: priorityExhaustion.modelSnapshot(),
         }
       : {}
     // Additive: follow state, so UIs can say where the active profile comes
@@ -11232,6 +11280,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       activeProfile: getActiveProfileId() || finalConfig.defaultProfile || undefined,
       spent: spentProfiles.snapshot(),
       exhausted: priorityExhaustion.snapshot(),
+      exhaustedModels: priorityExhaustion.modelSnapshot(),
       asOf: Date.now(),
     })
   })
@@ -11884,6 +11933,14 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const spent = spentProfiles.get(profileId)
     if (!spent?.diagnosis.reported || !spent.diagnosis.bucket || !cleared.includes(spent.diagnosis.bucket)) return
     spentProfiles.forget(profileId)
+    const modelFamily = spent.modelFamily
+    if (modelFamily) {
+      // Only a refusal from this bucket sets this model mark, so clearing the
+      // bucket clears it exactly. A profile-wide mark came from some other
+      // refusal and stays.
+      priorityExhaustion.forgetModel(profileId, modelFamily)
+      return
+    }
     const now = Date.now()
     const stillRejected = rateLimitStore.getAll(profileId).some(entry =>
       ((entry.status === "rejected" || (entry.utilization ?? 0) >= 1) && (entry.resetsAt === undefined || entry.resetsAt > now))
