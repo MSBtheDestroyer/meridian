@@ -160,7 +160,6 @@ import { rootSessionIdOf } from "./adapter"
 import { buildQueryOptions, isCliThinkingDisplay, promptCachingDisabled, passthroughThinking, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
 import { resolveTranscriptRetention } from "./transcriptRetention"
 import { transcriptRetentionSettingsResponse } from "./transcriptRetentionSettings"
-import { createTranscriptSweep, DEFAULT_TRANSCRIPT_SWEEP_INTERVAL_MS, listSweepRoots, runIdleSweepChild } from "./transcriptSweep"
 import { normalizeEffort } from "./effort"
 import { parseOutputFormat, structuredOutputText } from "./structuredOutput"
 import { runTransformHook, buildPipeline, createRequestContext } from "./transform"
@@ -1117,44 +1116,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     : getProcessSdkSemaphore()
   const responseCompletions = new WeakMap<Response, Promise<void>>()
 
-  // Config roots a request's Claude Code process is running in, so the idle
-  // transcript sweep never starts a second process beside one.
-  const busySdkRoots = new Map<string, number>()
-  const markSdkRootBusy = (options: Parameters<typeof query>[0]["options"]): (() => void) => {
-    const root = resolveQueryConfigDir(options?.env ?? {}, false, options?.cwd)
-    busySdkRoots.set(root, (busySdkRoots.get(root) ?? 0) + 1)
-    let released = false
-    return () => {
-      if (released) return
-      released = true
-      const remaining = (busySdkRoots.get(root) ?? 1) - 1
-      if (remaining > 0) busySdkRoots.set(root, remaining)
-      else busySdkRoots.delete(root)
-    }
-  }
-  const transcriptSweep = createTranscriptSweep({
-    listRoots: () => {
-      const profiles = getEffectiveProfiles(finalConfig.profiles)
-      const resolved = profiles.length === 0
-        ? [resolveProfile(finalConfig.profiles, finalConfig.defaultProfile)]
-        : profiles.map((profile) => resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, profile.id))
-      return listSweepRoots(resolved, process.env)
-    },
-    isRootBusy: (configDir) => busySdkRoots.has(configDir),
-    isDraining: () => draining,
-    credentialsReadOnly: isCredentialsReadOnly,
-    tryAcquireSlot: () => sdkSemaphore.tryAcquire(),
-    readCredentials: (root) => createPlatformCredentialStore(
-      root.explicitConfigDir ? { claudeConfigDir: root.configDir } : undefined,
-    ).read(),
-    runChild: async (root, retentionDays, signal) => {
-      const claudeExecutable = await executableProbeOwner.run(signal, resolveClaudeExecutableAsync)
-      return runIdleSweepChild({ root, retentionDays, claudeExecutable, signal })
-    },
-    log: plog,
-    intervalMs: Math.max(0, envInt("TRANSCRIPT_SWEEP_INTERVAL_MS", DEFAULT_TRANSCRIPT_SWEEP_INTERVAL_MS)),
-  })
-
   // Graceful shutdown (#drain): once true, handleWithQueue fast-fails new
   // requests instead of queueing them, and /health reports it so a fleet
   // manager (e.g. a gateway's account-pool scheduler) can stop routing here
@@ -1529,7 +1490,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   ) {
     // When this query started, for the login record a successful answer writes.
     const startedAt = Date.now()
-    const releaseSdkRoot = markSdkRootBusy(params.options)
     let sdkQuery: ReturnType<typeof query> | undefined
     let activeTranscriptLease: Awaited<ReturnType<typeof acquireActiveTranscriptLease>> | undefined
     let processGate: Awaited<ReturnType<typeof createSdkProcessGate>> | undefined
@@ -1588,7 +1548,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           await releaseJoinedTranscriptLease(activeTranscriptLease, sessionGcOptions)
         }
       } finally {
-        releaseSdkRoot()
         lease.release()
       }
     }
@@ -13137,7 +13096,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         await Promise.allSettled([chatGptLoginClosed, chatGptSource.settle?.()])
       },
     } } : {}),
-    transcriptSweep,
   }
 }
 
@@ -13271,7 +13229,6 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     tickCacheKeepalive,
     closeBackend,
     chatGpt,
-    transcriptSweep,
   } = proxy
 
   // Only the owned HTTP-server lifecycle starts a periodic sweep. Embedders
@@ -13283,7 +13240,6 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     : undefined
   sessionGcInterval?.unref?.()
   if (sweepSessionGc) void sweepSessionGc()
-  transcriptSweep?.start()
 
   // Same ownership rule as the GC sweep: only the owned server runs the timer.
   // The tick only compares timestamps (and returns at once with nothing
@@ -13469,7 +13425,6 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         if (authKeepaliveInterval) clearInterval(authKeepaliveInterval)
         if (sessionGcInterval) clearInterval(sessionGcInterval)
         if (cacheKeepaliveInterval) clearInterval(cacheKeepaliveInterval)
-        const transcriptSweepStopped = transcriptSweep?.stop()
         // Refuse new work before potentially waiting for a deletion child.
         beginDrain?.()
         const chatGptRenewalStopped = chatGptRenewal?.stop()
@@ -13508,12 +13463,8 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
           await joinShutdownCleanup({
             idle: waitForShutdownIdle(() => (getInFlightCount?.() ?? 0) > 0),
             durable: async () => {
-              try {
-                if (sweepSessionGc) await progress.run("session GC sweep", sweepSessionGc)
-                if (closeBackend) await progress.run("backend close", closeBackend)
-              } finally {
-                await progress.run("transcript sweep stop", async () => { await transcriptSweepStopped })
-              }
+              if (sweepSessionGc) await progress.run("session GC sweep", sweepSessionGc)
+              if (closeBackend) await progress.run("backend close", closeBackend)
             },
             chatGpt: async () => {
               // Not before a renewal still out has recorded its seat's new refresh token.
