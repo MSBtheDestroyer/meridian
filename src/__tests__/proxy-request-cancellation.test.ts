@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { readFileSync, rmSync } from "node:fs"
 import { open, type FileHandle } from "node:fs/promises"
-import * as files from "node:fs/promises"
 import { join } from "node:path"
 import * as lifecycle from "../proxy/sessionLifecycle"
 import { lifecycleLockQueue } from "../proxy/session/lifecycleLockQueue"
@@ -11,6 +10,7 @@ import * as sessionStore from "../proxy/sessionStore"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
+import { holdStoreWrites } from "./storeDatabaseHelpers"
 type QueryMode = "complete" | "wait-for-abort" | "expose-then-fail"
 
 let mode: QueryMode = "complete"
@@ -203,7 +203,7 @@ describe("request cancellation propagation", () => {
       expect(capturedController).toBeUndefined()
       expect(released).toBe(true)
       expect(resourceKey).toBeDefined()
-      const sidecar: unknown = JSON.parse(readFileSync(join(getSessionStoreDir(), "session-gc.json"), "utf8"))
+      const sidecar: unknown = lifecycle.readSessionGcSnapshot(getSessionStoreDir())
       expect(sidecar).toHaveProperty(`resources.${resourceKey}`)
       expect(sidecar).not.toHaveProperty(`resources.${resourceKey}.activeLeases`)
     } finally {
@@ -291,31 +291,31 @@ describe("request cancellation propagation", () => {
     expect(sessionStore.lookupSharedSession(sessionId)).toBeDefined()
   })
 
-  it.each(["request", "shutdown"] as const)("never publishes a mapping revoked by %s while its fsync waits", async (cause) => {
+  it.each(["request", "shutdown"] as const)("never publishes a mapping revoked by %s while its store write waits", async (cause) => {
     const controller = new AbortController()
     const server = createProxyServer({ port: 0, host: "127.0.0.1" })
-    const disk = await holdStoreFileSync(getSessionStoreDir())
-    const rename = files.rename
+    const entered = Promise.withResolvers<void>()
+    const released = Promise.withResolvers<void>()
     let publications = 0
-    const renames = spyOn(files, "rename").mockImplementation(async (...args) => {
-      if (String(args[1]) === join(getSessionStoreDir(), "sessions.json")) publications++
-      return rename(...args)
+    // The fork's store is sessions.db: hold the next write transaction where
+    // upstream held the sessions.json fsync, and count the ones that commit.
+    const writes = holdStoreWrites(getSessionStoreDir(), () => entered.resolve(), released.promise, () => {
+      if (sessionStore.lookupSharedSession("cancel-during-store-fsync")) publications++
     })
     try {
       const response = server.app.fetch(makeRequest(false, controller.signal, "cancel-during-store-fsync"))
-      await disk.entered
+      await entered.promise
       if (cause === "request") controller.abort("cancel during durable write")
       else server.forceAbortInFlight?.()
-      disk.release()
+      released.resolve()
       expect((await response).status).toBe(499)
       expect(sessionStore.lookupSharedSession("cancel-during-store-fsync")).toBeUndefined()
       // Another proxy must never be able to resume the canceled target, even
       // briefly between a late publication and its compensating eviction.
       expect(publications).toBe(0)
     } finally {
-      disk.release()
-      disk.restore()
-      renames.mockRestore()
+      released.resolve()
+      writes.mockRestore()
     }
   })
 
@@ -348,14 +348,13 @@ describe("request cancellation propagation", () => {
   })
 })
 
-async function holdStoreFileSync(dir: string): Promise<{ entered: Promise<void>; release: () => void; restore: () => void }> {
+async function holdStoreFileSync(dir: string): Promise<{ release: () => void; restore: () => void }> {
   const probe = await open(join(dir, "sync-probe"), "w")
   const prototype = Object.getPrototypeOf(probe) as FileHandle
   await probe.close()
   rmSync(join(dir, "sync-probe"), { force: true })
   const { writeFile, sync } = prototype
   const storeFiles = new WeakSet<FileHandle>()
-  const entered = Promise.withResolvers<void>()
   let release!: () => void
   const released = new Promise<void>((resolve) => { release = resolve })
   prototype.writeFile = function (this: FileHandle, ...args: Parameters<FileHandle["writeFile"]>) {
@@ -365,14 +364,10 @@ async function holdStoreFileSync(dir: string): Promise<{ entered: Promise<void>;
     return writeFile.apply(this, args)
   }
   prototype.sync = async function (this: FileHandle) {
-    if (storeFiles.has(this)) {
-      entered.resolve()
-      await released
-    }
+    if (storeFiles.has(this)) await released
     return sync.call(this)
   }
   return {
-    entered: entered.promise,
     release,
     restore: () => {
       prototype.writeFile = writeFile

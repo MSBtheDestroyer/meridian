@@ -91,13 +91,14 @@ async function seed(accounts: ChatGptAccount[]): Promise<void> {
 }
 
 /** An owned source over the seeded store, with a mock token endpoint that records which refresh tokens it was sent. */
-function owned(reply: (refreshToken: string) => Response | Promise<Response> = renewed) {
+function owned(reply: (refreshToken: string) => Response | Promise<Response> = renewed, renewalIntervals?: () => Record<string, number>) {
   const sent: string[] = []
   const source = createOwnedCredentialSource({
     storePath,
     staleMs: 400,
     heartbeatMs: 80,
     now: () => clock,
+    ...(renewalIntervals ? { renewalIntervals } : {}),
     fetchImpl: async (_url, init) => {
       const refreshToken = new URLSearchParams(String(init.body)).get("refresh_token") ?? ""
       sent.push(refreshToken)
@@ -126,6 +127,38 @@ describe("renewalDueAt", () => {
   it("is due at once for a seat with no access token or no expiry", () => {
     expect(renewalDueAt({ accessToken: null, expiresAt: NOW + DAY })).toBe(0)
     expect(renewalDueAt({ accessToken: token(NOW, NOW + DAY), expiresAt: null })).toBe(0)
+  })
+})
+
+describe("a seat's own renewal interval", () => {
+  it("falls due that long after the token was issued", () => {
+    expect(renewalDueAt(account("a", NOW), DAY)).toBe(NOW + DAY)
+  })
+
+  it("is never later than a request would renew the token", () => {
+    expect(renewalDueAt(account("a", NOW), 12 * DAY)).toBe(NOW + 10 * DAY - 5 * MINUTE)
+  })
+
+  it("leaves a token that does not say when it was issued to the request path", () => {
+    expect(renewalDueAt({ accessToken: "opaque", expiresAt: NOW + 5 * DAY }, DAY)).toBe(NOW + 5 * DAY - 5 * MINUTE)
+  })
+
+  it("renews only the seat that has one, every interval, and reads the intervals on every pass", async () => {
+    await seed([account("daily", NOW - 25 * HOUR), account("control", NOW - 25 * HOUR)])
+    let intervals: Record<string, number> = { daily: DAY }
+    const { source, sent } = owned(renewed, () => intervals)
+    await source.acquire()
+
+    expect(await source.renewDue!()).toMatchObject({ due: ["daily"], outcome: { status: "refreshed", accountUserId: "daily" } })
+    expect(await source.renewDue!()).toEqual(nothing)
+    clock = NOW + DAY
+    expect((await source.renewDue!()).due).toEqual(["daily"])
+    expect(sent).toEqual(["refresh-daily", "rotated-refresh-daily"])
+
+    intervals = {}
+    clock = NOW + 2 * DAY + MINUTE
+    expect(await source.renewDue!()).toEqual(nothing)
+    expect(onDisk("control")).toMatchObject({ refreshToken: "refresh-control" })
   })
 })
 
@@ -275,6 +308,101 @@ describe("a seat read while its exchange is in flight", () => {
     held.push(source)
     expect(view(source, "ahead")).toMatchObject({ eligible: false, reason: "requires_reauth" })
   })
+})
+
+// chatgpt.com can refuse a seat's access token while its refresh token is
+// still good: on 2026-11-10 it refused every seat of one workspace, and "Renew
+// now" brought one back hours later. A refused access token is renewed at
+// once, then 5 minutes, 30 minutes, 2 hours and every 6 hours after each
+// renewal whose new token is refused too. Only a refused refresh ends it.
+describe("a seat whose access token chatgpt.com refused", () => {
+  const retryAt = (source: { seats(): Array<{ id: string; renewalRetryAt?: number | null }> }, id: string) =>
+    source.seats().find(seat => seat.id === id)!.renewalRetryAt ?? undefined
+
+  it("is renewed at once though its token is not due, and its view says when", async () => {
+    await seed([account("refused", NOW - DAY), account("fine", NOW - DAY)])
+    const { source, sent } = owned()
+    await source.acquire()
+    expect(await source.renewDue!()).toEqual(nothing)
+
+    source.accessRefused!("refused", NOW)
+    expect(retryAt(source, "refused")).toBe(NOW)
+    expect(retryAt(source, "fine")).toBeUndefined()
+    expect(await source.renewDue!()).toMatchObject({ due: ["refused"], outcome: { status: "refreshed", accountUserId: "refused" } })
+    expect(sent).toEqual(["refresh-refused"])
+    expect(retryAt(source, "refused")).toBeUndefined()
+  })
+
+  it("waits 5 minutes, 30 minutes, 2 hours, then 6 hours each time a renewed token is refused too", async () => {
+    await seed([account("refused", NOW - DAY)])
+    const { source, sent } = owned()
+    await source.acquire()
+    source.accessRefused!("refused", NOW)
+    await source.renewDue!()
+
+    let renewedAt = clock
+    for (const wait of [5 * MINUTE, 30 * MINUTE, 2 * HOUR, 6 * HOUR, 6 * HOUR]) {
+      clock = renewedAt + MINUTE
+      source.accessRefused!("refused", clock)
+      expect(retryAt(source, "refused")).toBe(renewedAt + wait)
+      clock = renewedAt + wait - 1
+      expect(await source.renewDue!()).toEqual(nothing)
+      clock = renewedAt + wait
+      expect((await source.renewDue!()).outcome).toMatchObject({ status: "refreshed", accountUserId: "refused" })
+      renewedAt = clock
+    }
+    expect(sent).toHaveLength(6)
+  })
+
+  it("starts over at once after chatgpt.com accepts a renewed token", async () => {
+    await seed([account("refused", NOW - DAY)])
+    const { source, sent } = owned()
+    await source.acquire()
+    source.accessRefused!("refused", NOW)
+    await source.renewDue!()
+    source.accessAccepted!("refused", NOW + MINUTE)
+
+    clock = NOW + DAY
+    source.accessRefused!("refused", clock)
+    expect(retryAt(source, "refused")).toBe(clock)
+    expect((await source.renewDue!()).outcome).toMatchObject({ status: "refreshed" })
+    expect(sent).toHaveLength(2)
+  })
+
+  it("ignores a refusal of a token it has since replaced", async () => {
+    await seed([account("refused", NOW - DAY)])
+    const { source, sent } = owned()
+    await source.acquire()
+    source.accessRefused!("refused", NOW)
+    await source.renewDue!()
+
+    clock = NOW + MINUTE
+    source.accessRefused!("refused", NOW - MINUTE)
+    expect(retryAt(source, "refused")).toBeUndefined()
+    expect(await source.renewDue!()).toEqual(nothing)
+    expect(sent).toHaveLength(1)
+  })
+
+  const endings: Array<[string, (status: number) => Response]> = [
+    ["the provider refuses the refresh token", () => refused(401, { error: { code: "refresh_token_reused" } })],
+    ["the exchange's result cannot be established", () => refused(503, { error: "upstream" })],
+  ]
+  for (const [ending, reply] of endings) {
+    it(`stops retrying, needing a sign-in, once ${ending}`, async () => {
+      await seed([account("refused", NOW - DAY)])
+      const { source, sent } = owned(() => reply(0))
+      await source.acquire()
+      source.accessRefused!("refused", NOW)
+      expect((await source.renewDue!()).outcome).toMatchObject({ status: "requires-reauth", accountUserId: "refused" })
+
+      clock = NOW + 7 * HOUR
+      source.accessRefused!("refused", clock)
+      expect(await source.renewDue!()).toEqual(nothing)
+      expect(sent).toEqual(["refresh-refused"])
+      expect(source.seats().find(seat => seat.id === "refused")).toMatchObject({ eligible: false, reason: "requires_reauth" })
+      expect(retryAt(source, "refused")).toBeUndefined()
+    })
+  }
 })
 
 describe("the renewal schedule", () => {

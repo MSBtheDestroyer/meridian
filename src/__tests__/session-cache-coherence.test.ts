@@ -1,8 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { setupStoreBackend, teardownStoreBackend } from "./fixtures/bookkeeping-store-backend"
 import { clearSessionCache, evictSession, getSessionByClaudeId, lookupSession, storeSession } from "../proxy/session/cache"
 import { getConversationFingerprint } from "../proxy/session/fingerprint"
 import { evictSharedSession, lookupSharedSession, lookupSharedSessionResult, setSessionStoreDir, storeSharedSession } from "../proxy/sessionStore"
@@ -13,110 +12,13 @@ describe("cross-process session cache coherence", () => {
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), "meridian-cache-coherence-"))
     setSessionStoreDir(dir, { skipLocking: false })
-    setupStoreBackend(dir)
     await clearSessionCache()
   })
 
   afterEach(async () => {
     await clearSessionCache()
-    teardownStoreBackend()
     setSessionStoreDir(null)
     rmSync(dir, { recursive: true, force: true })
-  })
-
-  it.each([true, false])("owns queued local-fallback inputs as well as durable data (keyed=%s)", async keyed => {
-    const messages = [{ role: "user", content: "hello" }]
-    const cwd = "/tmp/owned-cache-input"
-    const sessionId = keyed ? "owned-cache-session" : undefined
-    const uuids = ["original-uuid"]
-    const locator = { sessionId: "owned-sdk", configDir: "/tmp/owned-config" }
-    const pending = storeSession(sessionId, messages, "owned-sdk", cwd, uuids,
-      undefined, undefined, undefined, locator)
-    uuids[0] = "changed-uuid"
-    locator.configDir = "invalid-relative-path"
-    await pending
-    // Force the genuine local-fallback path before a successful shared lookup
-    // can replace the locally published state with the durable owned snapshot.
-    writeFileSync(join(dir, "sessions.json"), "corrupt fixture")
-    const found = lookupSession(sessionId, [...messages, { role: "user", content: "next" }], cwd)
-    expect(found.type).toBe("continuation")
-    if (found.type !== "continuation") throw new Error("expected continuation")
-    expect(found.session).toMatchObject({
-      sdkMessageUuids: ["original-uuid"],
-      currentTranscript: { configDir: "/tmp/owned-config" },
-    })
-  })
-
-  it.each([true, false])("awaited cleanup cannot revive an earlier queued write (keyed=%s)", async keyed => {
-    const messages = [{ role: "user", content: "hello" }]
-    const cwd = "/tmp/cleanup-ordering"
-    const sessionId = keyed ? "client-session" : undefined
-    const key = sessionId ?? getConversationFingerprint(messages, cwd)
-    const pending = storeSession(sessionId, messages, "before-cleanup", cwd)
-    const cleanup = clearSessionCache()
-    await Promise.all([pending, cleanup])
-    expect(lookupSharedSession(key)).toBeUndefined()
-    // A genuine durable read error uses local fallback. No successful lookup
-    // may first mask stale memory by observing authoritative absence.
-    writeFileSync(join(dir, "sessions.json"), "corrupt fixture")
-    expect(lookupSession(sessionId, [...messages, { role: "user", content: "next" }], cwd))
-      .toEqual({ type: "diverged", reason: "not-found" })
-  })
-
-  it.each([true, false])("cleanup preserves a write started after it (keyed=%s)", async keyed => {
-    const messages = [{ role: "user", content: "hello" }]
-    const cwd = "/tmp/cleanup-ordering"
-    const sessionId = keyed ? "client-session" : undefined
-    const key = sessionId ?? getConversationFingerprint(messages, cwd)
-    const old = storeSession(sessionId, messages, "before-cleanup", cwd)
-    const cleanup = clearSessionCache()
-    const later = storeSession(sessionId, messages, "after-cleanup", cwd)
-    await Promise.all([old, cleanup, later])
-    expect(lookupSharedSession(key)?.claudeSessionId).toBe("after-cleanup")
-    writeFileSync(join(dir, "sessions.json"), "corrupt fixture")
-    const found = lookupSession(sessionId, [...messages, { role: "user", content: "next" }], cwd)
-    expect(found.type).toBe("continuation")
-    if (found.type !== "continuation") throw new Error("expected continuation")
-    expect(found.session.claudeSessionId).toBe("after-cleanup")
-  })
-
-  it.each([true, false])("eviction clears local fallback repopulated before its durable write (keyed=%s)", async keyed => {
-    const messages = [{ role: "user", content: "hello" }]
-    const continuation = [...messages, { role: "user", content: "next" }]
-    const cwd = "/tmp/eviction-ordering"
-    const sessionId = keyed ? "client-session" : undefined
-    const key = sessionId ?? getConversationFingerprint(messages, cwd)
-    await storeSession(sessionId, messages, "before-eviction", cwd)
-
-    const eviction = evictSession(sessionId, cwd, messages)
-    lookupSession(sessionId, continuation, cwd)
-    expect(await eviction).toBe(true)
-    expect(lookupSharedSession(key)).toBeUndefined()
-
-    // No successful cache lookup may hide a stale fallback by observing absence.
-    writeFileSync(join(dir, "sessions.json"), "corrupt fixture")
-    expect(lookupSession(sessionId, continuation, cwd))
-      .toEqual({ type: "diverged", reason: "not-found" })
-  })
-
-  it.each([true, false])("eviction preserves a write started after it (keyed=%s)", async keyed => {
-    const messages = [{ role: "user", content: "hello" }]
-    const continuation = [...messages, { role: "user", content: "next" }]
-    const cwd = "/tmp/eviction-ordering"
-    const sessionId = keyed ? "client-session" : undefined
-    await storeSession(sessionId, messages, "before-eviction", cwd)
-
-    const eviction = evictSession(sessionId, cwd, messages)
-    lookupSession(sessionId, continuation, cwd)
-    const later = storeSession(sessionId, messages, "after-eviction", cwd)
-    expect(await eviction).toBe(true)
-    expect(await later).not.toBe(false)
-
-    writeFileSync(join(dir, "sessions.json"), "corrupt fixture")
-    const found = lookupSession(sessionId, continuation, cwd)
-    expect(found.type).toBe("continuation")
-    if (found.type !== "continuation") throw new Error("expected continuation")
-    expect(found.session.claudeSessionId).toBe("after-eviction")
   })
 
   it("refreshes a stale in-memory generation from the shared mapping", async () => {

@@ -85,14 +85,17 @@ export const landingHtml = `<!DOCTYPE html>
      passed 95%, which is precisely when somebody comes looking for it. A
      descendant cannot undo an ancestor's filter or opacity, so scoping the
      fade to the children is the only thing that leaves the ring alone. The
-     active card spares its name row as well, so its Active pill and its
-     spent badge stay readable and only its figures recede. */
+     active card spares its Active strip and its name row as well, so they
+     and its spent badge stay readable and only its figures recede. */
   .profile-card.spend-fading > *, .profile-card.spend-spent > * {
     filter: grayscale(var(--spend-fade, 0));
     opacity: calc(1 - 0.55 * var(--spend-fade, 0));
     transition: filter 0.2s, opacity 0.2s; }
   .profile-card.spend-fading:hover > *, .profile-card.spend-spent:hover > * { filter: none; opacity: 1; }
   .profile-card.active.spend-fading > .profile-head, .profile-card.active.spend-spent > .profile-head { filter: none; opacity: 1; }
+  .profile-card.active.spend-fading > .card-strip, .profile-card.active.spend-spent > .card-strip { filter: none; opacity: 1; }
+  /* An active card that needs a login keeps its brand ring outside the red
+     border, so it still reads as the active one by more than hue. */
   .profile-card.needs-login { border-color: var(--red); }
   .profile-card.needs-login .prof-dot { background: var(--red); }
   .spend-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
@@ -120,15 +123,24 @@ export const landingHtml = `<!DOCTYPE html>
     flex: 1 1 12em; flex-wrap: wrap; row-gap: 4px; min-width: 0; overflow-wrap: anywhere; }
   .profile-name .prof-dot { width: 8px; height: 8px; flex-shrink: 0; border-radius: 50%; background: var(--border); }
   .profile-card.active .prof-dot { background: var(--brand, var(--accent)); box-shadow: 0 0 6px rgba(var(--brand-rgb, 88,166,255),0.5); }
-  .active-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--brand-bright, var(--accent)); background: rgba(var(--brand-rgb, 88,166,255),0.12);
-    border: 1px solid rgba(var(--brand-rgb, 88,166,255),0.35);
-    border-radius: 10px; padding: 1px 8px; }
   .provider-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
     border-radius: 10px; padding: 1px 8px; }
-  .switch-hint { font-size: 9px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--muted); opacity: 0; transition: opacity 0.15s; }
-  .profile-card.switchable:hover .switch-hint { opacity: 1; }
+  /* A card's activation state is a strip across its top edge in its
+     provider's brand: "Click to activate" while a switchable card is hovered
+     or focused, in the -bright tint its hover border takes, and "Active" for
+     as long as it is the active one, in the brand of its ring. It sits inside
+     the border, so a needs-login card keeps its red frame on all four sides.
+     The hint is hidden by clip-path, not opacity: the spend fade sets the
+     opacity of a card's children, which would show a hidden hint on a dimmed
+     card. --on-brand is the ink that reads on every brand (themeCss). */
+  .card-strip { position: absolute; top: 0; left: 0; right: 0; height: 12px; border-radius: 11px 11px 0 0;
+    background: var(--brand, var(--accent)); color: var(--on-brand); font-size: 9px; font-weight: 600; line-height: 12px;
+    letter-spacing: 0.5px; text-transform: uppercase; text-align: center; white-space: nowrap; overflow: hidden; pointer-events: none; }
+  .card-strip.strip-hint { background: var(--brand-bright, var(--accent)); clip-path: inset(0 0 100% 0); transition: clip-path 0.15s; }
+  .profile-card.switchable:hover > .strip-hint, .profile-card.switchable:focus-visible > .strip-hint { clip-path: inset(0); }
+  @media (max-width: 720px) {
+    .profile-card.active, .profile-card.switchable { padding-top: 18px; }
+  }
   .profile-cost { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); flex-shrink: 0; margin-left: auto; }
 
   /* Account details on hover. Drawn rather than a title attribute: the native
@@ -176,9 +188,11 @@ export const landingHtml = `<!DOCTYPE html>
     .prof-pop { left: -4px; right: -4px; }
   }
   /* A phone shows one card per row, each packed with usage rows and chips,
-     so the page edge and the card's own padding give that room back. */
+     so the page edge and the card's own padding give that room back. The
+     wide layout's gutter rule comes later in the page with the same
+     specificity, so :root lifts this one above it on a phone. */
   @media (max-width: 720px) {
-    .container { padding-left: 8px; padding-right: 8px; }
+    .container, :root[data-layout="wide"] .container { padding-left: 8px; padding-right: 8px; }
     .profile-card { padding: 9px 10px; }
   }
   .profile-sub { font-size: 11px; color: var(--muted); text-align: right; margin-bottom: 12px; }
@@ -189,11 +203,14 @@ export const landingHtml = `<!DOCTYPE html>
   .pace-row { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 8px; }
   .pace-row .w-bar { overflow: visible; position: relative; }
   .pace-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); opacity: 0.55; border-radius: 1px; }
+  .usage-row .w-bar.reserved { overflow: visible; position: relative; }
+  .reserve-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px;
+    background: var(--yellow); border-radius: 1px; box-shadow: 0 0 0 1px var(--surface); }
   .pace-row .w-pct { font-weight: 600; }
-  .pool-chip { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: var(--surface2); color: var(--muted); margin-left: 6px; vertical-align: middle; }
+  .pool-chip { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: var(--surface2); color: var(--muted); }
   .pool-chip.exhausted { color: var(--red); background: rgba(248,81,73,0.12); }
   .plan-chip { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: var(--surface2);
-    color: var(--accent2); margin-left: 6px; vertical-align: middle; font-variant-numeric: tabular-nums; }
+    color: var(--accent2); font-variant-numeric: tabular-nums; }
   .spent-banner { font-size: 12px; line-height: 1.45; color: var(--text); margin-bottom: 10px;
     padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(248,81,73,0.35); background: rgba(248,81,73,0.1); }
   .spent-banner strong { color: var(--red); }
@@ -218,7 +235,7 @@ export const landingHtml = `<!DOCTYPE html>
   .credits-row .w-credits.serving { color: var(--yellow); }
   .credits-row .w-credits-note { color: var(--muted); font-size: 11px; text-align: right; min-width: 0; overflow-wrap: anywhere; }
   .credits-row .w-credits-note.credits-pace { flex: 1; text-align: left; }
-  .pool-chip.on-credits { color: var(--yellow); background: rgba(210,153,34,0.15); }
+  .pool-chip.on-credits, .pool-chip.reserved { color: var(--yellow); background: rgba(210,153,34,0.15); }
 
   /* Traffic strip — one compact surface */
   .strip { display: flex; flex-wrap: wrap; background: var(--surface); border: 1px solid var(--border);
@@ -292,6 +309,10 @@ function paceText(pc){
   return 'on pace';
 }
 function paceColor(pc){return pc.status==='over'?'var(--red)':pc.status==='ahead'?'var(--yellow)':'var(--green)'}
+
+function reservePct(v){return String(Math.round(v*10)/10)}
+function reserveTip(b){return b.floor===b.ceiling?'Usage reserve: capped at '+reservePct(b.ceiling)+'%':'Usage reserve: '+reservePct(b.allowance)+'% allowed now, paced from '+reservePct(b.floor)+'% to '+reservePct(b.ceiling)+'%'}
+function reserveBounds(reserve,type){var b=reserve&&reserve.windows?reserve.windows[type]:null;return b&&typeof b.allowance==='number'?b:null}
 
 function resetIn(ts){if(ts==null)return '';var d=ts-Date.now();if(d<=0)return 'resetting…';var m=Math.ceil(d/60000);if(m<60)return 'in '+m+'m';var h=Math.floor(m/60);if(h<24)return 'in '+h+'h'+(m%60?' '+(m%60)+'m':'');var days=Math.floor(h/24);return 'in '+days+'d'+(h%24?' '+(h%24)+'h':'')}
 
@@ -414,6 +435,7 @@ function applyProviderFilter(){
   var loginNone=root.querySelector('.login-none');
   if(loginNone)loginNone.hidden=!(meridianProviders.anyShown(providersPresent)&&cards.length>0&&shown===0);
 }
+
 // Whether this instance serves Claude at all. An instance that serves ChatGPT
 // and has neither a Claude login nor a Claude profile does not, and its page
 // must not describe a Claude account it never had.
@@ -584,8 +606,10 @@ function profileSection(q,s,pl,h){
     var rows='';
     for(var j=0;j<wins.length;j++){
       var w=wins[j];var pct=Math.round(w.utilization*100);
+      var rb=reserveBounds(quota.reserve,w.type);
       rows+='<div class="usage-row"><span class="w-label">'+esc(winLabel(w.type))+'</span>'
-        +'<div class="w-bar"><div class="w-fill" style="width:'+Math.min(pct,100)+'%;background:'+utilColor(w.utilization)+'"></div></div>'
+        +'<div class="w-bar'+(rb?' reserved" title="'+esc(reserveTip(rb)):'')+'"><div class="w-fill" style="width:'+Math.min(pct,100)+'%;background:'+utilColor(w.utilization)+'"></div>'
+        +(rb?'<div class="reserve-marker" style="left:'+Math.max(0,Math.min(100,rb.allowance)).toFixed(1)+'%"></div>':'')+'</div>'
         +'<span class="w-pct" style="color:'+utilColor(w.utilization)+'">'+pct+'%</span>'
         +'<span class="w-reset">'+resetIn(w.resetsAt)+'</span></div>';
     }
@@ -611,7 +635,7 @@ function profileSection(q,s,pl,h){
     if(credits)rows+='<div class="usage-row credits-row" title="'+esc(credits.note)+'"><span class="w-label">credits</span>'
       +'<span class="w-credits'+(credits.serving?' serving':'')+'">'+esc(credits.value)+'</span>'
       +'<span class="w-credits-note">'+esc(credits.serving?'serving on credits':credits.policy||credits.note)+'</span></div>'
-      +(credits.pace?'<div class="usage-row credits-row" title="'+esc(credits.pace.title)+'"><span class="w-label">lasts</span>'
+      +(credits.pace?'<div class="usage-row credits-row" title="'+esc(credits.pace.title)+'">'
         +'<span class="w-credits-note credits-pace">'+esc(credits.pace.text)+'</span></div>':'');
     var isPriority=pl&&pl.routing==='priority';
     // active+priority keeps the active profile meaningful - switching it is how
@@ -621,7 +645,9 @@ function profileSection(q,s,pl,h){
     // A ChatGPT seat has an active pointer of its own that neither priority
     // routing nor follow mode takes over, so it is switchable in every mode.
     var switchable=multi&&p.configured&&!p.isActive&&(chat||(!isPriority&&!follow));
-    var badge=isPriority&&!chat?'':p.isActive?'<span class="active-pill">Active</span>':switchable?'<span class="switch-hint">Click to activate</span>':'';
+    var showsActive=p.isActive&&!(isPriority&&!chat);
+    var badge='';
+    var cardStrip=showsActive?'<div class="card-strip">Active</div>':switchable?'<div class="card-strip strip-hint">Click to activate</div>':'';
     if(follow&&p.isActive&&!chat)badge+=' <span class="pool-chip">'+(follow.activeProfile?'following '+esc(follow.url):'local — '+esc(follow.url)+' unreachable')+(follow.stale?' · stale':'')+'</span>';
     // Sits beside the name because it qualifies the percentages below it: 70%
     // of a 20x account is several times the work left in 70% of a 5x one.
@@ -647,6 +673,8 @@ function profileSection(q,s,pl,h){
       }
     }
     if(credits&&credits.serving)badge+=' <span class="pool-chip on-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
+    var rsv=quota.reserve;
+    if(rsv&&rsv.held)badge+=' <span class="pool-chip reserved" title="'+esc((rsv.reason||'over its allowance')+(rsv.opensAt!=null&&rsv.opensAt>Date.now()?' · opens '+resetIn(rsv.opensAt):''))+'">held · reserve</span>';
     var sp=spentByProfile[p.id];
     var spentBanner='';
     if(sp){\n      var spBucket=(sp.diagnosis&&sp.diagnosis.bucket)?winLabel(sp.diagnosis.bucket):'its limit';
@@ -683,6 +711,7 @@ function profileSection(q,s,pl,h){
       +' data-group="'+esc(slot.provider)+'" data-login-state="'+esc(loginStates[i])+'"'+(cardHidden?' hidden':'')
       +(p.configured?' data-id="'+esc(p.id)+'" data-index="'+pos+'"':'')
       +(switchable?' data-profile="'+esc(p.id)+'" role="button" tabindex="0"':'')+'>'
+      +cardStrip
       +'<div class="profile-head"><span class="profile-name">'+(draggable?meridianReorder.handleHtml(p.id,pos,slot.place,slot.size):'')+'<span class="prof-dot"></span>'+(p.entry?infoIcon(p.entry,p.type):'')+''+esc(p.label||p.id)+' '+meridianProviders.badgeHtml(slot.provider,'provider-pill')+badge+'</span>'
       +'<span class="profile-cost">'+usd(cost?cost.estimatedUsd:0)+'</span></div>'
       +'<div class="profile-sub">'+(cost?cost.requests+' request'+(cost.requests===1?'':'s')+' · est. API value · 24h':'no traffic · 24h')+'</div>'

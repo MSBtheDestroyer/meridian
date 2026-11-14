@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { spawn, spawnSync } from "node:child_process"
-import { realpathSync } from "node:fs"
+import { existsSync, readFileSync, realpathSync } from "node:fs"
 import {
   chmod,
   link,
@@ -17,19 +17,7 @@ import {
 import { hostname } from "node:os"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { setTimeout as waitForLockRetry } from "node:timers/promises"
-import {
-  SIDECAR_VERSION, allocateLifecycleGeneration, isRecord, parseLegacySidecar, serializeLegacySidecar,
-} from "./session/bookkeeping/legacyCodec"
-import type { SessionGcSidecar } from "./session/bookkeeping/legacyCodec"
-export { parseLegacySidecar, serializeLegacySidecar } from "./session/bookkeeping/legacyCodec"
-import { canonicalizeLocator, resourceKey } from "./session/bookkeeping/locator"
-import type { TranscriptLocator, TranscriptResource } from "./session/bookkeeping/types"
-export type { TranscriptLocator, TranscriptResourceState } from "./session/bookkeeping/types"
 import { lifecycleLockQueue } from "./session/lifecycleLockQueue"
-import { activeLifecycleBackend } from "./session/bookkeeping/lifecycleBackend"
-import { deletionChildClosure } from "./session/deletionChildClosure"
-import { ownSessionDeletionWork, trackSessionDeletionCleanup } from "./session/deletionCleanup"
-export { setSessionLifecycleBackendForTest } from "./session/bookkeeping/lifecycleBackend"
 import {
   SessionLifecycleError,
   SessionLifecycleLockError,
@@ -54,6 +42,15 @@ import {
 } from "./sessionStore"
 import { CrossProcessTurnCoordinator, type CrossProcessTurnLease } from "./session/crossProcessTurnCoordinator"
 import {
+  fileDigest,
+  getStoreLockWaitMs,
+  openStoreDatabase,
+  retireImportedFile,
+  STORE_DATABASE_NAME,
+  type StoreDatabase,
+  type WriteOp,
+} from "./session/storeDatabase"
+import {
   directoryRenameWasBlocked,
   syncDirectoryDurably,
 } from "./session/durableFileSystem"
@@ -73,6 +70,8 @@ import {
   processIncarnationProbeBudgetMs,
   type ProcessIncarnation,
 } from "./session/processIncarnation"
+
+const SIDECAR_VERSION = 2
 const SIDECAR_NAME = "session-gc.json"
 const DEFAULT_MAX_PENDING = 256
 const DEFAULT_MAX_TOMBSTONES = 256
@@ -90,9 +89,68 @@ const DEFAULT_UNARMED_LEASE_TTL_MS = 11 * 60_000
 const DEFAULT_RETRY_BASE_MS = 5_000
 const DEFAULT_RETRY_MAX_MS = 60 * 60_000
 const DEFAULT_DELETE_TIMEOUT_MS = 30_000
+// Deletions started together. Each one costs three lifecycle transactions
+// (claim, executor handshake, verdict); under request load the lifecycle lock
+// is saturated and every transaction waits in its FIFO, so one deletion at a
+// time fell below the rate resumes create superseded forks. A batch shares one
+// claim and one verdict transaction and runs its children side by side.
+const DELETION_BATCH_SIZE = 8
+// How long a deletion child waits for its gate beyond its own budget. The
+// parent opens the gate only after its executor handshake commits, and that
+// handshake queues in the lifecycle FIFO, whose holder may stall for two 60s
+// windows before waiters are rejected. The parent kills the child on every
+// failure path, so the wait cannot outlive a failed handshake.
+const DELETION_GATE_ADMISSION_MS = 150_000
 // "Nothing to delete" travels as an exit code because child output is clipped,
 // and a Node crash report can bury the verdict. 75 is the gate timeout.
 const SESSION_GC_NOT_FOUND_EXIT_CODE = 69
+
+export interface TranscriptLocator {
+  sessionId: string
+  /** The absolute CLAUDE_CONFIG_DIR which owns this transcript. */
+  configDir: string
+  /** SDK project directory, passed as deleteSession(..., { dir }). */
+  projectDir?: string
+  /** Opaque physical-ownership fence. Omitted only on legacy store locators. */
+  lifecycleGeneration?: string
+}
+
+export type TranscriptResourceState = "prepared" | "live" | "retired" | "deleting" | "deleted"
+
+interface ActiveTranscriptLeaseRecord {
+  token: string
+  owner: ProcessIncarnation
+  /** Absent on SDK writer leases, including all legacy records. */
+  purpose?: "publication"
+  executor?: ProcessIncarnation
+  executorRecoverable?: boolean
+  createdAt: number
+}
+
+interface TranscriptResource {
+  key: string
+  generation: string
+  locator: TranscriptLocator
+  state: TranscriptResourceState
+  createdAt: number
+  updatedAt: number
+  attempts: number
+  nextAttemptAt?: number
+  lastError?: string
+  deletionToken?: string
+  deletionOwner?: ProcessIncarnation
+  deletionExecutor?: ProcessIncarnation
+  deletionProcessGroupId?: number
+  activeLeases?: Record<string, ActiveTranscriptLeaseRecord>
+}
+
+type LegacyTranscriptResource = Omit<TranscriptResource, "generation">
+
+interface SessionGcSidecar {
+  version: typeof SIDECAR_VERSION
+  meta: { fenceSlots: Record<string, number> }
+  resources: Record<string, TranscriptResource>
+}
 
 export type SessionDeleter = (locator: TranscriptLocator) => Promise<void>
 
@@ -121,14 +179,14 @@ export interface SessionLifecycleOptions {
   retryBaseMs?: number
   retryMaxMs?: number
   deletionTimeoutMs?: number
-  /** Budget for the executor's durable attach under the sidecar lock (FIFO wait
-   * plus write), counted after incarnation capture; never the gated execution. */
-  deletionHandshakeTimeoutMs?: number
   /** Refresh durable mapping pins before each destructive claim. */
   pinProvider?: () => readonly TranscriptLocator[]
-  /** Stops new deletion claims once elapsed; a started claim keeps its own
-   * budgets (deletionTimeoutMs plus deletionHandshakeTimeoutMs). */
+  /** Stop claiming new deletions after this long. A claimed deletion keeps its whole budget. */
   runTimeoutMs?: number
+  /** Checked before each claim: true stops the run after the batch already claimed. */
+  shouldStop?: () => boolean
+  /** Called after every sweep with the transcript backlog it left behind. */
+  onBacklog?: (backlog: GcBacklog) => void
   /** Test seam. Overrides the resolved @anthropic-ai/claude-agent-sdk module the
    * deletion child imports, so the fenced-delete path can run against a stub. */
   sdkModuleUrl?: string
@@ -153,9 +211,27 @@ export interface GcResult {
   deferred: number
 }
 
+/** The transcript backlog as a sweep left it. */
+export interface GcBacklog {
+  /** Prepared, retired and deleting transcripts. */
+  pending: number
+  maxPending: number
+  /** Unpinned, unleased live transcripts: superseded, waiting for a pending slot. */
+  awaitingRetirement: number
+  /** Retired transcripts a sweep could claim right now. */
+  dueForDeletion: number
+  /** Retirement is held back by a full pending budget. */
+  saturated: boolean
+}
+
 /** Stable ownership key. The separator prevents ambiguous concatenation. */
 export function getTranscriptResourceKey(locator: TranscriptLocator): string {
-  return resourceKey(locator)
+  validateLocator(locator)
+  return createHash("sha256")
+    .update(locator.configDir)
+    .update("\0")
+    .update(locator.sessionId)
+    .digest("hex")
 }
 
 function physicalLocator(locator: TranscriptLocator): TranscriptLocator {
@@ -178,8 +254,6 @@ export async function acquireActiveTranscriptLease(
   locators: readonly TranscriptLocator[],
   options: SessionLifecycleOptions = {},
 ): Promise<ActiveTranscriptLease> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.acquireActiveTranscriptLease(locators, options)
   const normalized = [...new Map(
     locators.map(canonicalizeTranscriptLocator).map((locator) => [getTranscriptResourceKey(locator), locator]),
   ).entries()]
@@ -188,7 +262,7 @@ export async function acquireActiveTranscriptLease(
   if (!owner) throw new SessionLifecycleError("cannot capture active transcript owner incarnation")
   const token = randomUUID()
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const unarmedLeaseTtlMs = nonNegativeOption(options.unarmedLeaseTtlMs, DEFAULT_UNARMED_LEASE_TTL_MS, "unarmedLeaseTtlMs")
     for (const [key, locator] of normalized) {
       const resource = sidecar.resources[key]
@@ -205,7 +279,7 @@ export async function acquireActiveTranscriptLease(
       resource.activeLeases ??= {}
       resource.activeLeases[token] = { token, owner, createdAt: nowMs(options) }
     }
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
   })
   return { token, resourceKeys: normalized.map(([key]) => key) }
 }
@@ -217,12 +291,10 @@ export async function attachActiveTranscriptExecutor(
   options: SessionLifecycleOptions = {},
   executorRecoverable = true,
 ): Promise<void> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.attachActiveTranscriptExecutor(lease, executor, options, executorRecoverable)
   const parsedExecutor = parseProcessIncarnation(executor)
   if (!parsedExecutor) throw new TypeError("invalid active transcript executor incarnation")
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     for (const key of lease.resourceKeys) {
       const record = sidecar.resources[key]?.activeLeases?.[lease.token]
       if (!record) throw new SessionLifecycleError(`active transcript lease ${lease.token} was lost`)
@@ -230,7 +302,7 @@ export async function attachActiveTranscriptExecutor(
       record.executor = parsedExecutor
       record.executorRecoverable = executorRecoverable
     }
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
   })
 }
 
@@ -239,10 +311,8 @@ export async function releaseActiveTranscriptLease(
   lease: ActiveTranscriptLease,
   options: SessionLifecycleOptions = {},
 ): Promise<void> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.releaseActiveTranscriptLease(lease, options)
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     let changed = false
     for (const key of lease.resourceKeys) {
       const resource = sidecar.resources[key]
@@ -251,7 +321,7 @@ export async function releaseActiveTranscriptLease(
       if (Object.keys(resource.activeLeases).length === 0) delete resource.activeLeases
       changed = true
     }
-    if (changed) await writeSidecar(paths.sidecar, sidecar)
+    if (changed) await writeSidecar(paths, sidecar)
   })
 }
 
@@ -271,8 +341,6 @@ export async function releaseJoinedTranscriptLease(
   lease: ActiveTranscriptLease,
   options: SessionLifecycleOptions = {},
 ): Promise<void> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.releaseJoinedTranscriptLease(lease, options)
   try {
     await releaseActiveTranscriptLease(lease, options)
   } catch (error) {
@@ -298,8 +366,6 @@ export async function prepareFork(
   locator: TranscriptLocator,
   options: SessionLifecycleOptions = {},
 ): Promise<TranscriptLocator> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.prepareFork(locator, options)
   return prepareForkIntent(locator, options)
 }
 
@@ -312,8 +378,6 @@ export async function prepareForkForPublication(
   locator: TranscriptLocator,
   options: SessionLifecycleOptions = {},
 ): Promise<TranscriptLocator> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.prepareForkForPublication(locator, options)
   const owner = captureProcessIncarnation()
   if (!owner) throw new SessionLifecycleError("cannot capture publication owner incarnation")
   return prepareForkIntent(locator, options, owner)
@@ -327,7 +391,7 @@ async function prepareForkIntent(
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   return withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const existing = sidecar.resources[key]
     if (existing) {
       if (publicationOwner) throw new SessionLifecycleError(`publication target ${key} already exists`)
@@ -359,7 +423,7 @@ async function prepareForkIntent(
     }
     sidecar.resources[key] = resource
     pruneTombstones(sidecar, options)
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
     Object.assign(locator, exactLocator(resource))
     return exactLocator(resource)
   })
@@ -370,12 +434,10 @@ export async function ensureTranscriptJournaled(
   locator: TranscriptLocator,
   options: SessionLifecycleOptions = {},
 ): Promise<TranscriptLocator> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.ensureTranscriptJournaled(locator, options)
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   return withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const existing = sidecar.resources[key]
     if (existing) {
       assertSameLocator(existing.locator, normalized)
@@ -402,7 +464,7 @@ export async function ensureTranscriptJournaled(
     }
     sidecar.resources[key] = resource
     pruneTombstones(sidecar, options)
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
     Object.assign(locator, exactLocator(resource))
     return exactLocator(resource)
   })
@@ -413,12 +475,10 @@ export async function registerLiveTranscript(
   locator: TranscriptLocator,
   options: SessionLifecycleOptions = {},
 ): Promise<TranscriptLocator> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.registerLiveTranscript(locator, options)
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   return withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     let resource = sidecar.resources[key]
     if (!resource) {
       if (normalized.lifecycleGeneration !== undefined) {
@@ -437,7 +497,7 @@ export async function registerLiveTranscript(
       }
       sidecar.resources[key] = resource
       pruneTombstones(sidecar, options)
-      await writeSidecar(paths.sidecar, sidecar)
+      await writeSidecar(paths, sidecar)
       Object.assign(locator, exactLocator(resource))
       return exactLocator(resource)
     }
@@ -454,7 +514,7 @@ export async function registerLiveTranscript(
     resource.updatedAt = nowMs(options)
     delete resource.nextAttemptAt
     delete resource.lastError
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
     Object.assign(locator, exactLocator(resource))
     return exactLocator(resource)
   })
@@ -465,12 +525,10 @@ export async function commitFork(
   locator: TranscriptLocator,
   options: SessionLifecycleOptions = {},
 ): Promise<void> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.commitFork(locator, options)
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const resource = sidecar.resources[key]
     if (!resource) {
       throw new SessionLifecycleError(`fork ${key} was not prepared`)
@@ -485,7 +543,7 @@ export async function commitFork(
     resource.updatedAt = nowMs(options)
     delete resource.nextAttemptAt
     delete resource.lastError
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
   })
 }
 
@@ -502,8 +560,6 @@ export async function publishPinnedTranscript<T extends boolean | string>(
   publish: () => T | Promise<T>,
   options: SessionLifecycleOptions = {},
 ): Promise<T> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.publishPinnedTranscript(locator, publish, options)
   return updatePinnedTranscript(locator, publish, options, false)
 }
 
@@ -517,8 +573,6 @@ export async function attachPinnedTranscript<T extends boolean | string>(
   publish: () => T | Promise<T>,
   options: SessionLifecycleOptions = {},
 ): Promise<T> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.attachPinnedTranscript(locator, publish, options)
   return updatePinnedTranscript(locator, publish, options, true)
 }
 
@@ -532,7 +586,7 @@ async function updatePinnedTranscript<T extends boolean | string>(
   const key = getTranscriptResourceKey(normalized)
   const originalGeneration = locator.lifecycleGeneration
   return withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const beforeMutation = structuredClone(sidecar)
     let resource = sidecar.resources[key]
     let changed = false
@@ -573,20 +627,20 @@ async function updatePinnedTranscript<T extends boolean | string>(
     if (releasePublicationLease(resource)) changed = true
     if (changed) {
       pruneTombstones(sidecar, options)
-      await writeSidecar(paths.sidecar, sidecar)
+      await writeSidecar(paths, sidecar)
     }
     // Keep the lifecycle lock held across the session-store CAS.
     locator.lifecycleGeneration = resource.generation
     try {
       const result = await publish()
       if (result === false) {
-        if (changed) await writeSidecar(paths.sidecar, beforeMutation)
+        if (changed) await writeSidecar(paths, beforeMutation)
         if (originalGeneration === undefined) delete locator.lifecycleGeneration
         else locator.lifecycleGeneration = originalGeneration
       }
       return result
     } catch (error) {
-      if (changed) await writeSidecar(paths.sidecar, beforeMutation)
+      if (changed) await writeSidecar(paths, beforeMutation)
       if (originalGeneration === undefined) delete locator.lifecycleGeneration
       else locator.lifecycleGeneration = originalGeneration
       throw error
@@ -599,12 +653,10 @@ export async function abandonFork(
   locator: TranscriptLocator,
   options: SessionLifecycleOptions = {},
 ): Promise<void> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.abandonFork(locator, options)
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const resource = sidecar.resources[key]
     if (!resource) {
       throw new SessionLifecycleError(`fork ${key} was not prepared`)
@@ -617,9 +669,9 @@ export async function abandonFork(
       resource.state = "retired"
       resource.updatedAt = nowMs(options)
       resource.nextAttemptAt = resource.updatedAt + retiredGraceMs(options)
-      await writeSidecar(paths.sidecar, sidecar)
+      await writeSidecar(paths, sidecar)
     } else if (releasedPublication) {
-      await writeSidecar(paths.sidecar, sidecar)
+      await writeSidecar(paths, sidecar)
     }
   })
 }
@@ -632,8 +684,6 @@ export async function reconcile(
   pins: readonly TranscriptLocator[],
   options: SessionLifecycleOptions = {},
 ): Promise<ReconcileResult> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.reconcile(pins, options)
   // Validate caller pins before waiting for the lock. The authoritative pin
   // provider is refreshed again while the lifecycle lock is held.
   indexPins(pins)
@@ -646,7 +696,7 @@ async function reconcileUnderLock(
   paths: SidecarPaths,
 ): Promise<ReconcileResult> {
     const effectivePins = indexPins(options.pinProvider?.() ?? pins)
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const pinKeys = new Set(Object.values(sidecar.resources)
       .filter((resource) => resourceIsPinned(resource, effectivePins))
       .map((resource) => resource.key))
@@ -664,29 +714,24 @@ async function reconcileUnderLock(
       if (pruneDeadActiveLeases(resource, now, unarmedLeaseTtlMs)) changed = true
     }
     let pending = pendingResourceCount(sidecar)
-    const maxPending = option(options.maxPending, DEFAULT_MAX_PENDING, "maxPending")
-    // Passive retirement must leave room for one active preallocation. Without
-    // that headroom, a profile switch can unpin enough live transcripts to fill
-    // the backlog and block every fresh request until the quarantine expires.
-    // A one-slot configuration cannot reserve capacity without disabling
-    // passive cleanup entirely, so preserve its existing behavior.
-    const passiveRetirementLimit = maxPending > 1 ? maxPending - 1 : maxPending
+    const retirementLimit = passiveRetirementLimit(
+      option(options.maxPending, DEFAULT_MAX_PENDING, "maxPending"),
+    )
 
-    // The claiming proxy owns the original child and pipe handles. Its death
-    // is required before another sweep may recover a claim: executor death
-    // alone cannot establish that the live owner's cleanup joined. After a
-    // handshake, the exact executor and its POSIX group must also be gone.
+    // A deletion claim is recoverable only after the exact persisted executor
+    // is provably dead. Before the executor handshake, authoritative death of
+    // the claiming proxy is enough because the gated child cannot start the
+    // physical SDK deletion without that handshake.
     for (const resource of Object.values(sidecar.resources)) {
       if (resource.state !== "deleting") continue
-      if (!resource.deletionOwner || !processIncarnationIsDead(resource.deletionOwner)) continue
       // The incarnation probe (pid + OS start id) is immune to pid reuse. On
       // POSIX the group probe additionally waits out surviving descendants.
       // win32 has no process groups and recycles pids aggressively: probing
       // the stored pid there could misread an unrelated process as a live
       // deleter forever, permanently blocking recovery of this claim, and a
       // single-pid probe observes no descendants anyway — executor death is
-      // the remaining win32 signal after owner death (the un-detached
-      // deletion child spawns none; see deleteWithSdkChild).
+      // the entire win32 signal (the un-detached deletion child spawns none;
+      // see deleteWithSdkChild).
       const executorDead = resource.deletionExecutor
         && resource.deletionProcessGroupId !== undefined
         ? processIncarnationIsDead(resource.deletionExecutor)
@@ -694,6 +739,8 @@ async function reconcileUnderLock(
             || processGroupIsEmpty(resource.deletionProcessGroupId))
         : false
       const ownerDiedBeforeHandshake = !resource.deletionExecutor
+        && resource.deletionOwner !== undefined
+        && processIncarnationIsDead(resource.deletionOwner)
       if (!executorDead && !ownerDiedBeforeHandshake) continue
       resource.state = "retired"
       resource.updatedAt = now
@@ -734,7 +781,7 @@ async function reconcileUnderLock(
         resource.nextAttemptAt = now + retiredGraceMs(options)
         result.preparedRetired++
         changed = true
-      } else if (resource.state === "live" && pending < passiveRetirementLimit) {
+      } else if (resource.state === "live" && pending < retirementLimit) {
         resource.state = "retired"
         resource.updatedAt = now
         resource.nextAttemptAt = now + retiredGraceMs(options)
@@ -744,7 +791,7 @@ async function reconcileUnderLock(
       }
     }
 
-    if (changed) await writeSidecar(paths.sidecar, sidecar)
+    if (changed) await writeSidecar(paths, sidecar)
     return result
 }
 
@@ -765,15 +812,13 @@ export async function releaseSupersededProfileCopies(
   options: SessionLifecycleOptions = {},
   turnCoordinator = new CrossProcessTurnCoordinator(join(options.storeDir ?? getSessionStoreDir(), "turn-locks")),
 ): Promise<number> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.releaseSupersededProfileCopies(copies, options, turnCoordinator)
   const maxPending = option(options.maxPending, DEFAULT_MAX_PENDING, "maxPending")
   if (!options.pinProvider) throw new SessionLifecycleError("profile-copy pruning requires an authoritative pin provider")
   return withSidecarLock(options, async paths => {
     // Recover unrecorded retirements from an earlier failed publication before
     // granting more capacity; a pin-provider/write failure must precede pruning.
     await reconcileUnderLock([], options, paths)
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const budget = Math.floor(maxPending / 2) - pendingResourceCount(sidecar)
     if (budget <= 0) return 0
     const selection = { ...copies, maxUnpinnedTranscripts: budget }
@@ -805,86 +850,110 @@ export async function releaseSupersededProfileCopies(
 /**
  * Delete a bounded batch of unpinned retired transcripts through the supported
  * SDK API, after retrying deferred lease releases that would otherwise fence them.
+ *
+ * Claims are taken in batches of DELETION_BATCH_SIZE: one transaction claims a
+ * batch, its children run side by side, and one transaction records their
+ * verdicts. The run deadline only stops the next claim. A deletion already
+ * claimed gets its whole budget, because truncating it to the run's remainder
+ * doomed the last claim of nearly every sweep on a loaded host: its child gave
+ * up waiting for a gate the parent's queued handshake had not opened yet.
  */
-export function runGc(
+export async function runGc(
   pins: readonly TranscriptLocator[],
   options: SessionLifecycleOptions = {},
 ): Promise<GcResult> {
-  return ownSessionDeletionWork(getStoreDir(options), () => runGcOwned(pins, options))
-}
-
-async function runGcOwned(pins: readonly TranscriptLocator[], options: SessionLifecycleOptions): Promise<GcResult> {
-  const backend = activeLifecycleBackend()
-  if (backend) return backend.runGc(pins, options)
   await retryDeferredLeaseReleases(options)
   await reconcile(pins, options)
   let currentPins = indexPins(pins)
   const limit = option(options.maxDeletesPerRun, DEFAULT_MAX_DELETES, "maxDeletesPerRun")
+  const deletionTimeout = option(options.deletionTimeoutMs, DEFAULT_DELETE_TIMEOUT_MS, "deletionTimeoutMs")
   const result: GcResult = { deleted: 0, notFound: 0, failed: 0, deferred: 0 }
   const runTimeoutMs = option(options.runTimeoutMs, DEFAULT_DELETE_TIMEOUT_MS, "runTimeoutMs")
   const deadline = Date.now() + runTimeoutMs
+  let claimed = 0
+  let deletionStillRunning = false
 
-  for (let index = 0; index < limit; index++) {
-    if (Date.now() >= deadline) break
+  while (claimed < limit && !deletionStillRunning && Date.now() < deadline && !options.shouldStop?.()) {
     const refreshedPins = options.pinProvider?.()
     if (refreshedPins) {
       currentPins = indexPins(refreshedPins)
     }
-    const candidate = await claimDeletion(currentPins, options)
-    if (!candidate) break
+    const batch = await claimDeletions(currentPins, Math.min(DELETION_BATCH_SIZE, limit - claimed), options)
+    if (batch.length === 0) break
+    claimed += batch.length
 
-    let failure: unknown
-    let notFound = false
-    let deletionStillRunning = false
-    try {
-      // The run deadline only gates the next claim; this one keeps its full budgets.
-      const deletionTimeout = option(options.deletionTimeoutMs, DEFAULT_DELETE_TIMEOUT_MS, "deletionTimeoutMs")
-      if (options.deleter) {
-        await awaitCustomDeleter(options.deleter(candidate.locator), deletionTimeout, getStoreDir(options))
-      } else {
-        await deleteWithSdkChild(
-          candidate.locator,
-          candidate.deletionToken!,
-          deletionTimeout,
-          (executor, processGroupId, signal) => attachDeletionExecutor(
-            candidate.key,
-            candidate.deletionToken!,
-            executor,
-            processGroupId,
-            signal,
-            options,
-          ),
-          options,
-        )
+    const outcomes = await Promise.all(batch.map((candidate) => deleteClaimed(candidate, deletionTimeout, options)))
+    const verdicts: DeletionVerdict[] = []
+    for (const [index, outcome] of outcomes.entries()) {
+      if (outcome === "still-running") {
+        // The SDK has no deletion fencing token. Keep the resource permanently
+        // deleting until an operator proves the old deleter is gone; retrying
+        // could let an old physical delete race a newly pinned generation.
+        result.deferred++
+        deletionStillRunning = true
+        continue
       }
-    } catch (error) {
-      if (error instanceof DeletionStillRunningError) deletionStillRunning = true
-      else if (isNotFoundError(error, candidate.locator.sessionId)) notFound = true
-      else failure = error
+      verdicts.push({ candidate: batch[index]!, outcome })
     }
-
-    if (deletionStillRunning) {
-      // The SDK has no deletion fencing token. Keep the resource permanently
-      // deleting until an operator proves the old deleter is gone; retrying
-      // could let an old physical delete race a newly pinned generation.
-      break
+    await finishDeletions(verdicts, options)
+    for (const { outcome } of verdicts) {
+      if (outcome === "deleted") result.deleted++
+      else if (outcome === "not-found") result.notFound++
+      else result.failed++
     }
-    await finishDeletion(candidate.key, candidate.deletionToken!, failure, options)
-    if (failure) result.failed++
-    else if (notFound) result.notFound++
-    else result.deleted++
   }
 
-  result.deferred += await countDeferred(currentPins, options)
+  const backlog = await readBacklog(currentPins, options)
+  result.deferred += backlog.deferred
+  options.onBacklog?.(backlog.report)
   return result
 }
 
-async function claimDeletion(
-  pins: PinIndex,
+type DeletionOutcome = "deleted" | "not-found" | "still-running" | { failure: unknown }
+
+interface DeletionVerdict {
+  candidate: TranscriptResource
+  outcome: Exclude<DeletionOutcome, "still-running">
+}
+
+async function deleteClaimed(
+  candidate: TranscriptResource,
+  timeoutMs: number,
   options: SessionLifecycleOptions,
-): Promise<TranscriptResource | undefined> {
+): Promise<DeletionOutcome> {
+  try {
+    if (options.deleter) {
+      await awaitCustomDeleter(options.deleter(candidate.locator), timeoutMs)
+    } else {
+      await deleteWithSdkChild(
+        candidate.locator,
+        candidate.deletionToken!,
+        timeoutMs,
+        (executor, processGroupId) => attachDeletionExecutor(
+          candidate.key,
+          candidate.deletionToken!,
+          executor,
+          processGroupId,
+          options,
+        ),
+        options,
+      )
+    }
+    return "deleted"
+  } catch (error) {
+    if (error instanceof DeletionStillRunningError) return "still-running"
+    if (isNotFoundError(error, candidate.locator.sessionId)) return "not-found"
+    return { failure: error }
+  }
+}
+
+async function claimDeletions(
+  pins: PinIndex,
+  count: number,
+  options: SessionLifecycleOptions,
+): Promise<TranscriptResource[]> {
   return withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const refreshedPins = options.pinProvider?.()
     const finalPins = refreshedPins ? indexPins(refreshedPins) : pins
     const now = nowMs(options)
@@ -893,28 +962,34 @@ async function claimDeletion(
     for (const resource of Object.values(sidecar.resources)) {
       if (pruneDeadActiveLeases(resource, now, unarmedLeaseTtlMs)) leasesChanged = true
     }
-    const candidate = Object.values(sidecar.resources)
-      .filter((resource) =>
-        resource.state === "retired"
-        && !resourceIsPinned(resource, finalPins)
-        && !hasActiveTranscriptLease(resource)
-        && (resource.nextAttemptAt ?? 0) <= now)
-      .sort((left, right) => left.updatedAt - right.updatedAt || left.key.localeCompare(right.key))[0]
-    if (!candidate) {
-      if (leasesChanged) await writeSidecar(paths.sidecar, sidecar)
-      return undefined
+    const candidates = Object.values(sidecar.resources)
+      .filter((resource) => resourceIsDue(resource, finalPins, now))
+      .sort((left, right) => left.updatedAt - right.updatedAt || left.key.localeCompare(right.key))
+      .slice(0, count)
+    if (candidates.length === 0) {
+      if (leasesChanged) await writeSidecar(paths, sidecar)
+      return []
     }
     const deletionOwner = captureProcessIncarnation()
     if (!deletionOwner) throw new SessionLifecycleError("cannot capture deletion owner process incarnation")
-    candidate.state = "deleting"
-    candidate.updatedAt = now
-    candidate.deletionToken = randomUUID()
-    candidate.deletionOwner = deletionOwner
-    delete candidate.deletionExecutor
-    delete candidate.deletionProcessGroupId
-    await writeSidecar(paths.sidecar, sidecar)
-    return structuredClone(candidate)
+    for (const candidate of candidates) {
+      candidate.state = "deleting"
+      candidate.updatedAt = now
+      candidate.deletionToken = randomUUID()
+      candidate.deletionOwner = deletionOwner
+      delete candidate.deletionExecutor
+      delete candidate.deletionProcessGroupId
+    }
+    await writeSidecar(paths, sidecar)
+    return structuredClone(candidates)
   })
+}
+
+function resourceIsDue(resource: TranscriptResource, pins: PinIndex, now: number): boolean {
+  return resource.state === "retired"
+    && !resourceIsPinned(resource, pins)
+    && !hasActiveTranscriptLease(resource)
+    && (resource.nextAttemptAt ?? 0) <= now
 }
 
 async function attachDeletionExecutor(
@@ -922,15 +997,10 @@ async function attachDeletionExecutor(
   deletionToken: string,
   executor: ProcessIncarnation,
   processGroupId: number,
-  signal: AbortSignal,
   options: SessionLifecycleOptions,
 ): Promise<void> {
-  // The signal fences admission only: a started write runs to completion, so
-  // finishDeletion (queued behind this holder) sees the whole attach or none of it.
-  signal.throwIfAborted()
-  await withSidecarLock({ ...options, admissionSignal: signal }, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
-    signal.throwIfAborted()
+  await withSidecarLock(options, async (paths) => {
+    const sidecar = await readSidecar(paths)
     const resource = sidecar.resources[key]
     if (!resource || resource.state !== "deleting" || resource.deletionToken !== deletionToken) {
       throw new SessionLifecycleError(`deletion lease for ${key} was lost before executor handshake`)
@@ -938,55 +1008,83 @@ async function attachDeletionExecutor(
     resource.deletionExecutor = executor
     resource.deletionProcessGroupId = processGroupId
     resource.updatedAt = nowMs(options)
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
   })
 }
 
-async function finishDeletion(
-  key: string,
-  deletionToken: string,
-  failure: unknown,
+/** Record a batch's verdicts in one transaction. A lost lease fails the sweep after the rest are recorded. */
+async function finishDeletions(
+  verdicts: readonly DeletionVerdict[],
   options: SessionLifecycleOptions,
 ): Promise<void> {
+  if (verdicts.length === 0) return
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
-    const resource = sidecar.resources[key]
-    if (!resource || resource.state !== "deleting" || resource.deletionToken !== deletionToken) {
-      throw new SessionLifecycleError(`deletion lease for ${key} was lost`)
-    }
+    const sidecar = await readSidecar(paths)
     const now = nowMs(options)
-    resource.updatedAt = now
-    delete resource.deletionToken
-    delete resource.deletionOwner
-    delete resource.deletionExecutor
-    delete resource.deletionProcessGroupId
-    if (!failure) {
-      resource.state = "deleted"
-      delete resource.nextAttemptAt
-      delete resource.lastError
-    } else {
-      resource.state = "retired"
-      resource.attempts++
-      resource.lastError = errorMessage(failure).slice(0, 1_000)
-      const base = option(options.retryBaseMs, DEFAULT_RETRY_BASE_MS, "retryBaseMs")
-      const maximum = option(options.retryMaxMs, DEFAULT_RETRY_MAX_MS, "retryMaxMs")
-      const delay = Math.min(maximum, base * (2 ** Math.min(resource.attempts - 1, 20)))
-      resource.nextAttemptAt = now + delay
+    const lost: string[] = []
+    for (const { candidate, outcome } of verdicts) {
+      const resource = sidecar.resources[candidate.key]
+      if (!resource || resource.state !== "deleting" || resource.deletionToken !== candidate.deletionToken) {
+        lost.push(candidate.key)
+        continue
+      }
+      resource.updatedAt = now
+      delete resource.deletionToken
+      delete resource.deletionOwner
+      delete resource.deletionExecutor
+      delete resource.deletionProcessGroupId
+      if (typeof outcome === "string") {
+        resource.state = "deleted"
+        delete resource.nextAttemptAt
+        delete resource.lastError
+      } else {
+        resource.state = "retired"
+        resource.attempts++
+        resource.lastError = errorMessage(outcome.failure).slice(0, 1_000)
+        const base = option(options.retryBaseMs, DEFAULT_RETRY_BASE_MS, "retryBaseMs")
+        const maximum = option(options.retryMaxMs, DEFAULT_RETRY_MAX_MS, "retryMaxMs")
+        const delay = Math.min(maximum, base * (2 ** Math.min(resource.attempts - 1, 20)))
+        resource.nextAttemptAt = now + delay
+      }
     }
-    pruneTombstones(sidecar, options)
-    await writeSidecar(paths.sidecar, sidecar)
+    if (lost.length < verdicts.length) {
+      pruneTombstones(sidecar, options)
+      await writeSidecar(paths, sidecar)
+    }
+    if (lost.length > 0) {
+      throw new SessionLifecycleError(`deletion lease for ${lost.join(", ")} was lost`)
+    }
   })
 }
 
-async function countDeferred(
+async function readBacklog(
   pins: PinIndex,
   options: SessionLifecycleOptions,
-): Promise<number> {
+): Promise<{ deferred: number; report: GcBacklog }> {
   return withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
-    return Object.values(sidecar.resources).filter((resource) =>
-      (resource.state === "retired" || resource.state === "deleting")
-      && !resourceIsPinned(resource, pins)).length
+    const sidecar = await readSidecar(paths)
+    const now = nowMs(options)
+    const maxPending = option(options.maxPending, DEFAULT_MAX_PENDING, "maxPending")
+    let deferred = 0
+    let awaitingRetirement = 0
+    let dueForDeletion = 0
+    for (const resource of Object.values(sidecar.resources)) {
+      const pinned = resourceIsPinned(resource, pins)
+      if ((resource.state === "retired" || resource.state === "deleting") && !pinned) deferred++
+      if (resource.state === "live" && !pinned && !hasActiveTranscriptLease(resource)) awaitingRetirement++
+      if (resourceIsDue(resource, pins, now)) dueForDeletion++
+    }
+    const pending = pendingResourceCount(sidecar)
+    return {
+      deferred,
+      report: {
+        pending,
+        maxPending,
+        awaitingRetirement,
+        dueForDeletion,
+        saturated: awaitingRetirement > 0 && pending >= passiveRetirementLimit(maxPending),
+      },
+    }
   })
 }
 
@@ -995,18 +1093,7 @@ class DeletionStillRunningError extends Error {}
 /** The SDK reported the transcript already gone: there is nothing left to delete. */
 class TranscriptAlreadyAbsentError extends Error {}
 
-/** @internal Bridge from the SQL deletion phase into the one deletion runtime; not package API.
- * Frozen so that neither a consumer nor a test can swap a member under the JSON path. */
-export const sessionDeletionRuntime = Object.freeze({
-  processGroupIsEmpty,
-  deleteWithSdkChild, awaitCustomDeleter, isNotFoundError, DeletionStillRunningError,
-  maxDeletes: DEFAULT_MAX_DELETES, timeoutMs: DEFAULT_DELETE_TIMEOUT_MS,
-  retryBaseMs: DEFAULT_RETRY_BASE_MS, retryMaxMs: DEFAULT_RETRY_MAX_MS,
-})
-
-async function awaitCustomDeleter(deletion: Promise<void>, timeoutMs: number, directory: string): Promise<void> {
-  // A timeout fences the transcript; it does not cancel or join the original work.
-  trackSessionDeletionCleanup(directory, deletion.then(() => undefined, () => undefined))
+async function awaitCustomDeleter(deletion: Promise<void>, timeoutMs: number): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => reject(new DeletionStillRunningError("custom deleter did not settle before timeout")), timeoutMs)
@@ -1079,8 +1166,8 @@ async function waitForProcessGroupEmpty(
   return processGroupIsEmpty(processGroupId)
 }
 
-async function waitForDeletionClosure(
-  closed: Promise<void>,
+async function waitForDeletionExit(
+  exited: Promise<unknown>,
   timeoutMs: number,
 ): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -1089,7 +1176,7 @@ async function waitForDeletionClosure(
     timer.unref?.()
   })
   try {
-    return await Promise.race([closed.then(() => true), timeout])
+    return await Promise.race([exited.then(() => true, () => true), timeout])
   } finally {
     if (timer) clearTimeout(timer)
   }
@@ -1099,18 +1186,9 @@ async function deleteWithSdkChild(
   locator: TranscriptLocator,
   deletionToken: string,
   timeoutMs: number,
-  attachExecutor: (
-    executor: ProcessIncarnation,
-    processGroupId: number,
-    signal: AbortSignal,
-  ) => Promise<void>,
+  attachExecutor: (executor: ProcessIncarnation, processGroupId: number) => Promise<void>,
   options: SessionLifecycleOptions,
 ): Promise<void> {
-  const handshakeTimeoutMs = option(
-    options.deletionHandshakeTimeoutMs,
-    DEFAULT_DELETE_TIMEOUT_MS,
-    "deletionHandshakeTimeoutMs",
-  )
   const sdkUrl = options.sdkModuleUrl ?? import.meta.resolve("@anthropic-ai/claude-agent-sdk")
   const gateDirectory = join(getStoreDir(options), "deletion-gates")
   await mkdir(gateDirectory, { recursive: true, mode: 0o700 })
@@ -1164,30 +1242,17 @@ try {
       MERIDIAN_GC_PROJECT_DIR: locator.projectDir ?? "",
       MERIDIAN_GC_GATE_PATH: gatePath,
       // The child counts its gate deadline from its own start, but the parent
-      // opens the gate only after capturing the child's incarnation — a
+      // only opens the gate after capturing the child's incarnation — a
       // PowerShell round trip on win32 that may consume its entire probe
-      // budget — and after the durable executor handshake. Without both
-      // allowances the child exits 75 before the gate ever appears, turning
-      // every deletion into a retryable failure on a loaded host.
-      MERIDIAN_GC_GATE_TIMEOUT_MS: String(
-        timeoutMs
-        + handshakeTimeoutMs
-        + processIncarnationProbeBudgetMs(),
-      ),
+      // budget. Without that allowance the child can exit 75 before the gate
+      // ever appears, turning every deletion into a retryable failure on a
+      // loaded Windows host.
+      MERIDIAN_GC_GATE_TIMEOUT_MS: String(timeoutMs + processIncarnationProbeBudgetMs() + DELETION_GATE_ADMISSION_MS),
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
     detached: process.platform !== "win32",
   })
-  const originalClosure = deletionChildClosure(child)
-  // A bounded caller may give up before cleanup joins. Keep its owner attached
-  // to the original handle/pipes and read-only group proof beyond that deadline.
-  trackSessionDeletionCleanup(getStoreDir(options), originalClosure.then(async () => {
-    if (process.platform === "win32" || !child.pid) return
-    while (!processGroupIsEmpty(child.pid)) {
-      await new Promise<void>(resolve => { const timer = setTimeout(resolve, 25); timer.unref?.() })
-    }
-  }))
   let output = ""
   const collect = (chunk: Buffer | string): void => {
     if (output.length < 64 * 1024) output += chunk.toString()
@@ -1203,14 +1268,13 @@ try {
   let timer: ReturnType<typeof setTimeout> | undefined
   const joinTimeoutMs = Math.max(100, Math.min(2_000, timeoutMs))
   const processGroupId = child.pid
-  // Signal only while the original leader is still live. After its exit,
-  // retain unknown custody instead of targeting a possibly reused group ID.
+  // win32 recycles a pid the instant the child is reaped, so pid-level kills
+  // are only safe while our un-reaped handle still pins it. If the leader is
+  // already gone there, so is its taskkill-visible tree.
   let deletionTreeKilled = false
   const killDeletionTree = (): void => {
     if (!processGroupId || deletionTreeKilled) return
-    // Once the original leader exited, its numeric PID/group may be reused.
-    // Retain unknown custody rather than signal a later process by that ID.
-    if (child.exitCode !== null || child.signalCode !== null) return
+    if (process.platform === "win32" && (child.exitCode !== null || child.signalCode !== null)) return
     signalProcessGroup(processGroupId, "SIGKILL")
     // macOS can reject a second signal to a killed, not-yet-reaped group
     // with EPERM. Join the original kill instead of masking its timeout.
@@ -1220,42 +1284,7 @@ try {
     if (!processGroupId) throw new Error("session deletion child has no PID")
     const executor = captureProcessIncarnation(processGroupId)
     if (!executor) throw new Error("cannot capture session deletion executor incarnation")
-    // The handshake budget starts after incarnation capture and covers only the
-    // durable attach; losing the race never opens the gate.
-    const handshakeDeadline = performance.now() + handshakeTimeoutMs
-    const handshake = new AbortController()
-    // Admission cancellation joins the handshake fence when the runtime
-    // supports combining; otherwise the handshake deadline alone fences it.
-    const handshakeSignal = options.admissionSignal && typeof AbortSignal.any === "function"
-      ? AbortSignal.any([handshake.signal, options.admissionSignal])
-      : handshake.signal
-    let handshakeTimer: ReturnType<typeof setTimeout> | undefined
-    let onHandshakeAbort: (() => void) | undefined
-    const handshakeAbort = new Promise<never>((_resolve, reject) => {
-      const settle = (): void => reject(handshakeSignal.reason)
-      if (handshakeSignal.aborted) {
-        settle()
-        return
-      }
-      onHandshakeAbort = settle
-      handshakeSignal.addEventListener("abort", onHandshakeAbort, { once: true })
-    })
-    handshakeTimer = setTimeout(() => {
-      handshake.abort(new Error("session deletion executor handshake timed out"))
-    }, handshakeTimeoutMs)
-    handshakeTimer.unref?.()
-    try {
-      await Promise.race([attachExecutor(executor, processGroupId, handshakeSignal), handshakeAbort])
-    } finally {
-      if (handshakeTimer) clearTimeout(handshakeTimer)
-      if (onHandshakeAbort) handshakeSignal.removeEventListener("abort", onHandshakeAbort)
-    }
-    // A delayed timer, an admission abort, or an attach that resolved past
-    // the monotonic deadline must all still fail closed.
-    handshakeSignal.throwIfAborted()
-    if (performance.now() >= handshakeDeadline) {
-      throw new Error("session deletion executor handshake timed out")
-    }
+    await attachExecutor(executor, processGroupId)
     const gateHandle = await open(gatePath, "wx", 0o600)
     try {
       await gateHandle.writeFile("go\n", "utf8")
@@ -1272,23 +1301,18 @@ try {
       timer.unref?.()
     })
     const status = await Promise.race([exited, timeout])
-    // Exit alone does not establish child/pipe closure. Join the original
-    // handle and both captured pipes before accepting any deletion verdict.
-    // On win32 the un-detached leader is the entire
+    // The leader was just joined through its own ChildProcess handle, which
+    // is immune to pid reuse. On win32 the un-detached leader is the entire
     // observable "group" (the SDK's deleteSession spawns no descendants) and
     // its pid is already reusable, so probing it could only misread a reused
     // pid as a still-running deleter and wedge this resource in permanent
     // deferral; the handle join is the fence. POSIX still waits out group
     // survivors.
-    const [handleClosed, groupEmpty] = await Promise.all([
-      waitForDeletionClosure(originalClosure, joinTimeoutMs),
-      process.platform === "win32"
-        ? Promise.resolve(true)
-        : waitForProcessGroupEmpty(processGroupId, joinTimeoutMs),
-    ])
-    joined = handleClosed && groupEmpty
+    joined = process.platform === "win32"
+      ? true
+      : await waitForProcessGroupEmpty(processGroupId, joinTimeoutMs)
     if (!joined) {
-      throw new DeletionStillRunningError("session deletion child, pipes or process group remain unjoined")
+      throw new DeletionStillRunningError("session deletion process group remains active")
     }
     if (status.code === SESSION_GC_NOT_FOUND_EXIT_CODE) {
       throw new TranscriptAlreadyAbsentError(
@@ -1300,17 +1324,17 @@ try {
     }
   } finally {
     if (timer) clearTimeout(timer)
-    if (!joined) {
+    if (!joined && processGroupId) {
       killDeletionTree()
-      const [handleClosed, groupEmpty] = await Promise.all([
-        waitForDeletionClosure(originalClosure, joinTimeoutMs),
+      const [leaderExited, groupEmpty] = await Promise.all([
+        waitForDeletionExit(exited, joinTimeoutMs),
         // win32: the leader's ChildProcess handle is the only reuse-proof
         // join signal; see the comment on the un-timed-out path above.
-        process.platform === "win32" || !processGroupId
+        process.platform === "win32"
           ? Promise.resolve(true)
           : waitForProcessGroupEmpty(processGroupId, joinTimeoutMs),
       ])
-      joined = handleClosed && groupEmpty
+      joined = leaderExited && groupEmpty
       unjoined = !joined
     }
     await unlink(gatePath).catch((error) => {
@@ -1319,7 +1343,7 @@ try {
       }
     })
     if (unjoined) {
-      throw new DeletionStillRunningError("session deletion child, pipes or process group remain unjoined")
+      throw new DeletionStillRunningError("session deletion process group remains unjoined")
     }
   }
 }
@@ -1400,11 +1424,6 @@ export async function createInitializedSidecarLockCandidate(
   }
 }
 
-/** Offline migration uses the same lifecycle lock and recovery protocol as legacy publication. */
-export function withLegacyLifecycleMaintenanceLock<T>(directory: string, operation: () => Promise<T>): Promise<T> {
-  return withSidecarLock({ storeDir: directory, lockWaitMs: 100, lockStaleMs: 1 }, operation)
-}
-
 async function withSidecarLock<T>(
   options: SessionLifecycleOptions,
   operation: (paths: SidecarPaths) => Promise<T>,
@@ -1436,11 +1455,6 @@ async function withSidecarLock<T>(
           if (acquired) break
           await recoverStaleLock(paths.lock, staleMs)
           options.admissionSignal?.throwIfAborted()
-          // Recovery itself may consume the contention budget while durably
-          // retiring a dead owner. Try the now-free lock before deciding to
-          // wait again; the exclusive link still protects any successor.
-          acquired = await candidate.publish()
-          if (acquired) break
           if (performance.now() >= deadline) {
             throw new SessionLifecycleLockError(`timed out waiting for ${paths.lock}`)
           }
@@ -1724,43 +1738,447 @@ async function recoverStaleLock(lockPath: string, staleMs: number): Promise<void
   }
 }
 
-async function readSidecar(path: string): Promise<SessionGcSidecar> {
-  let raw: string
-  try {
-    raw = await readFile(path, "utf8")
-  } catch (error) {
-    if (hasCode(error, "ENOENT")) return {
-      version: SIDECAR_VERSION,
-      meta: { fenceSlots: {} },
-      resources: {},
-    }
-    throw error
-  }
-
-  return parseLegacySidecar(raw, path)
+interface LifecycleInfoRow {
+  seq: number
+  commit_token: string | null
+  imported_json_sha256: string | null
 }
 
-async function writeSidecar(path: string, sidecar: SessionGcSidecar): Promise<void> {
-  const temp = `${path}.tmp-${process.pid}-${randomUUID()}`
-  let handle: Awaited<ReturnType<typeof open>> | undefined
+interface LifecycleRows {
+  /** Each resource's record, serialized. A stored record not here is deleted. */
+  records: ReadonlyMap<string, string>
+  /** Counters that may have advanced. Any other is left as stored. */
+  fenceSlots: ReadonlyMap<string, number>
+}
+
+interface LifecycleCache {
+  /** The lifecycle commit the cache reflects. Every lifecycle commit advances it. */
+  seq: number
+  /** Each resource's record, exactly as stored. Every one has been checked. */
+  records: ReadonlyMap<string, string>
+  /**
+   * The fence counters, checked. A transaction's journal reads them through
+   * its prototype chain, so they are advanced in place rather than copied:
+   * they only ever advance, and lifecycle transactions run one at a time.
+   */
+  fenceSlots: Record<string, number>
+}
+
+// The journal as of the latest lifecycle commit this process has read, each
+// row checked once, when it was read. While nothing changed, a transaction's
+// read of it touches one row; after another process commits, only the rows it
+// wrote are read and checked again.
+const lifecycleCaches = new WeakMap<StoreDatabase, LifecycleCache>()
+
+const UPSERT_RESOURCE = "INSERT INTO lifecycle_resources (key, seq, record) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET seq = excluded.seq, record = excluded.record"
+const DELETE_RESOURCE = "DELETE FROM lifecycle_resources WHERE key = ?"
+const UPSERT_FENCE_SLOT = "INSERT INTO lifecycle_fence_slots (slot, counter, seq) VALUES (?, ?, ?) ON CONFLICT(slot) DO UPDATE SET counter = excluded.counter, seq = excluded.seq"
+const UPDATE_LIFECYCLE_INFO = "UPDATE lifecycle_info SET seq = ?, commit_token = ? WHERE id = 1"
+const RECORD_LIFECYCLE_IMPORT = "UPDATE lifecycle_info SET imported_json_sha256 = ?, imported_json_at = ? WHERE id = 1"
+
+function lifecycleDatabase(dir: string): StoreDatabase {
+  return openStoreDatabase(dir, getStoreLockWaitMs())
+}
+
+function readLifecycleInfo(database: StoreDatabase): LifecycleInfoRow {
+  const info = database.get<LifecycleInfoRow>(
+    "SELECT seq, commit_token, imported_json_sha256 FROM lifecycle_info WHERE id = 1",
+  )
+  if (!info || !Number.isSafeInteger(info.seq) || info.seq < 0) {
+    throw new SessionLifecycleCorruptError(`${database.path} has no valid lifecycle_info row`)
+  }
+  return info
+}
+
+/** The cache, brought up to the database's latest lifecycle commit. */
+function freshLifecycleCache(database: StoreDatabase): LifecycleCache {
+  const cached = lifecycleCaches.get(database)
+  if (cached && readLifecycleInfo(database).seq === cached.seq) return cached
+  const fresh = database.snapshot((): LifecycleCache => {
+    const info = readLifecycleInfo(database)
+    if (cached?.seq === info.seq) return cached
+    return cached && cached.seq < info.seq
+      ? caughtUpLifecycleCache(database, cached, info.seq)
+      : loadLifecycleCache(database, info.seq)
+  })
+  lifecycleCaches.set(database, fresh)
+  return fresh
+}
+
+function loadLifecycleCache(database: StoreDatabase, seq: number): LifecycleCache {
+  const fenceSlots = Object.create(null) as Record<string, number>
+  for (const { slot, counter } of database.all<{ slot: string; counter: number }>(
+    "SELECT slot, counter FROM lifecycle_fence_slots",
+  )) {
+    assertValidFenceSlot(slot, counter, database.path)
+    fenceSlots[slot] = counter
+  }
+  const records = new Map<string, string>()
+  for (const { key, record } of database.all<{ key: string; record: string }>(
+    "SELECT key, record FROM lifecycle_resources",
+  )) {
+    assertValidRecord(key, record, fenceSlots, database.path)
+    records.set(key, record)
+  }
+  return { seq, records, fenceSlots }
+}
+
+/** `cached` with what other processes committed since, read and checked. */
+function caughtUpLifecycleCache(database: StoreDatabase, cached: LifecycleCache, seq: number): LifecycleCache {
+  // Rows carry the sequence of the lifecycle commit that last wrote them.
+  const slots = database.all<{ slot: string; counter: number }>(
+    "SELECT slot, counter FROM lifecycle_fence_slots WHERE seq > ?",
+    cached.seq,
+  )
+  for (const { slot, counter } of slots) assertValidFenceSlot(slot, counter, database.path)
+  // The cached records were checked against the counters the cache holds, so
+  // a counter moved back could leave one ahead of it unnoticed. Counters only
+  // ever advance; for a journal where one did not, check every row again.
+  if (slots.some(({ slot, counter }) => counter < (cached.fenceSlots[slot] ?? 0))) {
+    return loadLifecycleCache(database, seq)
+  }
+  for (const { slot, counter } of slots) cached.fenceSlots[slot] = counter
+  const present = new Set(database.all<{ key: string }>("SELECT key FROM lifecycle_resources").map((row) => row.key))
+  const records = new Map([...cached.records].filter(([key]) => present.has(key)))
+  for (const { key, record } of database.all<{ key: string; record: string }>(
+    "SELECT key, record FROM lifecycle_resources WHERE seq > ?",
+    cached.seq,
+  )) {
+    assertValidRecord(key, record, cached.fenceSlots, database.path)
+    records.set(key, record)
+  }
+  return { seq, records, fenceSlots: cached.fenceSlots }
+}
+
+function assertValidFenceSlot(slot: string, counter: unknown, source: string): void {
+  if (!isValidFenceSlot(slot, counter)) {
+    throw new SessionLifecycleCorruptError(`invalid lifecycle fence slot ${slot} in ${source}`)
+  }
+}
+
+/** Throws unless `record` is a valid record of transcript `key` under these fence counters. */
+function assertValidRecord(
+  key: string,
+  record: string,
+  fenceSlots: Readonly<Record<string, number>>,
+  source: string,
+): void {
+  let resource: unknown
   try {
-    handle = await open(temp, "wx", 0o600)
-    // Compact on purpose: machine-read only, and indentation costs ~25% of the
-    // bytes and of the serialisation CPU spent under the lock.
-    await handle.writeFile(serializeLegacySidecar(sidecar), "utf8")
-    await handle.sync()
-    await handle.close()
-    handle = undefined
-    await rename(temp, path)
-    await chmod(path, 0o600)
-    // Persist the rename itself, not only the temporary file contents. This is
-    // the durability boundary before the SDK may create a managed fork.
-    await syncDirectoryDurably(dirname(path))
+    resource = JSON.parse(record)
   } catch (error) {
-    await handle?.close().catch(() => undefined)
-    await unlink(temp).catch(() => undefined)
+    throw new SessionLifecycleCorruptError(`cannot parse transcript ${key} in ${source}: ${errorMessage(error)}`)
+  }
+  if (!isValidResource(resource, key, fenceSlots)) {
+    throw new SessionLifecycleCorruptError(`invalid transcript ${key} in ${source}`)
+  }
+}
+
+/** The journal for a transaction to change. Its fence counters read through to the cache's. */
+function draftSidecar(cache: LifecycleCache): SessionGcSidecar {
+  const resources: Record<string, TranscriptResource> = {}
+  for (const [key, record] of cache.records) resources[key] = JSON.parse(record) as TranscriptResource
+  return {
+    version: SIDECAR_VERSION,
+    meta: { fenceSlots: Object.create(cache.fenceSlots) as Record<string, number> },
+    resources,
+  }
+}
+
+/** The rows of `sidecar`. A transaction's journal holds as its own only the counters it advanced. */
+function lifecycleRowsOf(sidecar: SessionGcSidecar): LifecycleRows {
+  return {
+    records: new Map(Object.entries(sidecar.resources).map(([key, resource]) => [key, JSON.stringify(resource)])),
+    fenceSlots: new Map(Object.entries(sidecar.meta.fenceSlots)),
+  }
+}
+
+/**
+ * Make the stored journal `next` in one transaction, writing only the rows
+ * that differ. Fence counters only ever advance, whatever `next` holds, and a
+ * record the next transaction could not read is refused before anything is
+ * committed. Returns whether anything was committed.
+ */
+async function commitLifecycleRows(
+  database: StoreDatabase,
+  next: LifecycleRows,
+  extraOps: readonly WriteOp[] = [],
+): Promise<boolean> {
+  const commitToken = randomUUID()
+  const { committed, result } = await database.transact<{
+    base: LifecycleCache
+    cache: LifecycleCache
+    advanced: ReadonlyMap<string, number>
+  } | undefined>({
+    lockWaitMs: getStoreLockWaitMs(),
+    build: () => {
+      const base = freshLifecycleCache(database)
+      const seq = base.seq + 1
+      const ops: WriteOp[] = []
+      const source = `${database.path} (not committed)`
+      const fenceSlots = Object.create(base.fenceSlots) as Record<string, number>
+      const advanced = new Map<string, number>()
+      for (const [slot, counter] of next.fenceSlots) {
+        if (counter <= (base.fenceSlots[slot] ?? 0)) continue
+        assertValidFenceSlot(slot, counter, source)
+        fenceSlots[slot] = counter
+        advanced.set(slot, counter)
+        ops.push([UPSERT_FENCE_SLOT, [slot, counter, seq]])
+      }
+      for (const [key, record] of next.records) {
+        if (base.records.get(key) === record) continue
+        assertValidRecord(key, record, fenceSlots, source)
+        ops.push([UPSERT_RESOURCE, [key, seq, record]])
+      }
+      for (const key of base.records.keys()) {
+        if (!next.records.has(key)) ops.push([DELETE_RESOURCE, [key]])
+      }
+      if (ops.length === 0 && extraOps.length === 0) return { ops, result: undefined }
+      ops.push(...extraOps, [UPDATE_LIFECYCLE_INFO, [seq, commitToken]])
+      const cache = { seq, records: next.records, fenceSlots: base.fenceSlots }
+      return { ops, result: { base, cache, advanced } }
+    },
+    landedDespiteError: () => readLifecycleInfo(database).commit_token === commitToken,
+  })
+  if (committed && result) {
+    if (lifecycleCaches.get(database) === result.base) {
+      for (const [slot, counter] of result.advanced) result.base.fenceSlots[slot] = counter
+      lifecycleCaches.set(database, result.cache)
+    } else if ((lifecycleCaches.get(database)?.seq ?? -1) < result.cache.seq) {
+      lifecycleCaches.delete(database)
+    }
+  }
+  return committed
+}
+
+/** Parse and validate a session-gc.json, upgrading the v1 format. */
+function parseLegacySidecar(raw: Buffer, path: string): SessionGcSidecar {
+  let value: unknown
+  try {
+    value = JSON.parse(raw.toString("utf8"))
+  } catch (error) {
+    throw new SessionLifecycleCorruptError(`cannot parse ${path}: ${errorMessage(error)}`)
+  }
+  const upgraded = upgradeLegacySidecar(value)
+  if (!isValidSidecar(upgraded)) {
+    throw new SessionLifecycleCorruptError(`invalid or unsupported ${path}`)
+  }
+  return upgraded
+}
+
+/**
+ * The journal after taking a session-gc.json into `base`.
+ *
+ * An empty journal takes the file whole. A journal that already holds records
+ * received the file from a Meridian still on the JSON journal: once the first
+ * import renamed the file aside, that process found none and wrote only what
+ * it did since. Its records replace the stored copies of the same transcripts,
+ * no stored record is removed, and fence counters only ever advance.
+ */
+function mergeLegacySidecar(base: LifecycleCache, legacy: SessionGcSidecar): LifecycleRows {
+  const records = new Map(base.records)
+  for (const [key, resource] of Object.entries(legacy.resources)) records.set(key, JSON.stringify(resource))
+  // Committing them advances only the counters ahead of the stored ones.
+  return { records, fenceSlots: new Map(Object.entries(legacy.meta.fenceSlots)) }
+}
+
+/**
+ * Take in a session-gc.json before the transaction that found it reads the
+ * journal. Every version writes that file only under the lifecycle lock this
+ * transaction holds, so nothing changes it or the stored rows meanwhile. The
+ * file stays authoritative until the import commits; the recorded digest
+ * turns a file found again after a crash between the commit and the rename
+ * into a plain rename. A file that does not parse fails the transaction and
+ * is left untouched.
+ */
+async function importLegacySidecar(database: StoreDatabase, legacyPath: string): Promise<void> {
+  if (!existsSync(legacyPath)) return
+  let raw: Buffer
+  try {
+    raw = await readFile(legacyPath)
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return
     throw error
   }
+  const digest = fileDigest(raw)
+  if (readLifecycleInfo(database).imported_json_sha256 !== digest) {
+    const legacy = parseLegacySidecar(raw, legacyPath)
+    const merged = mergeLegacySidecar(freshLifecycleCache(database), legacy)
+    await commitLifecycleRows(database, merged, [[RECORD_LIFECYCLE_IMPORT, [digest, Date.now()]]])
+    console.error(`[sessionLifecycle] imported ${Object.keys(legacy.resources).length} transcript records from ${SIDECAR_NAME} into ${basename(database.path)}`)
+  }
+  try {
+    const retiredPath = await retireImportedFile(legacyPath, digest)
+    if (retiredPath) {
+      console.error(`[sessionLifecycle] ${SIDECAR_NAME} is in the database now; the file is kept as ${basename(retiredPath)}`)
+    }
+  } catch (error) {
+    console.error(`[sessionLifecycle] renaming the imported ${SIDECAR_NAME} aside failed; it is retried by the next transaction:`, errorMessage(error))
+  }
+}
+
+async function readSidecar(paths: SidecarPaths): Promise<SessionGcSidecar> {
+  const database = lifecycleDatabase(dirname(paths.sidecar))
+  await importLegacySidecar(database, paths.sidecar)
+  return draftSidecar(freshLifecycleCache(database))
+}
+
+/** Commit the rows of `sidecar` that changed. Durable once it returns. */
+async function writeSidecar(paths: SidecarPaths, sidecar: SessionGcSidecar): Promise<void> {
+  await commitLifecycleRows(lifecycleDatabase(dirname(paths.sidecar)), lifecycleRowsOf(sidecar))
+}
+
+/**
+ * The transcript lifecycle journal as the next lifecycle transaction will
+ * read it, for diagnostics and tests. A session-gc.json not taken in yet is
+ * still the journal, so that is what this returns.
+ */
+export function readSessionGcSnapshot(storeDir: string = getSessionStoreDir()): SessionGcSidecar {
+  const legacyPath = join(storeDir, SIDECAR_NAME)
+  let raw: Buffer | undefined
+  try {
+    raw = readFileSync(legacyPath)
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) throw error
+  }
+  if (!existsSync(join(storeDir, STORE_DATABASE_NAME))) {
+    return raw
+      ? parseLegacySidecar(raw, legacyPath)
+      : { version: SIDECAR_VERSION, meta: { fenceSlots: {} }, resources: {} }
+  }
+  const database = lifecycleDatabase(storeDir)
+  const cache = freshLifecycleCache(database)
+  const snapshot = draftSidecar(cache)
+  // A copy of the counters, not a view of the cache's, for callers that list them.
+  snapshot.meta.fenceSlots = { ...cache.fenceSlots }
+  if (raw && readLifecycleInfo(database).imported_json_sha256 !== fileDigest(raw)) {
+    // The next transaction takes the file in first.
+    const legacy = parseLegacySidecar(raw, legacyPath)
+    Object.assign(snapshot.resources, legacy.resources)
+    for (const [slot, counter] of Object.entries(legacy.meta.fenceSlots)) {
+      if (counter > (snapshot.meta.fenceSlots[slot] ?? 0)) snapshot.meta.fenceSlots[slot] = counter
+    }
+  }
+  return snapshot
+}
+
+function isValidActiveLeases(value: unknown): value is Record<string, ActiveTranscriptLeaseRecord> {
+  if (!isRecord(value)) return false
+  return Object.entries(value).every(([token, lease]) =>
+    token.length > 0
+    && isRecord(lease)
+    && lease.token === token
+    && parseProcessIncarnation(lease.owner) !== undefined
+    && (lease.purpose === undefined || lease.purpose === "publication")
+    && (lease.purpose !== "publication" || (lease.executor === undefined && lease.executorRecoverable === undefined))
+    && (lease.executor === undefined || parseProcessIncarnation(lease.executor) !== undefined)
+    && (lease.executorRecoverable === undefined || typeof lease.executorRecoverable === "boolean")
+    && (lease.executorRecoverable === undefined || lease.executor !== undefined)
+    && isFiniteNumber(lease.createdAt)
+  )
+}
+
+function fenceSlotForKey(key: string): string {
+  return key.slice(0, 4)
+}
+
+function allocateLifecycleGeneration(sidecar: SessionGcSidecar, key: string): string {
+  const slot = fenceSlotForKey(key)
+  const current = sidecar.meta.fenceSlots[slot] ?? 0
+  if (!Number.isSafeInteger(current) || current < 0 || current === Number.MAX_SAFE_INTEGER) {
+    throw new SessionLifecycleCorruptError(`lifecycle fence slot ${slot} is exhausted or corrupt`)
+  }
+  const next = current + 1
+  sidecar.meta.fenceSlots[slot] = next
+  return `r:${key}:${next}`
+}
+
+function lifecycleGenerationIsValid(value: unknown, key: string): value is string {
+  if (typeof value !== "string") return false
+  const prefix = `r:${key}:`
+  if (!value.startsWith(prefix)) return false
+  const counter = Number(value.slice(prefix.length))
+  return Number.isSafeInteger(counter) && counter > 0
+}
+
+function hasValidTranscriptResourceFields(
+  value: unknown,
+  key: string,
+): value is Record<string, unknown> & LegacyTranscriptResource {
+  if (!/^[a-f0-9]{64}$/.test(key) || !isRecord(value)) return false
+  if (value.key !== key || !isValidLocator(value.locator)) return false
+  if (getTranscriptResourceKey(value.locator) !== key || !isState(value.state)) return false
+  if (!isFiniteNumber(value.createdAt) || !isFiniteNumber(value.updatedAt)) return false
+  if (typeof value.attempts !== "number"
+    || !Number.isSafeInteger(value.attempts)
+    || value.attempts < 0) return false
+  if (value.nextAttemptAt !== undefined && !isFiniteNumber(value.nextAttemptAt)) return false
+  if (value.lastError !== undefined && typeof value.lastError !== "string") return false
+  if (value.deletionToken !== undefined && typeof value.deletionToken !== "string") return false
+  if (value.deletionOwner !== undefined && !parseProcessIncarnation(value.deletionOwner)) return false
+  if (value.deletionExecutor !== undefined && !parseProcessIncarnation(value.deletionExecutor)) return false
+  if (value.deletionProcessGroupId !== undefined && (
+    typeof value.deletionProcessGroupId !== "number"
+    || !Number.isSafeInteger(value.deletionProcessGroupId)
+    || value.deletionProcessGroupId <= 0
+  )) return false
+  // Legacy deleting entries without exact owners/group identity remain permanently fenced.
+  if (value.state !== "deleting" && (
+    value.deletionToken !== undefined
+    || value.deletionOwner !== undefined
+    || value.deletionExecutor !== undefined
+    || value.deletionProcessGroupId !== undefined
+  )) return false
+  if (value.deletionExecutor !== undefined && value.deletionOwner === undefined) return false
+  if (value.deletionProcessGroupId !== undefined && value.deletionExecutor === undefined) return false
+  return value.activeLeases === undefined || isValidActiveLeases(value.activeLeases)
+}
+
+function upgradeLegacySidecar(value: unknown): unknown {
+  if (!isRecord(value) || value.version !== 1 || !isRecord(value.resources)) return value
+  const upgraded: SessionGcSidecar = {
+    version: SIDECAR_VERSION,
+    meta: { fenceSlots: {} },
+    resources: {},
+  }
+  for (const [key, raw] of Object.entries(value.resources)) {
+    if (!hasValidTranscriptResourceFields(raw, key)) return value
+    const generation = allocateLifecycleGeneration(upgraded, key)
+    upgraded.resources[key] = {
+      ...raw,
+      key,
+      generation,
+    }
+  }
+  return upgraded
+}
+
+function isValidFenceSlot(slot: string, counter: unknown): boolean {
+  return /^[a-f0-9]{4}$/.test(slot)
+    && typeof counter === "number"
+    && Number.isSafeInteger(counter)
+    && counter > 0
+}
+
+/** Whether `resource` is a valid record of transcript `key` under these fence counters. */
+function isValidResource(
+  resource: unknown,
+  key: string,
+  fenceSlots: Readonly<Record<string, unknown>>,
+): resource is TranscriptResource {
+  if (!hasValidTranscriptResourceFields(resource, key)) return false
+  if (!lifecycleGenerationIsValid(resource.generation, key)) return false
+  return Number(fenceSlots[fenceSlotForKey(key)] ?? 0)
+    >= Number(resource.generation.slice(`r:${key}:`.length))
+}
+
+function isValidSidecar(value: unknown): value is SessionGcSidecar {
+  if (!isRecord(value) || value.version !== SIDECAR_VERSION
+    || !isRecord(value.meta) || !isRecord(value.meta.fenceSlots)
+    || !isRecord(value.resources)) return false
+  const meta = value.meta as { fenceSlots: Record<string, unknown> }
+  if (!Object.entries(meta.fenceSlots).every(([slot, counter]) => isValidFenceSlot(slot, counter))) return false
+  return Object.entries(value.resources).every(([key, resource]) => isValidResource(resource, key, meta.fenceSlots))
 }
 
 function assertResourceCapacity(
@@ -1861,6 +2279,17 @@ function pruneDeadActiveLeases(resource: TranscriptResource, now: number, unarme
   return changed
 }
 
+/**
+ * Passive retirement must leave room for one active preallocation. Without
+ * that headroom, a profile switch can unpin enough live transcripts to fill
+ * the backlog and block every fresh request until the quarantine expires.
+ * A one-slot configuration cannot reserve capacity without disabling
+ * passive cleanup entirely, so preserve its existing behavior.
+ */
+function passiveRetirementLimit(maxPending: number): number {
+  return maxPending > 1 ? maxPending - 1 : maxPending
+}
+
 function pendingResourceCount(sidecar: SessionGcSidecar): number {
   return Object.values(sidecar.resources).filter((resource) =>
     resource.state === "prepared"
@@ -1919,8 +2348,68 @@ function pruneTombstones(sidecar: SessionGcSidecar, options: SessionLifecycleOpt
   for (const resource of tombstones.slice(maximum)) delete sidecar.resources[resource.key]
 }
 
+function canonicalLocatorPath(path: string, realpaths: Map<string, string> | undefined): string {
+  const lexical = resolve(path)
+  const known = realpaths?.get(lexical)
+  if (known !== undefined) return known
+  let canonical: string
+  try {
+    canonical = realpathSync.native(lexical)
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) throw error
+    canonical = lexical
+  }
+  realpaths?.set(lexical, canonical)
+  return canonical
+}
+
 export function canonicalizeTranscriptLocator(locator: TranscriptLocator): TranscriptLocator {
-  return { ...canonicalizeLocator(locator, undefined) }
+  return canonicalizeLocator(locator, undefined)
+}
+
+/** `realpaths` memoises resolution across one batch; its pins share a few directories. */
+function canonicalizeLocator(
+  locator: TranscriptLocator,
+  realpaths: Map<string, string> | undefined,
+): TranscriptLocator {
+  validateLocator(locator)
+  return {
+    sessionId: locator.sessionId,
+    configDir: canonicalLocatorPath(locator.configDir, realpaths),
+    ...(locator.projectDir ? { projectDir: canonicalLocatorPath(locator.projectDir, realpaths) } : {}),
+    ...(locator.lifecycleGeneration ? { lifecycleGeneration: locator.lifecycleGeneration } : {}),
+  }
+}
+
+function validateLocator(locator: TranscriptLocator): void {
+  if (!locator || typeof locator.sessionId !== "string" || locator.sessionId.length === 0) {
+    throw new TypeError("sessionId must be a non-empty string")
+  }
+  if (typeof locator.configDir !== "string" || !isAbsolute(locator.configDir)) {
+    throw new TypeError("configDir must be an absolute path")
+  }
+  if (locator.projectDir !== undefined
+    && (typeof locator.projectDir !== "string" || !isAbsolute(locator.projectDir))) {
+    throw new TypeError("projectDir must be an absolute path when provided")
+  }
+  if (locator.lifecycleGeneration !== undefined
+    && (typeof locator.lifecycleGeneration !== "string" || locator.lifecycleGeneration.length === 0)) {
+    throw new TypeError("lifecycleGeneration must be a non-empty string when provided")
+  }
+}
+
+function isValidLocator(value: unknown): value is TranscriptLocator {
+  if (!isRecord(value)) return false
+  return typeof value.sessionId === "string"
+    && value.sessionId.length > 0
+    && typeof value.configDir === "string"
+    && isAbsolute(value.configDir)
+    && (value.projectDir === undefined
+      || (typeof value.projectDir === "string" && isAbsolute(value.projectDir)))
+    && (value.lifecycleGeneration === undefined
+      || (typeof value.lifecycleGeneration === "string" && value.lifecycleGeneration.length > 0))
+    && Object.keys(value).every((key) =>
+      key === "sessionId" || key === "configDir" || key === "projectDir" || key === "lifecycleGeneration")
 }
 
 function assertSameLocator(left: TranscriptLocator, right: TranscriptLocator): void {
@@ -1929,6 +2418,11 @@ function assertSameLocator(left: TranscriptLocator, right: TranscriptLocator): v
     || left.projectDir !== right.projectDir) {
     throw new SessionLifecycleCorruptError("resource key collision or locator mismatch")
   }
+}
+
+function isState(value: unknown): value is TranscriptResourceState {
+  return value === "prepared" || value === "live" || value === "retired"
+    || value === "deleting" || value === "deleted"
 }
 
 /** The SDK's UUID-specific absence verdict — the only wording either the parent
@@ -1976,6 +2470,14 @@ function hasCode(error: unknown, code: string): boolean {
   return isRecord(error) && error.code === code
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value)
+}
+
 function nowMs(options: SessionLifecycleOptions): number {
   const value = (options.now ?? Date.now)()
   if (!Number.isFinite(value)) throw new TypeError("now() must return a finite number")
@@ -2000,4 +2502,34 @@ function retiredGraceMs(options: SessionLifecycleOptions): number {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+const SQLITE_BOOKKEEPING_UNSUPPORTED =
+  "SQLite bookkeeping is not supported by this build: the lifecycle journal is kept in sessions.db"
+
+/**
+ * What upstream's SQLite bookkeeping modules take from this file. This build
+ * never installs that backend (bookkeepingMode refuses it), so everything here
+ * but the read-only process probe refuses instead of acting on sessions.db.
+ */
+export const sessionDeletionRuntime = Object.freeze({
+  processGroupIsEmpty,
+  deleteWithSdkChild: async (
+    _locator: TranscriptLocator,
+    _deletionToken: string,
+    _timeoutMs: number,
+    _attachExecutor: (executor: ProcessIncarnation, processGroupId: number, signal: AbortSignal) => Promise<void>,
+    _options: SessionLifecycleOptions,
+  ): Promise<void> => { throw new Error(SQLITE_BOOKKEEPING_UNSUPPORTED) },
+  awaitCustomDeleter: async (_deletion: Promise<void>, _timeoutMs: number, _directory?: string): Promise<void> => {
+    throw new Error(SQLITE_BOOKKEEPING_UNSUPPORTED)
+  },
+  isNotFoundError, DeletionStillRunningError,
+  maxDeletes: DEFAULT_MAX_DELETES, timeoutMs: DEFAULT_DELETE_TIMEOUT_MS,
+  retryBaseMs: DEFAULT_RETRY_BASE_MS, retryMaxMs: DEFAULT_RETRY_MAX_MS,
+})
+
+/** For upstream's bookkeeping migration, which this build refuses to run. */
+export function withLegacyLifecycleMaintenanceLock<T>(_directory: string, _operation: () => Promise<T>): Promise<T> {
+  return Promise.reject(new Error(SQLITE_BOOKKEEPING_UNSUPPORTED))
 }

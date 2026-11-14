@@ -19,6 +19,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import { configPath } from "./configDir"
 import type { PriorityFailbackPolicy } from "./proxy/routing"
+import type { UsageReserveMap } from "./proxy/usageReserve"
 import type { ClaudeExecutableMode } from "./proxy/claudeExecutablePreference"
 import type { PageLayout } from "./telemetry/pageLayout"
 
@@ -47,6 +48,21 @@ export interface MeridianSettings {
   /** Pool-routing weekly reserve per profile id, in percent (e.g.
    *  `{ "personal": 20 }`). MERIDIAN_WEEKLY_RESERVE env var takes precedence. */
   weeklyReserve?: Record<string, number>
+  routingExcludedProfiles?: string[]
+  routingManagedExcludedProfiles?: string[]
+  /**
+   * Profiles held out of rotation by a supervisor, for a measured run: no
+   * unpinned work, failover or warm reaches them, but a request pinned with
+   * `x-meridian-profile` is served there. Written through
+   * `PUT /settings/api/routing`; re-read per request.
+   */
+  routingHeldProfiles?: string[]
+  /**
+   * Per profile id, how far work may take its 5-hour and weekly windows
+   * (proxy/usageReserve.ts). Written by a supervisor through
+   * `PUT /settings/api/routing`; re-read per request.
+   */
+  usageReserves?: UsageReserveMap
   /** The ChatGPT seat (accountUserId) unpinned ChatGPT turns go to first; POST /profiles/active. */
   chatGptActiveSeat?: string
   /** Operator-chosen profile ids for ChatGPT seats, keyed by seat id (accountUserId). */
@@ -81,6 +97,14 @@ export interface MeridianSettings {
   /** ChatGPT gateway features. Re-read per request; resolved in proxy/chatgpt/features.ts. */
   chatgpt?: ChatGptFeatureSettings
 
+  /** Event hook targets; validated and delivered in proxy/hooks.ts. Re-read per event. */
+  hooks?: MeridianHookSettings
+  /**
+   * The address people reach this instance at, e.g. https://meridian.example.
+   * Public OAuth callback URLs are built on it. MERIDIAN_PUBLIC_URL wins; when
+   * neither is set, the address the sign-in was started from is used.
+   */
+  publicUrl?: string
   /**
    * Sentry-protocol DSN (GlitchTip, Sentry) that Meridian's own uncaught
    * exceptions and unhandled rejections are reported to. Unset means off.
@@ -139,6 +163,12 @@ export interface MeridianSettings {
   upstreamUnreachableMinFailures?: number
 }
 
+/** Webhooks get the event as a JSON POST body, commands as JSON on stdin. Absent `events` = all. */
+export type MeridianHookSettings = {
+  webhooks?: Array<{ url: string; events?: string[] }>
+  commands?: Array<{ command: string; events?: string[] }>
+}
+
 /** What the operator saved; absent keys take the defaults in proxy/chatgpt/features.ts. */
 export type ChatGptFeatureSettings = {
   thinkingPassthrough?: boolean
@@ -152,6 +182,8 @@ export type ChatGptFeatureSettings = {
   seatCreditsPolicy?: Record<string, string>
   /** "before-credits" | "after-credits"; see ChatGptFreeSeatOrder. */
   freeSeatOrder?: string
+  /** Seat id (accountUserId) -> hours between renewals, overriding the default for that seat. */
+  seatRenewalHours?: Record<string, number>
 }
 
 /**

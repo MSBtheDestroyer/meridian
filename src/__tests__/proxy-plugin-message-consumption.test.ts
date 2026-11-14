@@ -14,7 +14,7 @@ let calls: Array<{ payload: unknown[]; options: Input["options"] }> = []
 let overrides: Array<{ mockRestore(): void }> = []
 let failures: string[] = []
 const lineagePaths = new WeakMap<object, string>()
-const storePaths = new WeakMap<object, string>()
+const storeDirs = new WeakMap<object, string>()
 
 installSdkMock(() => ({
   query: (input: Input) => (async function* () {
@@ -39,6 +39,7 @@ const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { clearSharedSessions, lookupSharedSession, setSessionStoreDir } = await import("../proxy/sessionStore")
 const { computeMessageHashes } = await import("../proxy/session/lineage")
 const { storeSession } = await import("../proxy/session/cache")
+const { commitRawSession, readCommittedSession } = await import("./storeDatabaseHelpers")
 const ownedDirectories: string[] = []
 
 beforeEach(async () => {
@@ -86,7 +87,7 @@ async function appWithPlugin() {
   const server = createProxyServer({ silent: true, host: "127.0.0.1", port: 0, pluginDir: directory, pluginConfigPath: config, profiles: [{ id: "default", type: "api", apiKey: "fixture-only-no-network" }] })
   await server.initPlugins?.()
   lineagePaths.set(server.app, witness)
-  storePaths.set(server.app, join(storeDirectory, "sessions.json"))
+  storeDirs.set(server.app, storeDirectory)
   return server.app
 }
 
@@ -247,12 +248,13 @@ describe("documented plugin message transforms at SDK ingress", () => {
         const firstId = calls[0]?.options?.sessionId
         if (!firstId) throw new Error("fixture SDK session ID missing")
         if (changedNamespace) {
-          const file = storePaths.get(app)
-          if (!file) throw new Error("fixture store path missing")
-          const document = JSON.parse(readFileSync(file, "utf8"))
+          const directory = storeDirs.get(app)
+          if (!directory) throw new Error("fixture store directory missing")
+          const entry = readCommittedSession(directory, key)
+          const transcript = entry?.currentTranscript as Record<string, unknown> | undefined
+          if (!entry || !transcript) throw new Error("fixture transcript locator missing")
           const changedConfigDir = join(tmpdir(), "different-fixture-transcript-config")
-          document[key].currentTranscript.configDir = changedConfigDir
-          writeFileSync(file, JSON.stringify(document))
+          commitRawSession(directory, key, { ...entry, currentTranscript: { ...transcript, configDir: changedConfigDir } })
           expect(lookupSharedSession(key)?.currentTranscript?.configDir).toBe(changedConfigDir)
         }
         await post(app, [...prior, { role: "assistant", content: "fixture answer" }, { role: "user", content: "next question" }], "modify", stream, key)

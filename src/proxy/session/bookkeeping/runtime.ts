@@ -24,6 +24,12 @@ export type BookkeepingMode = "json" | "sqlite"
 export function bookkeepingMode(env: NodeJS.ProcessEnv = process.env): BookkeepingMode {
   const value = env.MERIDIAN_BOOKKEEPING ?? "json"
   if (value !== "json" && value !== "sqlite") throw new TypeError("MERIDIAN_BOOKKEEPING must be json or sqlite")
+  // This fork keeps the session store and lifecycle journal in sessions.db
+  // (session/storeDatabase.ts), which the SQLite bookkeeping backend does not
+  // read. Selecting it would serve every session from an empty store.
+  if (value === "sqlite") {
+    throw new TypeError("MERIDIAN_BOOKKEEPING=sqlite is not supported by this build: sessions are kept in sessions.db")
+  }
   return value
 }
 

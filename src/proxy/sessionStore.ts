@@ -1,102 +1,172 @@
-import {
-  STORE_META_KEY, STORE_META_VERSION, PRIORITY_STORE_META_VERSION, keyDigest, getStoredSessionGeneration,
-  UUID_PATTERN, emptyStoreDocument, parseStoreDocument, serializeLegacyStore,
-} from "./session/bookkeeping/legacyCodec"
-import type {
-  StoredSessionGeneration, DurablePriorityAssignment, PriorityAssignmentGeneration,
-  SessionStoreMeta, SessionStoreDocument,
-} from "./session/bookkeeping/legacyCodec"
-export { getStoredSessionGeneration, parseStoreDocument, serializeLegacyStore } from "./session/bookkeeping/legacyCodec"
-export type {
-  StoredSessionGeneration, DurablePriorityAssignment, PriorityAssignmentGeneration, DurablePriorityAttempt,
-} from "./session/bookkeeping/legacyCodec"
 /**
- * File-based session store for cross-proxy session resume.
+ * Shared session store for cross-proxy session resume.
  *
  * When running per-terminal proxies (each on a different port),
  * sessions need to be shared so you can resume a conversation
- * started in one terminal from another. This stores session
- * mappings in a JSON file that all proxy instances read/write.
+ * started in one terminal from another. Every proxy instance reads
+ * and writes one SQLite database in the store directory, one row per
+ * mapping (see session/storeDatabase.ts).
  *
- * Format: { [key]: { claudeSessionId, createdAt, lastUsedAt } }
  * Keys are either OpenCode session IDs or conversation fingerprints.
+ * Earlier versions kept the whole store in sessions.json; the first
+ * open of a directory imports that file once and renames it aside.
  */
 
-import {
-  chmodSync,
-  fchmodSync,
-  linkSync,
-  closeSync,
-  existsSync,
-  fstatSync,
-  fsyncSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  rmSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs"
-import { link, open, readFile, rename, unlink, type FileHandle } from "node:fs/promises"
-import { setTimeout as waitForLockRetry } from "node:timers/promises"
+import { existsSync, readFileSync } from "node:fs"
 import { createHash, randomUUID } from "node:crypto"
-import { SessionStoreLockTimeoutError } from "./session/storeErrors"
-import { homedir, hostname } from "node:os"
-import { basename, dirname, isAbsolute, join } from "node:path"
-import {
-  directoryRenameWasBlockedSync,
-  syncDirectoryDurably,
-  syncDirectoryDurablySync,
-} from "./session/durableFileSystem"
+import { homedir } from "node:os"
+import { basename, isAbsolute, join } from "node:path"
 import type { TokenUsage } from "./session/lineage"
 import {
-  createRecoveryClaimOwner,
-  getRecoveryClaimPath,
-  getRecoveryClaimTombstonePath,
-  parseRecoveryClaimOwnerJson,
-  recoveryClaimOwnerIsDead,
-  type RecoveryClaimOwner,
-} from "./session/recoveryClaim"
-import {
-  captureProcessIncarnation,
-  parseProcessIncarnation,
-  processIncarnationIsDead,
-  type ProcessIncarnation,
-} from "./session/processIncarnation"
+  fileDigest,
+  getStoreLockWaitMs,
+  openStoreDatabase,
+  peekStoreDatabase,
+  retireImportedFile,
+  type StoreDatabase,
+  type WriteOp,
+} from "./session/storeDatabase"
 
-import type { TranscriptLocator, StoredSession } from "./session/bookkeeping/types"
-export type { TranscriptLocator, StoredSession } from "./session/bookkeeping/types"
-import { activeStoreBackend } from "./session/bookkeeping/storeBackend"
-import { selectProfileCopies, type ProfileCopyPruneOptions } from "./session/bookkeeping/profileCopies"
-export type { ProfileCopyPruneOptions } from "./session/bookkeeping/profileCopies"
-import { assertBookkeepingIdentityChangeAllowed } from "./session/bookkeeping/storeIdentity"
-import { retainedBookkeepingRuntimeDirectory } from "./session/bookkeeping/runtimeIdentity"
-export { setSessionStoreBackendForTest } from "./session/bookkeeping/storeBackend"
-import type {
-  SharedSessionLookupResult, PriorityAssignmentLookupResult, PriorityAttemptTurn, PriorityAttemptClaim,
-  SharedSessionAndPriorityAssignmentOptions, SharedSessionAndPriorityAssignmentResult,
-  FinalizeSharedSessionAndPriorityAssignmentOptions, RollbackSharedSessionAndPriorityAssignmentOptions,
-  RollbackSharedSessionAndPriorityAssignmentResult,
-} from "./session/bookkeeping/storeTypes"
-export type {
-  SharedSessionLookupResult, PriorityAssignmentLookupResult, PriorityAttemptTurn, PriorityAttemptClaim,
-  SharedSessionPriorityPublication, SharedSessionAndPriorityAssignmentOptions, SharedSessionAndPriorityAssignmentResult,
-  FinalizeSharedSessionAndPriorityAssignmentOptions, RollbackSharedSessionAndPriorityAssignmentOptions,
-  RollbackSharedSessionAndPriorityAssignmentResult,
-} from "./session/bookkeeping/storeTypes"
+export interface TranscriptLocator {
+  sessionId: string
+  configDir: string
+  projectDir?: string
+  /** Opaque lifecycle ownership fence; absent only on legacy mappings. */
+  lifecycleGeneration?: string
+}
+
+export interface StoredSession {
+  claudeSessionId: string
+  /** Monotonic per-entry revision retained for diagnostics and upgrades. */
+  revision?: number
+  /** Unique publication token. Replaced on every durable mapping mutation. */
+  generationId?: string
+  createdAt: number
+  lastUsedAt: number
+  messageCount: number
+  /** Hash of messages[0..messageCount-1] for conversation lineage verification */
+  lineageHash?: string
+  /** Raw client proof when lineageHash cannot certify the SDK execution prefix. */
+  clientLineageHash?: string
+  /** Adapter-owned stable context digest, never prompt text. */
+  resumeContextHash?: string
+  /** Per-message content hashes for precise diff-based compaction detection */
+  messageHashes?: string[]
+  /** Per-message hashes of individual content blocks for append-only tool results */
+  messageBlockHashes?: string[][]
+  /** Per-message SDK assistant UUIDs for undo rollback (null for user messages) */
+  sdkMessageUuids?: Array<string | null>
+  /** SDK assistant UUID immediately before synthetic passthrough denials.
+   *  Continuations resume the same session here, preserving the stable prefix. */
+  passthroughToolCallAssistantUuid?: string
+  /** Forwarded tool IDs pending at the stored assistant checkpoint. */
+  passthroughToolCallIds?: string[]
+  /** Last observed token usage for this Claude session */
+  contextUsage?: TokenUsage
+  /** Previous Claude session ID preserved when the session mapping is replaced.
+   *  Enables recovery when a lineage bug (e.g. false compaction) causes the
+   *  original session to be abandoned and a new one started. */
+  previousClaudeSessionId?: string
+  /** Exact transcript location for the current Claude session. */
+  currentTranscript?: TranscriptLocator
+  /** Transcript location retained when the session mapping is replaced. */
+  previousTranscript?: TranscriptLocator
+}
+
+export type StoredSessionGeneration = string
+
+const STORE_META_KEY = "\u0000meridian-session-store"
+const STORE_META_VERSION = 1
+const PRIORITY_STORE_META_VERSION = 3
+
+export interface DurablePriorityAssignment {
+  profileId: string
+  lastHumanTurnDigest: string
+  /** Monotonic signed issue-time high-water mark for replay suppression. */
+  lastHumanTurnIssuedAt: number
+  mappingKey: string
+  /** Exact mapping generation published atomically with this route. */
+  mappingGeneration: StoredSessionGeneration
+  /** Unique route publication token. Replaced on every route mutation. */
+  generationId: string
+  updatedAt: number
+}
+
+export type PriorityAssignmentGeneration = string
+
+export interface DurablePriorityAttempt {
+  /** A prior exposed or crashed attempt blocks untrusted/same-turn replay. */
+  blocked: boolean
+  blockedTurnDigest: string | null
+  blockedTurnIssuedAt: number | null
+  /** One exact in-flight request owns publication/release for this route. */
+  pendingTurnDigest: string | null
+  pendingTurnIssuedAt: number | null
+  ownerToken: string | null
+  generationId: string
+  updatedAt: number
+}
+
+interface SessionStoreMetaV1 {
+  version: 1
+  /** Fixed hash slots fence absent-key create/delete ABA without unbounded tombstones. */
+  slots: Record<string, number>
+}
+
+interface DurablePriorityRollbackMapping {
+  mappingKey: string
+  /** Exact fallback generation protected until terminal finalization/rollback. */
+  mappingGeneration: StoredSessionGeneration
+}
+
+interface SessionStoreMetaV2 {
+  version: 3
+  /** Shared fixed slots fence both mapping and namespaced route ABA. */
+  slots: Record<string, number>
+  priorityAssignments: Record<string, DurablePriorityAssignment>
+  /** Durable request claims block cross-request replay after committed exposure. */
+  priorityAttempts: Record<string, DurablePriorityAttempt>
+  /** Previous routed mappings retained only until terminal finalization/rollback. */
+  priorityRollbackMappings: Record<string, DurablePriorityRollbackMapping>
+}
+
+type SessionStoreMeta = SessionStoreMetaV1 | SessionStoreMetaV2
+
+interface SessionStoreDocument {
+  sessions: Record<string, StoredSession>
+  meta: SessionStoreMeta
+}
+
+function keyDigest(key: string): string {
+  return createHash("sha256").update(key).digest("hex")
+}
 
 function keySlot(key: string): string {
   // At most 65,536 counters are persisted. A collision can reject safe work,
   // but can never admit stale work because the full key digest is in the token.
+  //
+  // A mapping's slot advances only when the mapping is removed. Absence is
+  // the only generation a slot names: a present mapping's generation is its
+  // own generationId, so creating or rewriting one already changes every
+  // generation that could see it, and only a removal can return a key to an
+  // absence that looks like the one it left. Advancing on every write made
+  // each turn of one busy conversation fail the fresh turn of another whose
+  // absent key happened to hash to the same slot.
   return keyDigest(key).slice(0, 4)
 }
 
 function absenceGeneration(key: string, meta: SessionStoreMeta): StoredSessionGeneration {
   return `a:${keyDigest(key)}:${meta.slots[keySlot(key)] ?? 0}`
+}
+
+/** Exact, key-bound durable generation used for compare-and-swap fencing. */
+export function getStoredSessionGeneration(
+  session: StoredSession,
+  key: string,
+): StoredSessionGeneration {
+  const generationId = session.generationId
+    ?? `legacy-${createHash("sha256").update(JSON.stringify(session)).digest("hex")}`
+  return `p:${keyDigest(key)}:${generationId}`
 }
 
 function keyGeneration(
@@ -150,9 +220,6 @@ function advanceKeySlot(key: string, meta: SessionStoreMeta): void {
 const DEFAULT_MAX_STORED_SESSIONS = 10_000
 const DEFAULT_MAX_PRIORITY_ASSIGNMENTS = 5_000
 const DEFAULT_MAX_PRIORITY_ATTEMPTS = 5_000
-const STALE_LOCK_THRESHOLD_MS = 30_000
-const DEFAULT_LOCK_WAIT_MS = 10_000
-const LOCK_RETRY_MS = 10
 
 export function getMaxStoredSessionsLimit(): number {
   const raw = process.env.MERIDIAN_MAX_STORED_SESSIONS ?? process.env.CLAUDE_PROXY_MAX_STORED_SESSIONS
@@ -178,526 +245,6 @@ export function getMaxPriorityAttemptsLimit(): number {
   return parsed
 }
 
-function getLockWaitMs(): number {
-  const raw = process.env.MERIDIAN_SESSION_LOCK_TIMEOUT_MS
-    ?? process.env.CLAUDE_PROXY_SESSION_LOCK_TIMEOUT_MS
-  if (!raw) return DEFAULT_LOCK_WAIT_MS
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_LOCK_WAIT_MS
-  return parsed
-}
-
-interface StoreLock {
-  path: string
-  token: string
-}
-
-interface StoreLockCandidate {
-  /** Become the lock with an atomic no-replace hard link. False: it is held. */
-  publish: () => Promise<boolean>
-  /** Drop the staging name. A published candidate stays linked as the lock. */
-  discard: () => Promise<void>
-}
-
-/** Initialise fully written lock metadata once per acquisition, off the event
- *  loop, and re-link it on every attempt.
- *
- *  The fsync is load-bearing: stale-lock recovery retires only a lock whose
- *  owner it can parse and prove dead, so a crash must never leave the lock
- *  linked to an unwritten inode. One fsync per attempt does not follow from
- *  that, and on a slow disk it made every retry cost a journal commit on the
- *  directory the holder is about to fsync. This is the same protocol as the
- *  session lifecycle sidecar lock. */
-async function createInitializedLockCandidate(path: string, contents: string): Promise<StoreLockCandidate> {
-  const staging = `${path}.candidate-${process.pid}-${randomUUID()}`
-  const discard = async (): Promise<void> => {
-    try {
-      await unlink(staging)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        console.error("[sessionStore] lock staging cleanup failed:", (error as Error).message)
-      }
-    }
-  }
-  let handle: FileHandle | undefined
-  try {
-    handle = await open(staging, "wx", 0o600)
-    await handle.chmod(0o600)
-    await handle.writeFile(contents, "utf8")
-    await handle.sync()
-    await handle.close()
-    handle = undefined
-  } catch (error) {
-    if (handle) {
-      await handle.close().catch((closeError: unknown) => {
-        console.error("[sessionStore] lock staging close failed:", (closeError as Error).message)
-      })
-    }
-    await discard()
-    throw error
-  }
-  return {
-    publish: async () => {
-      try {
-        await link(staging, path)
-        return true
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") return false
-        throw error
-      }
-    },
-    discard,
-  }
-}
-
-interface CanonicalStoreLockOwner {
-  pid: number
-  hostname: string
-  token: string
-  incarnation: ProcessIncarnation
-}
-
-function parseCanonicalStoreLockOwner(contents: string): CanonicalStoreLockOwner | undefined {
-  try {
-    const owner = JSON.parse(contents) as Record<string, unknown>
-    const incarnation = parseProcessIncarnation(owner.incarnation)
-    if (
-      typeof owner.pid !== "number"
-      || !Number.isInteger(owner.pid)
-      || owner.pid <= 0
-      || typeof owner.hostname !== "string"
-      || owner.hostname.length === 0
-      || typeof owner.token !== "string"
-      || owner.token.length === 0
-      || !incarnation
-    ) return undefined
-    return {
-      pid: owner.pid,
-      hostname: owner.hostname,
-      token: owner.token,
-      incarnation,
-    }
-  } catch {
-    return undefined
-  }
-}
-
-function canonicalStoreLockOwnerIsDead(contents: string): boolean {
-  const owner = parseCanonicalStoreLockOwner(contents)
-  return owner ? processIncarnationIsDead(owner.incarnation) : false
-}
-
-interface StoreRecoveryClaimSnapshot {
-  dev: number
-  ino: number
-  owner?: RecoveryClaimOwner
-}
-
-function snapshotStoreRecoveryClaim(claimPath: string): StoreRecoveryClaimSnapshot | undefined {
-  let info: ReturnType<typeof lstatSync>
-  try {
-    info = lstatSync(claimPath)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
-    throw error
-  }
-  if (!info.isDirectory() || info.isSymbolicLink()) return { dev: info.dev, ino: info.ino }
-
-  let owner: RecoveryClaimOwner | undefined
-  try {
-    owner = parseRecoveryClaimOwnerJson(readFileSync(join(claimPath, "owner.json"), "utf8"))
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-  }
-  return { dev: info.dev, ino: info.ino, owner }
-}
-
-/** Atomically publish a fully initialized, non-empty recovery owner directory. */
-function publishStoreRecoveryClaim(claimPath: string, owner: RecoveryClaimOwner): boolean {
-  const candidate = `${claimPath}.candidate-${process.pid}-${owner.token}`
-  let fd: number | undefined
-  let published = false
-  try {
-    mkdirSync(candidate, { mode: 0o700 })
-    fd = openSync(join(candidate, "owner.json"), "wx", 0o600)
-    writeFileSync(fd, JSON.stringify(owner), "utf8")
-    fsyncSync(fd)
-    closeSync(fd)
-    fd = undefined
-    syncDirectoryDurablySync(candidate)
-
-    // Protocol-created destinations are non-empty directories, so rename is
-    // atomic and no-replace. Refuse malformed pre-existing paths as well.
-    try {
-      lstatSync(claimPath)
-      return false
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-    }
-    try {
-      renameSync(candidate, claimPath)
-      published = true
-      syncDirectoryDurablySync(dirname(claimPath))
-      return true
-    } catch (error) {
-      if (directoryRenameWasBlockedSync(error, claimPath)) return false
-      throw error
-    }
-  } finally {
-    if (fd !== undefined) {
-      try { closeSync(fd) } catch (error) {
-        console.error("[sessionStore] recovery claim owner close failed:", (error as Error).message)
-      }
-    }
-    if (!published) {
-      try { rmSync(candidate, { recursive: true, force: true }) } catch (error) {
-        console.error("[sessionStore] recovery claim candidate cleanup failed:", (error as Error).message)
-      }
-    }
-  }
-}
-
-/** Retire only the observed dead claim generation. Its tombstone fences ABA. */
-function retireDeadStoreRecoveryClaim(claimPath: string, generation: string): boolean {
-  const observed = snapshotStoreRecoveryClaim(claimPath)
-  if (!observed) return true
-  if (
-    !observed.owner
-    || observed.owner.generation !== generation
-    || !recoveryClaimOwnerIsDead(observed.owner)
-  ) return false
-
-  const tombstone = getRecoveryClaimTombstonePath(claimPath, observed.owner.token)
-  try {
-    lstatSync(tombstone)
-    return false
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-  }
-
-  const current = snapshotStoreRecoveryClaim(claimPath)
-  if (
-    !current
-    || current.dev !== observed.dev
-    || current.ino !== observed.ino
-    || current.owner?.token !== observed.owner.token
-    || current.owner.generation !== generation
-    || !recoveryClaimOwnerIsDead(current.owner)
-  ) return !current
-
-  try {
-    renameSync(claimPath, tombstone)
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code === "ENOENT") return true
-    if (directoryRenameWasBlockedSync(error, tombstone)) return false
-    throw error
-  }
-
-  const moved = snapshotStoreRecoveryClaim(tombstone)
-  if (
-    !moved
-    || moved.dev !== observed.dev
-    || moved.ino !== observed.ino
-    || moved.owner?.token !== observed.owner.token
-    || moved.owner.generation !== generation
-  ) throw new Error("recovery claim identity changed during retirement")
-  return true
-}
-
-function releaseStoreRecoveryClaim(claimPath: string, owner: RecoveryClaimOwner): void {
-  try {
-    const current = snapshotStoreRecoveryClaim(claimPath)
-    if (current?.owner?.token === owner.token && current.owner.generation === owner.generation) {
-      rmSync(claimPath, { recursive: true })
-    }
-  } catch (error) {
-    console.error("[sessionStore] stale recovery claim cleanup failed:", (error as Error).message)
-  }
-}
-
-function cleanupStoreRecoveryTombstones(claimPath: string): void {
-  const prefix = `${basename(claimPath)}.orphan-`
-  try {
-    for (const name of readdirSync(dirname(claimPath))) {
-      if (!name.startsWith(prefix)) continue
-      const path = join(dirname(claimPath), name)
-      const info = lstatSync(path)
-      if (info.isDirectory() && !info.isSymbolicLink()) {
-        rmSync(path, { recursive: true })
-      }
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      console.error("[sessionStore] stale recovery tombstone cleanup failed:", (error as Error).message)
-    }
-  }
-}
-
-function retireStaleLock(lockPath: string, staleMs = STALE_LOCK_THRESHOLD_MS): boolean {
-  let token: string
-  let info: ReturnType<typeof statSync>
-  try {
-    token = readFileSync(lockPath, "utf8")
-    info = statSync(lockPath)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true
-    throw new Error(`[sessionStore] stale lock inspection failed: ${(error as Error).message}`, { cause: error })
-  }
-  if (
-    Date.now() - info.mtimeMs <= staleMs
-    || !canonicalStoreLockOwnerIsDead(token)
-  ) return false
-
-  const generation = token
-  const claimPath = getRecoveryClaimPath(lockPath, generation)
-  const claimOwner = createRecoveryClaimOwner(generation)
-  try {
-    if (!publishStoreRecoveryClaim(claimPath, claimOwner)) {
-      if (!retireDeadStoreRecoveryClaim(claimPath, generation)) return false
-      if (!publishStoreRecoveryClaim(claimPath, claimOwner)) return false
-    }
-  } catch (error) {
-    throw new Error(`[sessionStore] stale recovery claim failed: ${(error as Error).message}`, { cause: error })
-  }
-
-  let generationResolved = false
-  try {
-    let currentToken: string
-    let currentInfo: ReturnType<typeof statSync>
-    try {
-      currentToken = readFileSync(lockPath, "utf8")
-      currentInfo = statSync(lockPath)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        generationResolved = true
-        return true
-      }
-      throw error
-    }
-    if (
-      currentToken !== token
-      || currentInfo.dev !== info.dev
-      || currentInfo.ino !== info.ino
-    ) {
-      generationResolved = true
-      return true
-    }
-    if (
-      Date.now() - currentInfo.mtimeMs <= staleMs
-      || !canonicalStoreLockOwnerIsDead(currentToken)
-    ) return false
-
-    const retiredPath = `${lockPath}.stale-${process.pid}-${randomUUID()}`
-    renameSync(lockPath, retiredPath)
-    generationResolved = true
-    try {
-      const movedToken = readFileSync(retiredPath, "utf8")
-      if (movedToken !== currentToken) {
-        throw new Error("claimed lock identity changed during stale recovery")
-      }
-      unlinkSync(retiredPath)
-    } catch (error) {
-      console.error("[sessionStore] stale lock cleanup failed:", (error as Error).message)
-    }
-    return true
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException
-    if (err.code === "ENOENT") {
-      generationResolved = true
-      return true
-    }
-    throw new Error(`[sessionStore] stale lock recovery failed: ${err.message}`, { cause: err })
-  } finally {
-    releaseStoreRecoveryClaim(claimPath, claimOwner)
-    if (generationResolved) cleanupStoreRecoveryTombstones(claimPath)
-  }
-}
-
-async function acquireLock(lockPath: string, waitMs = getLockWaitMs(), staleMs = STALE_LOCK_THRESHOLD_MS): Promise<StoreLock> {
-  const incarnation = captureProcessIncarnation()
-  if (!incarnation) throw new Error("[sessionStore] cannot capture lock owner process incarnation")
-  const token = JSON.stringify({
-    pid: process.pid,
-    hostname: hostname(),
-    token: randomUUID(),
-    incarnation,
-  })
-  const deadline = performance.now() + waitMs
-
-  let candidate: StoreLockCandidate
-  try {
-    candidate = await createInitializedLockCandidate(lockPath, token)
-  } catch (error) {
-    throw new Error(`[sessionStore] lock acquire failed: ${(error as Error).message}`, { cause: error })
-  }
-  try {
-    while (true) {
-      try {
-        if (await candidate.publish()) return { path: lockPath, token }
-      } catch (error) {
-        throw new Error(`[sessionStore] lock acquire failed: ${(error as Error).message}`, { cause: error })
-      }
-
-      if (deadline - performance.now() <= 0) {
-        throw new SessionStoreLockTimeoutError(`[sessionStore] timed out waiting for lock ${lockPath}`)
-      }
-      if (retireStaleLock(lockPath, staleMs)) continue
-      const remaining = deadline - performance.now()
-      if (remaining <= 0) {
-        throw new SessionStoreLockTimeoutError(`[sessionStore] timed out waiting for lock ${lockPath}`)
-      }
-      await waitForLockRetry(Math.min(LOCK_RETRY_MS, remaining))
-    }
-  } finally {
-    await candidate.discard()
-  }
-}
-
-async function releaseLock(lock: StoreLock): Promise<void> {
-  try {
-    if (await readFile(lock.path, "utf8") !== lock.token) {
-      console.error("[sessionStore] lock ownership changed before release")
-      return
-    }
-    await unlink(lock.path)
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException
-    if (err.code !== "ENOENT") {
-      console.error("[sessionStore] lock release failed:", err.message)
-    }
-  }
-}
-
-// One store's mutations run one at a time within this process, in call order.
-// The lock file arbitrates between processes; this queue keeps a process's own
-// writers from polling that lock against each other, which would let a later
-// caller's write land before an earlier one's.
-const storeMutationQueues = new Map<string, Promise<void>>()
-
-function runStoreMutationInOrder(lockPath: string, mutation: () => Promise<void>): Promise<void> {
-  const previous = storeMutationQueues.get(lockPath) ?? Promise.resolve()
-  const current = previous.then(mutation)
-  const tail = current.catch(() => undefined)
-  storeMutationQueues.set(lockPath, tail)
-  void tail.then(() => {
-    if (storeMutationQueues.get(lockPath) === tail) storeMutationQueues.delete(lockPath)
-  })
-  return current
-}
-
-/** Settles, never rejecting, once every store mutation this process has
- *  already started has landed. Mutations started later are not waited for. */
-export function sessionStoreWritesSettled(): Promise<void> {
-  return storeMutationQueues.get(`${getStorePath()}.lock`) ?? Promise.resolve()
-}
-
-const maintenanceLockWaitBuffer = new Int32Array(new SharedArrayBuffer(4))
-
-function sleepSync(milliseconds: number): void {
-  Atomics.wait(maintenanceLockWaitBuffer, 0, 0, milliseconds)
-}
-
-/** Publish fully initialized lock metadata with an atomic no-replace hard link. */
-function publishInitializedLockFile(path: string, contents: string): boolean {
-  const staging = `${path}.candidate-${process.pid}-${randomUUID()}`
-  let fd: number | undefined
-  try {
-    fd = openSync(staging, "wx", 0o600)
-    fchmodSync(fd, 0o600)
-    writeFileSync(fd, contents, "utf8")
-    fsyncSync(fd)
-    closeSync(fd)
-    fd = undefined
-    try {
-      linkSync(staging, path)
-      return true
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false
-      throw error
-    }
-  } finally {
-    if (fd !== undefined) {
-      try { closeSync(fd) } catch (error) {
-        console.error("[sessionStore] lock staging close failed:", (error as Error).message)
-      }
-    }
-    try { unlinkSync(staging) } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        console.error("[sessionStore] lock staging cleanup failed:", (error as Error).message)
-      }
-    }
-  }
-}
-
-function lockPathIsOccupied(lockPath: string): boolean {
-  try {
-    lstatSync(lockPath)
-    return true
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false
-    throw error
-  }
-}
-
-function acquireLegacyMaintenanceLockSync(lockPath: string, waitMs = getLockWaitMs(), staleMs = STALE_LOCK_THRESHOLD_MS): StoreLock {
-  const incarnation = captureProcessIncarnation()
-  if (!incarnation) throw new Error("[sessionStore] cannot capture lock owner process incarnation")
-  const token = JSON.stringify({
-    pid: process.pid,
-    hostname: hostname(),
-    token: randomUUID(),
-    incarnation,
-  })
-  const deadline = performance.now() + waitMs
-
-  while (true) {
-    try {
-      // The occupancy check avoids needless durable staging, not the atomic publication check.
-      if (!lockPathIsOccupied(lockPath) && publishInitializedLockFile(lockPath, token)) {
-        return { path: lockPath, token }
-      }
-    } catch (error) {
-      throw new Error(`[sessionStore] lock acquire failed: ${(error as Error).message}`, { cause: error })
-    }
-
-    if (deadline - performance.now() <= 0) {
-      throw new SessionStoreLockTimeoutError(`[sessionStore] timed out waiting for lock ${lockPath}`)
-    }
-    if (retireStaleLock(lockPath, staleMs)) continue
-    const remaining = deadline - performance.now()
-    if (remaining <= 0) {
-      throw new SessionStoreLockTimeoutError(`[sessionStore] timed out waiting for lock ${lockPath}`)
-    }
-    sleepSync(Math.min(LOCK_RETRY_MS, remaining))
-  }
-}
-
-function releaseLegacyMaintenanceLockSync(lock: StoreLock): void {
-  try {
-    if (readFileSync(lock.path, "utf8") !== lock.token) {
-      console.error("[sessionStore] lock ownership changed before release")
-      return
-    }
-    unlinkSync(lock.path)
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException
-    if (err.code !== "ENOENT") {
-      console.error("[sessionStore] lock release failed:", err.message)
-    }
-  }
-}
-
-/** Offline migration only: reuse legacy acquisition; never release a substituted barrier. */
-export function withLegacyStoreMaintenanceLock<T>(directory: string, operation: () => T): T {
-  const lock = acquireLegacyMaintenanceLockSync(join(directory, "sessions.json.lock"), 100, 0)
-  try {
-    return operation()
-  } finally {
-    if (readFileSync(lock.path, "utf8") === lock.token) releaseLegacyMaintenanceLockSync(lock)
-  }
-}
-
 /** Override for testing — avoids env var race when test files run in parallel */
 let sessionDirOverride: string | null = null
 
@@ -705,27 +252,15 @@ let sessionDirOverride: string | null = null
  *  Pass null to clear. For testing only. The legacy options parameter remains
  *  accepted for compatibility, but transactions are always locked. */
 export function setSessionStoreDir(dir: string | null, _opts?: { skipLocking?: boolean }): void {
-  assertBookkeepingIdentityChangeAllowed()
   sessionDirOverride = dir
 }
 
 /** Return the directory containing the cross-process session store. */
 export function getSessionStoreDir(): string {
-  const retained = retainedBookkeepingRuntimeDirectory()
-  if (retained) return retained
   return sessionDirOverride
     || process.env.MERIDIAN_SESSION_DIR
     || process.env.CLAUDE_PROXY_SESSION_DIR
     || getDefaultCacheDir()
-}
-
-function getStorePath(): string {
-  const dir = getSessionStoreDir()
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true, mode: 0o700 })
-  }
-  chmodSync(dir, 0o700)
-  return join(dir, "sessions.json")
 }
 
 /**
@@ -756,35 +291,435 @@ function getDefaultCacheDir(): string {
   return newDir
 }
 
-interface StoreFileIdentity {
-  dev: number
-  ino: number
-  mtimeMs: number
-  ctimeMs: number
-  size: number
+function isTranscriptLocator(value: unknown, expectedSessionId: string): value is TranscriptLocator {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const locator = value as Record<string, unknown>
+  return locator.sessionId === expectedSessionId
+    && typeof locator.configDir === "string"
+    && isAbsolute(locator.configDir)
+    && (locator.projectDir === undefined
+      || (typeof locator.projectDir === "string" && isAbsolute(locator.projectDir)))
+    && (locator.lifecycleGeneration === undefined
+      || (typeof locator.lifecycleGeneration === "string" && locator.lifecycleGeneration.length > 0))
 }
 
-interface StoreDocumentCache extends StoreFileIdentity {
-  path: string
+function validateStoredSession(key: string, value: unknown): asserts value is StoredSession {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`session store entry ${JSON.stringify(key)} must be an object`)
+  }
+  const entry = value as Record<string, unknown>
+  if (typeof entry.claudeSessionId !== "string" || entry.claudeSessionId.length === 0) {
+    throw new Error(`session store entry ${JSON.stringify(key)} has an invalid Claude session ID`)
+  }
+  if (entry.revision !== undefined && (
+    typeof entry.revision !== "number" || !Number.isInteger(entry.revision) || entry.revision < 1
+  )) throw new Error(`session store entry ${JSON.stringify(key)} has invalid revision`)
+  if (entry.generationId !== undefined && (
+    typeof entry.generationId !== "string" || entry.generationId.length === 0
+  )) throw new Error(`session store entry ${JSON.stringify(key)} has invalid generationId`)
+  for (const field of ["createdAt", "lastUsedAt", "messageCount"] as const) {
+    if (typeof entry[field] !== "number" || !Number.isFinite(entry[field]) || entry[field] < 0) {
+      throw new Error(`session store entry ${JSON.stringify(key)} has invalid ${field}`)
+    }
+  }
+  if (entry.lineageHash !== undefined && typeof entry.lineageHash !== "string") {
+    throw new Error(`session store entry ${JSON.stringify(key)} has invalid lineageHash`)
+  }
+  if (entry.clientLineageHash !== undefined && typeof entry.clientLineageHash !== "string") {
+    throw new Error(`session store entry ${JSON.stringify(key)} has invalid clientLineageHash`)
+  }
+  if (entry.resumeContextHash !== undefined && (
+    typeof entry.resumeContextHash !== "string" || !/^[a-f0-9]{64}$/.test(entry.resumeContextHash)
+  )) throw new Error(`session store entry ${JSON.stringify(key)} has invalid resumeContextHash`)
+  const stringArrays = ["messageHashes", "passthroughToolCallIds"] as const
+  for (const field of stringArrays) {
+    const item = entry[field]
+    if (item !== undefined && (!Array.isArray(item) || item.some((part) => typeof part !== "string"))) {
+      throw new Error(`session store entry ${JSON.stringify(key)} has invalid ${field}`)
+    }
+  }
+  if (entry.sdkMessageUuids !== undefined && (
+    !Array.isArray(entry.sdkMessageUuids)
+    || entry.sdkMessageUuids.some((part) => part !== null && typeof part !== "string")
+  )) throw new Error(`session store entry ${JSON.stringify(key)} has invalid sdkMessageUuids`)
+  if (entry.passthroughToolCallAssistantUuid !== undefined
+    && typeof entry.passthroughToolCallAssistantUuid !== "string") {
+    throw new Error(`session store entry ${JSON.stringify(key)} has invalid passthrough UUID`)
+  }
+  if (entry.previousClaudeSessionId !== undefined && typeof entry.previousClaudeSessionId !== "string") {
+    throw new Error(`session store entry ${JSON.stringify(key)} has invalid previous Claude session ID`)
+  }
+  if (entry.currentTranscript !== undefined
+    && !isTranscriptLocator(entry.currentTranscript, entry.claudeSessionId)) {
+    throw new Error(`session store entry ${JSON.stringify(key)} has invalid current transcript locator`)
+  }
+  if (entry.previousTranscript !== undefined) {
+    if (typeof entry.previousClaudeSessionId !== "string"
+      || !isTranscriptLocator(entry.previousTranscript, entry.previousClaudeSessionId)) {
+      throw new Error(`session store entry ${JSON.stringify(key)} has invalid previous transcript locator`)
+    }
+  }
+}
+
+function hasExactObjectKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort()
+  const wanted = [...expected].sort()
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index])
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+function validatePriorityAssignment(routeKey: string, value: unknown): DurablePriorityAssignment {
+  if (!routeKey || routeKey.length > 512 || !value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`session store priority route ${JSON.stringify(routeKey)} is invalid`)
+  }
+  const assignment = value as Record<string, unknown>
+  if (!hasExactObjectKeys(assignment, [
+    "profileId",
+    "lastHumanTurnDigest",
+    "lastHumanTurnIssuedAt",
+    "mappingKey",
+    "mappingGeneration",
+    "generationId",
+    "updatedAt",
+  ])) {
+    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has unknown or missing fields`)
+  }
+  if (typeof assignment.profileId !== "string" || !assignment.profileId || assignment.profileId.length > 128) {
+    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid profileId`)
+  }
+  if (typeof assignment.lastHumanTurnDigest !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(assignment.lastHumanTurnDigest)) {
+    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid human-turn digest`)
+  }
+  if (
+    typeof assignment.lastHumanTurnIssuedAt !== "number"
+    || !Number.isSafeInteger(assignment.lastHumanTurnIssuedAt)
+    || assignment.lastHumanTurnIssuedAt < 0
+  ) {
+    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid human-turn issue time`)
+  }
+  if (typeof assignment.mappingKey !== "string" || !assignment.mappingKey || assignment.mappingKey.length > 1_024) {
+    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid mappingKey`)
+  }
+  const expectedMappingPrefix = typeof assignment.mappingKey === "string"
+    ? `p:${keyDigest(assignment.mappingKey)}:`
+    : ""
+  if (
+    typeof assignment.mappingGeneration !== "string"
+    || !assignment.mappingGeneration.startsWith(expectedMappingPrefix)
+    || !UUID_PATTERN.test(assignment.mappingGeneration.slice(expectedMappingPrefix.length))
+  ) {
+    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid mapping generation`)
+  }
+  if (typeof assignment.generationId !== "string" || !UUID_PATTERN.test(assignment.generationId)) {
+    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid generationId`)
+  }
+  if (
+    typeof assignment.updatedAt !== "number"
+    || !Number.isSafeInteger(assignment.updatedAt)
+    || assignment.updatedAt < 0
+  ) {
+    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid updatedAt`)
+  }
+  return {
+    profileId: assignment.profileId,
+    lastHumanTurnDigest: assignment.lastHumanTurnDigest,
+    lastHumanTurnIssuedAt: assignment.lastHumanTurnIssuedAt,
+    mappingKey: assignment.mappingKey,
+    mappingGeneration: assignment.mappingGeneration,
+    generationId: assignment.generationId,
+    updatedAt: assignment.updatedAt,
+  }
+}
+
+function validatePriorityAttempt(routeKey: string, value: unknown): DurablePriorityAttempt {
+  if (!routeKey || routeKey.length > 512 || !value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`session store priority attempt ${JSON.stringify(routeKey)} is invalid`)
+  }
+  const attempt = value as Record<string, unknown>
+  if (!hasExactObjectKeys(attempt, [
+    "blocked",
+    "blockedTurnDigest",
+    "blockedTurnIssuedAt",
+    "pendingTurnDigest",
+    "pendingTurnIssuedAt",
+    "ownerToken",
+    "generationId",
+    "updatedAt",
+  ])) throw new Error(`session store priority attempt ${JSON.stringify(routeKey)} has unknown or missing fields`)
+  const validDigest = (digest: unknown): digest is string | null => (
+    digest === null || (typeof digest === "string" && /^[A-Za-z0-9_-]{43}$/.test(digest))
+  )
+  const validIssuedAt = (issuedAt: unknown): issuedAt is number | null => (
+    issuedAt === null || (typeof issuedAt === "number" && Number.isSafeInteger(issuedAt) && issuedAt >= 0)
+  )
+  if (typeof attempt.blocked !== "boolean"
+    || !validDigest(attempt.blockedTurnDigest)
+    || !validIssuedAt(attempt.blockedTurnIssuedAt)
+    || !validDigest(attempt.pendingTurnDigest)
+    || !validIssuedAt(attempt.pendingTurnIssuedAt)
+    || (attempt.blockedTurnDigest === null) !== (attempt.blockedTurnIssuedAt === null)
+    || (attempt.pendingTurnDigest === null) !== (attempt.pendingTurnIssuedAt === null)
+    || (attempt.ownerToken !== null && (typeof attempt.ownerToken !== "string" || !UUID_PATTERN.test(attempt.ownerToken)))
+    || (attempt.ownerToken === null && attempt.pendingTurnDigest !== null)
+    || (!attempt.blocked && attempt.ownerToken === null)) {
+    throw new Error(`session store priority attempt ${JSON.stringify(routeKey)} has invalid state`)
+  }
+  if (typeof attempt.generationId !== "string" || !UUID_PATTERN.test(attempt.generationId)) {
+    throw new Error(`session store priority attempt ${JSON.stringify(routeKey)} has invalid generationId`)
+  }
+  if (typeof attempt.updatedAt !== "number" || !Number.isSafeInteger(attempt.updatedAt) || attempt.updatedAt < 0) {
+    throw new Error(`session store priority attempt ${JSON.stringify(routeKey)} has invalid updatedAt`)
+  }
+  return {
+    blocked: attempt.blocked,
+    blockedTurnDigest: attempt.blockedTurnDigest,
+    blockedTurnIssuedAt: attempt.blockedTurnIssuedAt,
+    pendingTurnDigest: attempt.pendingTurnDigest,
+    pendingTurnIssuedAt: attempt.pendingTurnIssuedAt,
+    ownerToken: attempt.ownerToken,
+    generationId: attempt.generationId,
+    updatedAt: attempt.updatedAt,
+  }
+}
+
+function emptyStoreDocument(): SessionStoreDocument {
+  return { sessions: {}, meta: { version: STORE_META_VERSION, slots: {} } }
+}
+
+function validateStoreMeta(value: unknown): SessionStoreMeta {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("session store metadata must be an object")
+  }
+  const meta = value as Record<string, unknown> & {
+    version?: unknown
+    slots?: unknown
+    priorityAssignments?: unknown
+    priorityAttempts?: unknown
+    priorityRollbackMappings?: unknown
+  }
+  if (
+    (meta.version !== STORE_META_VERSION && meta.version !== PRIORITY_STORE_META_VERSION)
+    || typeof meta.slots !== "object"
+    || meta.slots === null
+    || Array.isArray(meta.slots)
+  ) {
+    throw new Error("session store metadata has an unsupported format")
+  }
+  for (const [slot, counter] of Object.entries(meta.slots)) {
+    if (!/^[0-9a-f]{4}$/.test(slot) || typeof counter !== "number" || !Number.isSafeInteger(counter) || counter < 0) {
+      throw new Error(`session store metadata has invalid generation slot ${JSON.stringify(slot)}`)
+    }
+  }
+  const slots = { ...(meta.slots as Record<string, number>) }
+  if (meta.version === STORE_META_VERSION) {
+    if (!hasExactObjectKeys(meta, ["version", "slots"])) {
+      throw new Error("session store v1 metadata has unknown or missing fields")
+    }
+    return { version: STORE_META_VERSION, slots }
+  }
+  if (!hasExactObjectKeys(meta, ["version", "slots", "priorityAssignments", "priorityAttempts", "priorityRollbackMappings"])) {
+    throw new Error("session store v3 metadata has unknown or missing fields")
+  }
+  if (
+    typeof meta.priorityAssignments !== "object"
+    || meta.priorityAssignments === null
+    || Array.isArray(meta.priorityAssignments)
+  ) throw new Error("session store v3 metadata has invalid priority assignments")
+  if (
+    typeof meta.priorityAttempts !== "object"
+    || meta.priorityAttempts === null
+    || Array.isArray(meta.priorityAttempts)
+  ) throw new Error("session store v3 metadata has invalid priority attempts")
+  if (
+    typeof meta.priorityRollbackMappings !== "object"
+    || meta.priorityRollbackMappings === null
+    || Array.isArray(meta.priorityRollbackMappings)
+  ) throw new Error("session store v3 metadata has invalid priority rollback mappings")
+  const priorityAssignments: Record<string, DurablePriorityAssignment> = {}
+  for (const [routeKey, assignment] of Object.entries(meta.priorityAssignments)) {
+    priorityAssignments[routeKey] = validatePriorityAssignment(routeKey, assignment)
+  }
+  const priorityAttempts: Record<string, DurablePriorityAttempt> = {}
+  for (const [routeKey, attempt] of Object.entries(meta.priorityAttempts)) {
+    priorityAttempts[routeKey] = validatePriorityAttempt(routeKey, attempt)
+  }
+  const priorityRollbackMappings: Record<string, DurablePriorityRollbackMapping> = {}
+  for (const [routeKey, value] of Object.entries(meta.priorityRollbackMappings)) {
+    priorityRollbackMappings[routeKey] = validatePriorityRollback(routeKey, value, priorityAssignments)
+  }
+  return {
+    version: PRIORITY_STORE_META_VERSION,
+    slots,
+    priorityAssignments,
+    priorityAttempts,
+    priorityRollbackMappings,
+  }
+}
+
+function validatePriorityRollback(
+  routeKey: string,
+  value: unknown,
+  priorityAssignments: Record<string, DurablePriorityAssignment>,
+): DurablePriorityRollbackMapping {
+  if (!priorityAssignments[routeKey] || !value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} is invalid`)
+  }
+  const rollback = value as Record<string, unknown>
+  if (
+    !hasExactObjectKeys(rollback, ["mappingKey", "mappingGeneration"])
+    || typeof rollback.mappingKey !== "string"
+    || !rollback.mappingKey
+    || rollback.mappingKey.length > 1_024
+  ) {
+    throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} is invalid`)
+  }
+  const expectedMappingPrefix = `p:${keyDigest(rollback.mappingKey)}:`
+  if (
+    typeof rollback.mappingGeneration !== "string"
+    || !rollback.mappingGeneration.startsWith(expectedMappingPrefix)
+    || !UUID_PATTERN.test(rollback.mappingGeneration.slice(expectedMappingPrefix.length))
+  ) {
+    throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} has invalid mapping generation`)
+  }
+  return {
+    mappingKey: rollback.mappingKey,
+    mappingGeneration: rollback.mappingGeneration,
+  }
+}
+
+/** Every rollback must retain the exact, distinct mapping it would restore. */
+function validateRollbackReferences(sessions: Record<string, StoredSession>, meta: SessionStoreMeta): void {
+  if (meta.version !== PRIORITY_STORE_META_VERSION) return
+  for (const [routeKey, rollback] of Object.entries(meta.priorityRollbackMappings)) {
+    const assignment = meta.priorityAssignments[routeKey]!
+    const mapping = sessions[rollback.mappingKey]
+    if (!mapping) {
+      throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} has no retained mapping`)
+    }
+    if (rollback.mappingKey === assignment.mappingKey) {
+      throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} aliases its current mapping`)
+    }
+    if (getStoredSessionGeneration(mapping, rollback.mappingKey) !== rollback.mappingGeneration) {
+      throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} has a stale mapping generation`)
+    }
+  }
+}
+
+/** Parse and validate a legacy sessions.json document. */
+function parseStoreDocument(data: string): SessionStoreDocument {
+  const parsed: unknown = JSON.parse(data)
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("session store must contain a JSON object")
+  }
+  const sessions: Record<string, StoredSession> = {}
+  let meta: SessionStoreMeta = { version: STORE_META_VERSION, slots: {} }
+  for (const [key, value] of Object.entries(parsed)) {
+    if (key === STORE_META_KEY) {
+      meta = validateStoreMeta(value)
+      continue
+    }
+    validateStoredSession(key, value)
+    sessions[key] = value as StoredSession
+  }
+  validateRollbackReferences(sessions, meta)
+  return { sessions, meta }
+}
+
+const LEGACY_STORE_NAME = "sessions.json"
+
+interface StoreInfoRow {
+  seq: number
+  meta_version: number
+  commit_token: string | null
+  imported_json_sha256: string | null
+}
+
+interface StoreCache {
+  /** The commit sequence the document reflects. Every commit advances it. */
+  seq: number
   document: SessionStoreDocument
 }
 
-function sameStoreFile(cached: StoreDocumentCache | undefined, path: string, info: StoreFileIdentity): boolean {
-  return cached?.path === path
-    && cached.dev === info.dev
-    && cached.ino === info.ino
-    && cached.mtimeMs === info.mtimeMs
-    && cached.ctimeMs === info.ctimeMs
-    && cached.size === info.size
+// The store as of the latest commit this process has read. While nothing
+// changed, a read costs one lookup of the commit sequence; a commit by another
+// process is read incrementally by that sequence. Cached entries are frozen and
+// shared with drafts: a mutation replaces the entries it changes, so the diff
+// against the cache is exactly what it writes.
+const storeCaches = new WeakMap<StoreDatabase, StoreCache>()
+// Databases whose directory has been checked for a legacy sessions.json.
+const legacyChecked = new WeakSet<StoreDatabase>()
+// The last store task queued on each database, settled. The transcript
+// lifecycle journal shares the database and its write queue; a request waits
+// only for the session store's own writes.
+const storeWriteTails = new WeakMap<StoreDatabase, Promise<void>>()
+
+function enqueueStoreTask<T>(database: StoreDatabase, task: () => Promise<T>): Promise<T> {
+  const run = database.enqueue(task)
+  storeWriteTails.set(database, run.then(() => undefined, () => undefined))
+  return run
 }
 
-// Takes the synchronous full-file parse — well over a hundred milliseconds on a
-// long-lived store — off every lookup and every locked mutation. Identity
-// keying is exact because every writer, this process or a foreign one,
-// publishes through rename and therefore a new inode with fresh times.
-// The document and its sessions are immutable: mutateStore hands mutators a
-// copy-on-write view, and entries are replaced rather than edited in place.
-let storeDocumentCache: StoreDocumentCache | undefined
+interface PendingImport {
+  legacyPath: string
+  digest: string
+  legacy: SessionStoreDocument
+  /** The store as the import will leave it, served to readers until it lands. */
+  view: SessionStoreDocument
+}
+
+// A sessions.json that has been read but not yet committed to the database.
+// Until the import lands the file stays authoritative: readers see its
+// contents, and no mutation commits before it.
+const pendingImports = new WeakMap<StoreDatabase, PendingImport>()
+
+const UPSERT_SESSION = "INSERT INTO sessions (key, seq, entry) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET seq = excluded.seq, entry = excluded.entry"
+const DELETE_SESSION = "DELETE FROM sessions WHERE key = ?"
+const UPSERT_SLOT = "INSERT INTO generation_slots (slot, counter) VALUES (?, ?) ON CONFLICT(slot) DO UPDATE SET counter = excluded.counter"
+const UPDATE_STORE_INFO = "UPDATE store_info SET seq = ?, meta_version = ?, commit_token = ? WHERE id = 1"
+const RECORD_IMPORT = "UPDATE store_info SET imported_json_sha256 = ?, imported_json_at = ? WHERE id = 1"
+
+const PRIORITY_TABLES = {
+  priorityAssignments: "priority_assignments",
+  priorityAttempts: "priority_attempts",
+  priorityRollbackMappings: "priority_rollbacks",
+} as const
+type PriorityRecordField = keyof typeof PRIORITY_TABLES
+const PRIORITY_RECORD_FIELDS = Object.keys(PRIORITY_TABLES) as PriorityRecordField[]
+
+function upsertPriorityRecord(field: PriorityRecordField): string {
+  return `INSERT INTO ${PRIORITY_TABLES[field]} (route_key, record) VALUES (?, ?) ON CONFLICT(route_key) DO UPDATE SET record = excluded.record`
+}
+
+function deletePriorityRecord(field: PriorityRecordField): string {
+  return `DELETE FROM ${PRIORITY_TABLES[field]} WHERE route_key = ?`
+}
+
+/** The database of the current store directory, with any legacy file taken in. */
+function storeDatabase(): StoreDatabase {
+  const database = openStoreDatabase(getSessionStoreDir(), getStoreLockWaitMs())
+  if (!legacyChecked.has(database)) {
+    checkLegacyStore(database)
+    legacyChecked.add(database)
+  }
+  return database
+}
+
+function readStoreInfo(database: StoreDatabase): StoreInfoRow {
+  const info = database.get<StoreInfoRow>(
+    "SELECT seq, meta_version, commit_token, imported_json_sha256 FROM store_info WHERE id = 1",
+  )
+  if (!info || !Number.isSafeInteger(info.seq) || info.seq < 0) {
+    throw new Error(`session store ${database.path} has no valid store_info row`)
+  }
+  return info
+}
+
+function parseSessionRow(key: string, entry: string): StoredSession {
+  const value: unknown = JSON.parse(entry)
+  validateStoredSession(key, value)
+  return Object.freeze(value)
+}
 
 function freezeStoreValue(value: unknown): void {
   if (value === null || typeof value !== "object" || Object.isFrozen(value)) return
@@ -805,79 +740,114 @@ function freezeSessionForRead(session: StoredSession): StoredSession {
   return Object.freeze(session)
 }
 
-function cacheStoreDocument(path: string, info: StoreFileIdentity, document: SessionStoreDocument): void {
-  // An in-place edit would reach disk through the serialization memo or be
-  // lost on the next write; freezing turns that into an immediate error.
-  for (const session of Object.values(document.sessions)) Object.freeze(session)
-  freezeStoreValue(document.meta)
-  Object.freeze(document.sessions)
-  Object.freeze(document)
-  storeDocumentCache = {
-    path,
-    dev: info.dev,
-    ino: info.ino,
-    mtimeMs: info.mtimeMs,
-    ctimeMs: info.ctimeMs,
-    size: info.size,
-    document,
+function loadSlots(database: StoreDatabase): Record<string, number> {
+  const slots: Record<string, number> = {}
+  for (const row of database.all<{ slot: string; counter: number }>("SELECT slot, counter FROM generation_slots")) {
+    if (!/^[0-9a-f]{4}$/.test(row.slot) || !Number.isSafeInteger(row.counter) || row.counter < 0) {
+      throw new Error(`session store metadata has invalid generation slot ${JSON.stringify(row.slot)}`)
+    }
+    slots[row.slot] = row.counter
+  }
+  return slots
+}
+
+function priorityRows(database: StoreDatabase, field: PriorityRecordField): Array<{ route_key: string; record: string }> {
+  return database.all<{ route_key: string; record: string }>(`SELECT route_key, record FROM ${PRIORITY_TABLES[field]}`)
+}
+
+function loadMeta(database: StoreDatabase, version: number, slots: Record<string, number>): SessionStoreMeta {
+  if (version === STORE_META_VERSION) {
+    for (const field of PRIORITY_RECORD_FIELDS) {
+      if (priorityRows(database, field).length > 0) {
+        throw new Error("session store v1 metadata has priority records")
+      }
+    }
+    return { version: STORE_META_VERSION, slots }
+  }
+  if (version !== PRIORITY_STORE_META_VERSION) {
+    throw new Error("session store metadata has an unsupported format")
+  }
+  const priorityAssignments: Record<string, DurablePriorityAssignment> = {}
+  for (const row of priorityRows(database, "priorityAssignments")) {
+    priorityAssignments[row.route_key] = validatePriorityAssignment(row.route_key, JSON.parse(row.record))
+  }
+  const priorityAttempts: Record<string, DurablePriorityAttempt> = {}
+  for (const row of priorityRows(database, "priorityAttempts")) {
+    priorityAttempts[row.route_key] = validatePriorityAttempt(row.route_key, JSON.parse(row.record))
+  }
+  const priorityRollbackMappings: Record<string, DurablePriorityRollbackMapping> = {}
+  for (const row of priorityRows(database, "priorityRollbackMappings")) {
+    priorityRollbackMappings[row.route_key] = validatePriorityRollback(
+      row.route_key,
+      JSON.parse(row.record),
+      priorityAssignments,
+    )
+  }
+  return {
+    version: PRIORITY_STORE_META_VERSION,
+    slots,
+    priorityAssignments,
+    priorityAttempts,
+    priorityRollbackMappings,
   }
 }
 
-function readStoreDocumentCached(path: string): SessionStoreDocument {
-  let fd: number | undefined
-  try {
-    const info = statSync(path)
-    if (sameStoreFile(storeDocumentCache, path, info)) return storeDocumentCache!.document
-    // Identity is re-taken from the same fd the content is read from, so a
-    // rename landing between stat and read can never pair one file's identity
-    // with another file's bytes.
-    fd = openSync(path, "r")
-    const identity = fstatSync(fd)
-    const document = parseStoreDocument(readFileSync(fd, "utf8"))
-    cacheStoreDocument(path, identity, document)
-    return document
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-    storeDocumentCache = undefined
-    return emptyStoreDocument()
-  } finally {
-    if (fd !== undefined) closeSync(fd)
+function loadStore(database: StoreDatabase, info: StoreInfoRow): StoreCache {
+  const sessions: Record<string, StoredSession> = {}
+  for (const row of database.all<{ key: string; entry: string }>("SELECT key, entry FROM sessions")) {
+    sessions[row.key] = parseSessionRow(row.key, row.entry)
   }
+  const meta = loadMeta(database, info.meta_version, loadSlots(database))
+  validateRollbackReferences(sessions, meta)
+  return { seq: info.seq, document: { sessions, meta } }
 }
 
-/** Publish a just-written document under the identity of the file it landed in.
- *  A failure to read that identity only costs the next reader a re-parse, so it
- *  must never turn a committed write into a thrown mutation. */
-function publishStoreCache(path: string, document: SessionStoreDocument): void {
-  try {
-    cacheStoreDocument(path, statSync(path), document)
-  } catch {
-    storeDocumentCache = undefined
+/** Apply the commits since `cached` without re-reading unchanged entries.
+ *  Rows carry the sequence of the commit that last wrote them. */
+function catchUpStore(database: StoreDatabase, cached: StoreCache, info: StoreInfoRow): StoreCache {
+  const sessions = { ...cached.document.sessions }
+  const present = new Set(database.all<{ key: string }>("SELECT key FROM sessions").map((row) => row.key))
+  for (const key of Object.keys(sessions)) {
+    if (!present.has(key)) delete sessions[key]
   }
+  for (const row of database.all<{ key: string; entry: string }>(
+    "SELECT key, entry FROM sessions WHERE seq > ?",
+    cached.seq,
+  )) {
+    sessions[row.key] = parseSessionRow(row.key, row.entry)
+  }
+  const meta = loadMeta(database, info.meta_version, loadSlots(database))
+  validateRollbackReferences(sessions, meta)
+  return { seq: info.seq, document: { sessions, meta } }
 }
 
+/** The cache, brought up to the database's latest commit. */
+function freshStoreCache(database: StoreDatabase): StoreCache {
+  const cached = storeCaches.get(database)
+  if (cached && readStoreInfo(database).seq === cached.seq) return cached
+  const fresh = database.snapshot(() => {
+    const info = readStoreInfo(database)
+    if (cached?.seq === info.seq) return cached
+    return cached && cached.seq < info.seq
+      ? catchUpStore(database, cached, info)
+      : loadStore(database, info)
+  })
+  storeCaches.set(database, fresh)
+  return fresh
+}
 
-
-function readStoreStrict(path: string): Record<string, StoredSession> {
-  const sessions = readStoreDocumentCached(path).sessions
-  for (const session of Object.values(sessions)) freezeSessionForRead(session)
-  return sessions
+/** The current store. Callers must treat it as immutable. */
+function currentDocument(): SessionStoreDocument {
+  const database = storeDatabase()
+  return pendingImports.get(database)?.view ?? freshStoreCache(database).document
 }
 
 /** Read a strict, coherent snapshot for maintenance tasks such as session GC.
- *  Unlike lookup helpers, malformed JSON and I/O errors are propagated. */
+ *  Unlike lookup helpers, a corrupt store and I/O errors are propagated. */
 export function readSessionStoreSnapshot(): Record<string, StoredSession> {
-  const backend = activeStoreBackend()
-  if (backend) return backend.readSessionStoreSnapshot(getSessionStoreDir())
-  return readStoreStrict(getStorePath())
-}
-
-/** Locator-only API; the SQLite backend must not hydrate history to supply durable pins. */
-export function readSessionTranscriptPins(): TranscriptLocator[] {
-  const backend = activeStoreBackend()
-  if (backend) return backend.readSessionTranscriptPins(getSessionStoreDir())
-  return Object.values(readSessionStoreSnapshot()).flatMap((session) =>
-    [session.currentTranscript, session.previousTranscript].flatMap((locator) => locator ? [{ ...locator }] : []))
+  const sessions = currentDocument().sessions
+  for (const session of Object.values(sessions)) freezeSessionForRead(session)
+  return Object.freeze(sessions)
 }
 
 /** Capture exact durable generations for one adapter session across profile keys. */
@@ -885,9 +855,7 @@ export function readSessionStoreGenerationSnapshot(
   adapterSessionId: string,
   profileIds: readonly string[] = [],
 ): Record<string, StoredSessionGeneration> {
-  const backend = activeStoreBackend()
-  if (backend) return backend.readSessionStoreGenerationSnapshot(getSessionStoreDir(), adapterSessionId, profileIds)
-  const document = readStoreDocumentCached(getStorePath())
+  const document = currentDocument()
   const keys = new Set(Object.keys(document.sessions).filter((key) =>
     key === adapterSessionId || key.endsWith(`:${adapterSessionId}`)))
   keys.add(adapterSessionId)
@@ -903,7 +871,6 @@ export function readSessionStoreGenerationSnapshot(
   ]))
 }
 
-
 function readStore(): Record<string, StoredSession> {
   try {
     return readSessionStoreSnapshot()
@@ -913,111 +880,323 @@ function readStore(): Record<string, StoredSession> {
   }
 }
 
-async function fsyncParentDirectory(path: string): Promise<void> {
-  try {
-    await syncDirectoryDurably(dirname(path))
-  } catch (error) {
-    // Preserve the store's legacy best-effort parent flush on supported filesystems.
-    void error
+/** A copy of the whole store in the shape sessions.json had: the mappings plus
+ *  the metadata under its reserved key. For diagnostics and tests. */
+export function readSessionStoreDocument(): Record<string, unknown> {
+  const { sessions, meta } = currentDocument()
+  const slots: Record<string, number> = {}
+  // Draft counters inherit the ones they did not advance.
+  for (const slot in meta.slots) slots[slot] = meta.slots[slot]!
+  return structuredClone({ [STORE_META_KEY]: { ...meta, slots }, ...sessions })
+}
+
+/** Settles, never rejecting, once every store write this process has already
+ *  started has landed. Writes started later are not waited for. */
+export function sessionStoreWritesSettled(): Promise<void> {
+  const database = peekStoreDatabase(getSessionStoreDir())
+  return (database && storeWriteTails.get(database)) ?? Promise.resolve()
+}
+
+function copyRecords<T extends object>(records: Record<string, T>): Record<string, T> {
+  const copy: Record<string, T> = {}
+  for (const [key, record] of Object.entries(records)) copy[key] = { ...record }
+  return copy
+}
+
+/**
+ * The document a mutator edits. Entries are shared with the cache, frozen, and
+ * replaced by the mutators that change them. Slot counters overlay the cache's
+ * through the prototype chain, so the draft's own properties are exactly the
+ * counters advanced. Priority records are edited in place, so they are copies.
+ */
+function draftStoreDocument(base: SessionStoreDocument): SessionStoreDocument {
+  const slots = Object.create(base.meta.slots) as Record<string, number>
+  const sessions = { ...base.sessions }
+  if (base.meta.version === STORE_META_VERSION) {
+    return { sessions, meta: { version: STORE_META_VERSION, slots } }
+  }
+  return {
+    sessions,
+    meta: {
+      version: PRIORITY_STORE_META_VERSION,
+      slots,
+      priorityAssignments: copyRecords(base.meta.priorityAssignments),
+      priorityAttempts: copyRecords(base.meta.priorityAttempts),
+      priorityRollbackMappings: copyRecords(base.meta.priorityRollbackMappings),
+    },
   }
 }
 
-// Entries are immutable once cached, so each is stringified and UTF-8 encoded
-// at most once; a mutation re-encodes only the entries it replaced. Encoding
-// the whole store was most of a write's CPU, all of it blocking the loop.
-const serializedEntries = new WeakMap<StoredSession, Buffer>()
-
-function serializeStoreDocument(document: SessionStoreDocument): Buffer {
-  // Compact on purpose: machine-read only, and indentation costs ~20% of the
-  // bytes and of the stringify CPU on a large store.
-  const chunks: Buffer[] = [Buffer.from(`{${JSON.stringify(STORE_META_KEY)}:${JSON.stringify(document.meta)}`, "utf8")]
-  for (const [key, session] of Object.entries(document.sessions)) {
-    let entry = serializedEntries.get(session)
-    if (entry === undefined) {
-      entry = Buffer.from(JSON.stringify(session), "utf8")
-      serializedEntries.set(session, entry)
-    }
-    chunks.push(Buffer.from(`,${JSON.stringify(key)}:`, "utf8"), entry)
-  }
-  chunks.push(Buffer.from("}", "utf8"))
-  return Buffer.concat(chunks)
+function sameFlatRecord(left: object, right: object): boolean {
+  const leftEntries = Object.entries(left)
+  if (leftEntries.length !== Object.keys(right).length) return false
+  return leftEntries.every(([key, value]) => (right as Record<string, unknown>)[key] === value)
 }
 
-/** Write the document to a temporary file, fsync it, then rename it over the
- *  store. Every step is awaited on a file handle: on a busy filesystem one
- *  fsync of the store can take seconds, and doing it synchronously stopped the
- *  whole proxy for that long. */
-async function writeStore(path: string, document: SessionStoreDocument, beforePublish?: () => void): Promise<void> {
-  const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`
-  let handle: FileHandle | undefined
-  try {
-    handle = await open(tmp, "wx", 0o600)
-    await handle.chmod(0o600)
-    await handle.writeFile(serializeStoreDocument(document))
-    await handle.sync()
-    await handle.close()
-    handle = undefined
-    // Disk waits yield to cancellation and forced shutdown. Recheck authority
-    // at the publication boundary, without yielding before dispatching rename.
-    beforePublish?.()
-    await rename(tmp, path)
-  } catch (error) {
-    if (handle) {
-      await handle.close().catch((closeError: unknown) => {
-        console.error("[sessionStore] temp close failed:", (closeError as Error).message)
-      })
-    }
-    try {
-      await unlink(tmp)
-    } catch (cleanupError) {
-      if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") {
-        console.error("[sessionStore] temp cleanup failed:", (cleanupError as Error).message)
+function priorityRecords(meta: SessionStoreMeta, field: PriorityRecordField): Record<string, object> {
+  return meta.version === PRIORITY_STORE_META_VERSION ? meta[field] : {}
+}
+
+/** The statements that turn `base` into `draft`, or none when they are equal. */
+function storeChangeOps(
+  base: SessionStoreDocument,
+  draft: SessionStoreDocument,
+  seq: number,
+  commitToken: string,
+): WriteOp[] {
+  const ops: WriteOp[] = []
+  for (const [key, entry] of Object.entries(draft.sessions)) {
+    if (base.sessions[key] !== entry) ops.push([UPSERT_SESSION, [key, seq, JSON.stringify(entry)]])
+  }
+  for (const key of Object.keys(base.sessions)) {
+    if (!Object.hasOwn(draft.sessions, key)) ops.push([DELETE_SESSION, [key]])
+  }
+  const slots = draft.meta.slots
+  const advanced = Object.getPrototypeOf(slots) === base.meta.slots
+    ? Object.keys(slots)
+    // A mutator replaced the counters outright: compare every one.
+    : Object.keys(slots).filter((slot) => slots[slot] !== base.meta.slots[slot])
+  for (const slot of advanced) ops.push([UPSERT_SLOT, [slot, slots[slot]!]])
+  for (const field of PRIORITY_RECORD_FIELDS) {
+    const before = priorityRecords(base.meta, field)
+    const after = priorityRecords(draft.meta, field)
+    for (const [routeKey, record] of Object.entries(after)) {
+      const previous = before[routeKey]
+      if (!previous || !sameFlatRecord(previous, record)) {
+        ops.push([upsertPriorityRecord(field), [routeKey, JSON.stringify(record)]])
       }
     }
-    throw new Error(`[sessionStore] write failed: ${(error as Error).message}`, { cause: error })
+    for (const routeKey of Object.keys(before)) {
+      if (!Object.hasOwn(after, routeKey)) ops.push([deletePriorityRecord(field), [routeKey]])
+    }
   }
+  if (ops.length === 0 && draft.meta.version === base.meta.version) return ops
+  ops.push([UPDATE_STORE_INFO, [seq, draft.meta.version, commitToken]])
+  return ops
+}
+
+/** The cached document after `draft` committed over `base`. */
+function committedDocument(base: SessionStoreDocument, draft: SessionStoreDocument): SessionStoreDocument {
+  // The counters only advance. Updating the cached object in place is safe
+  // because mutations run one at a time and readers use it synchronously.
+  const slots = base.meta.slots
+  for (const slot of Object.keys(draft.meta.slots)) slots[slot] = draft.meta.slots[slot]!
+  const meta: SessionStoreMeta = draft.meta.version === PRIORITY_STORE_META_VERSION
+    ? { ...draft.meta, slots }
+    : { version: STORE_META_VERSION, slots }
+  return { sessions: draft.sessions, meta }
+}
+
+interface StoreCommit {
+  base: StoreCache
+  draft: SessionStoreDocument
+  seq: number
 }
 
 async function mutateStore(mutator: (document: SessionStoreDocument) => boolean, beforePublish?: () => void, afterCommit?: () => void): Promise<void> {
-  const path = getStorePath()
-  const lockPath = `${path}.lock`
-  await runStoreMutationInOrder(lockPath, async () => {
-    const lock = await acquireLock(lockPath)
-    try {
-      // Every writer publishes while holding this lock, so the file identity
-      // checked here cannot change before our own rename: a cache hit is the
-      // current durable document without a re-parse. The draft shares entries
-      // with it; mutators replace entries and never edit them in place.
-      const current = readStoreDocumentCached(path)
-      const draft: SessionStoreDocument = {
-        sessions: { ...current.sessions },
-        meta: structuredClone(current.meta),
-      }
-      if (mutator(draft)) {
+  const database = storeDatabase()
+  const commitToken = randomUUID()
+  await enqueueStoreTask(database, async () => {
+    const pending = pendingImports.get(database)
+    if (pending) await importLegacyStore(database, pending)
+    const { committed, result: commit } = await database.transactNow<StoreCommit | undefined>({
+      lockWaitMs: getStoreLockWaitMs(),
+      build: () => {
+        // This process holds the write lock, so the store cannot change while
+        // the mutator decides: catch the cache up and draft on top of it.
+        const base = freshStoreCache(database)
+        const draft = draftStoreDocument(base.document)
+        if (!mutator(draft)) return { ops: [], result: undefined }
         // A new entry may still reference caller-owned arrays or usage objects.
-        // Own and freeze those values before memoizing bytes; otherwise later
-        // caller/lookup edits make memory disagree with the durable serialization.
-        // Unchanged entries are already deeply frozen and retain their memo keys.
-        for (const [key, session] of Object.entries(draft.sessions)) {
-          if (!Object.isFrozen(session)) {
-            const owned = structuredClone(session)
+        // Own and freeze those values before serializing; otherwise later
+        // caller/lookup edits make the cache disagree with the database.
+        for (const [key, entry] of Object.entries(draft.sessions)) {
+          if (base.document.sessions[key] !== entry && !Object.isFrozen(entry)) {
+            const owned = structuredClone(entry)
             freezeStoreValue(owned)
             draft.sessions[key] = owned
           }
         }
-        await writeStore(path, draft, beforePublish)
-        // Readers see the renamed file from here on whether or not the
-        // directory flush below has finished; publishing now spares them a
-        // re-parse of the whole store while that flush waits on the disk.
-        publishStoreCache(path, draft)
-        await fsyncParentDirectory(path)
+        const seq = base.seq + 1
+        const ops = storeChangeOps(base.document, draft, seq, commitToken)
+        // Recheck authority at the publication boundary: the queue and the
+        // lock wait yield to cancellation and forced shutdown.
+        if (ops.length > 0) beforePublish?.()
+        return { ops, result: { base, draft, seq } }
+      },
+      landedDespiteError: () => readStoreInfo(database).commit_token === commitToken,
+    })
+    if (committed && commit) {
+      if (storeCaches.get(database) === commit.base) {
+        storeCaches.set(database, { seq: commit.seq, document: committedDocument(commit.base.document, commit.draft) })
+      } else if ((storeCaches.get(database)?.seq ?? -1) < commit.seq) {
+        // A read replaced the cache before this commit landed; the next read
+        // loads what the database holds.
+        storeCaches.delete(database)
       }
-      // Complete local effects before releasing this writer or admitting the next.
-      afterCommit?.()
-    } finally {
-      await releaseLock(lock)
     }
+    // Complete local effects before admitting the next writer.
+    afterCommit?.()
   })
+}
+
+function storeIsEmpty(document: SessionStoreDocument): boolean {
+  if (Object.keys(document.sessions).length > 0 || Object.keys(document.meta.slots).length > 0) return false
+  return PRIORITY_RECORD_FIELDS.every((field) => Object.keys(priorityRecords(document.meta, field)).length === 0)
+}
+
+function protectedMappingKeys(meta: SessionStoreMeta): Set<string> {
+  if (meta.version !== PRIORITY_STORE_META_VERSION) return new Set()
+  return new Set([
+    ...Object.values(meta.priorityAssignments).map((assignment) => assignment.mappingKey),
+    ...Object.values(meta.priorityRollbackMappings).map((rollback) => rollback.mappingKey),
+  ])
+}
+
+interface LegacyImport {
+  draft: SessionStoreDocument
+  /** Mappings taken from the file. */
+  imported: number
+  /** Mappings of the file the database already had in a newer or protected copy. */
+  kept: number
+  /** Priority records of the file left out of a merge. */
+  skippedRoutes: number
+  merged: boolean
+}
+
+/**
+ * The store after taking a legacy sessions.json into `base`.
+ *
+ * An empty database takes the file whole. A database that already holds a
+ * store, because a process still on an older version rewrote the file after
+ * the first import, only merges it: an entry of the file replaces the
+ * database's copy only when it was used more recently, nothing is deleted, and
+ * the file's priority records are left out, so the database's routes and the
+ * mappings they protect stay exactly as they are.
+ */
+function legacyImportDraft(base: SessionStoreDocument, legacy: SessionStoreDocument): LegacyImport {
+  const draft = draftStoreDocument(base)
+  if (storeIsEmpty(base)) {
+    Object.assign(draft.sessions, legacy.sessions)
+    for (const [slot, counter] of Object.entries(legacy.meta.slots)) draft.meta.slots[slot] = counter
+    if (legacy.meta.version === PRIORITY_STORE_META_VERSION) {
+      draft.meta = {
+        version: PRIORITY_STORE_META_VERSION,
+        slots: draft.meta.slots,
+        priorityAssignments: copyRecords(legacy.meta.priorityAssignments),
+        priorityAttempts: copyRecords(legacy.meta.priorityAttempts),
+        priorityRollbackMappings: copyRecords(legacy.meta.priorityRollbackMappings),
+      }
+    }
+    return { draft, imported: Object.keys(legacy.sessions).length, kept: 0, skippedRoutes: 0, merged: false }
+  }
+  for (const [slot, counter] of Object.entries(legacy.meta.slots)) {
+    if (counter > (draft.meta.slots[slot] ?? 0)) draft.meta.slots[slot] = counter
+  }
+  const protectedKeys = protectedMappingKeys(base.meta)
+  let imported = 0
+  let kept = 0
+  for (const [key, entry] of Object.entries(legacy.sessions)) {
+    const current = base.sessions[key]
+    if (protectedKeys.has(key) || (current && current.lastUsedAt >= entry.lastUsedAt)) {
+      kept++
+      continue
+    }
+    draft.sessions[key] = entry
+    advanceKeySlot(key, draft.meta)
+    imported++
+  }
+  const skippedRoutes = PRIORITY_RECORD_FIELDS
+    .reduce((count, field) => count + Object.keys(priorityRecords(legacy.meta, field)).length, 0)
+  return { draft, imported, kept, skippedRoutes, merged: true }
+}
+
+/**
+ * Find a sessions.json left by an earlier version and queue its import.
+ *
+ * The file stays authoritative until the import commits: readers see what it
+ * holds, no mutation commits before it, and a failed import is retried by the
+ * next mutation, which fails with it. The database records the digest of the
+ * file it imported, so a file found again after a crash between the commit and
+ * the rename is only renamed. A file that does not parse fails every store
+ * operation and is left untouched, as it was before the database existed.
+ */
+function checkLegacyStore(database: StoreDatabase): void {
+  const legacyPath = join(database.dir, LEGACY_STORE_NAME)
+  let raw: Buffer
+  try {
+    raw = readFileSync(legacyPath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+    throw error
+  }
+  const digest = fileDigest(raw)
+  if (readStoreInfo(database).imported_json_sha256 === digest) {
+    void enqueueStoreTask(database, () => retireLegacyStore(legacyPath, digest))
+    return
+  }
+  const legacy = parseStoreDocument(raw.toString("utf8"))
+  for (const entry of Object.values(legacy.sessions)) Object.freeze(entry)
+  const pending: PendingImport = {
+    legacyPath,
+    digest,
+    legacy,
+    view: legacyImportDraft(freshStoreCache(database).document, legacy).draft,
+  }
+  pendingImports.set(database, pending)
+  void enqueueStoreTask(database, () => importLegacyStore(database, pending)).catch((error: unknown) => {
+    console.error(
+      `[sessionStore] importing ${LEGACY_STORE_NAME} failed; it stays the store until the next write retries:`,
+      (error as Error).message,
+    )
+  })
+}
+
+/** Commit a pending import. Only from inside an enqueued task. */
+async function importLegacyStore(database: StoreDatabase, pending: PendingImport): Promise<void> {
+  if (pendingImports.get(database) !== pending) return
+  const { committed, result: taken } = await database.transactNow<LegacyImport | undefined>({
+    lockWaitMs: getStoreLockWaitMs(),
+    build: () => {
+      // Another process may have imported the same file while this one waited.
+      if (readStoreInfo(database).imported_json_sha256 === pending.digest) return { ops: [], result: undefined }
+      const base = freshStoreCache(database)
+      const taken = legacyImportDraft(base.document, pending.legacy)
+      return {
+        ops: [
+          ...storeChangeOps(base.document, taken.draft, base.seq + 1, randomUUID()),
+          [RECORD_IMPORT, [pending.digest, Date.now()]],
+        ],
+        result: taken,
+      }
+    },
+    landedDespiteError: () => readStoreInfo(database).imported_json_sha256 === pending.digest,
+  })
+  pendingImports.delete(database)
+  storeCaches.delete(database)
+  if (committed && taken) {
+    const into = basename(database.path)
+    console.error(taken.merged
+      ? `[sessionStore] merged ${taken.imported} sessions from ${LEGACY_STORE_NAME} into ${into}; kept the database's copy of ${taken.kept}`
+        + (taken.skippedRoutes > 0 ? ` and left out ${taken.skippedRoutes} priority records` : "")
+      : `[sessionStore] imported ${taken.imported} sessions from ${LEGACY_STORE_NAME} into ${into}`)
+  }
+  await retireLegacyStore(pending.legacyPath, pending.digest)
+}
+
+/** Rename an imported sessions.json aside, never deleting it. The import it
+ *  was taken in by is a synced commit, so the file is no longer needed. A file
+ *  rewritten since, by a process still on an older version, stays for the next
+ *  start to take in. */
+async function retireLegacyStore(legacyPath: string, digest: string): Promise<void> {
+  try {
+    const retiredPath = await retireImportedFile(legacyPath, digest)
+    if (retiredPath) {
+      console.error(`[sessionStore] ${LEGACY_STORE_NAME} is in the database now; the file is kept as ${basename(retiredPath)}`)
+    }
+  } catch (error) {
+    console.error(`[sessionStore] renaming the imported ${LEGACY_STORE_NAME} aside failed; it is retried on the next start:`, (error as Error).message)
+  }
 }
 
 function hasLegacyUserDenialBoundary(session: StoredSession): boolean {
@@ -1025,12 +1204,15 @@ function hasLegacyUserDenialBoundary(session: StoredSession): boolean {
   return typeof legacy === "string" && legacy.length > 0 && !session.passthroughToolCallAssistantUuid
 }
 
+export type SharedSessionLookupResult =
+  | { status: "found"; session: StoredSession; generation?: StoredSessionGeneration }
+  | { status: "missing"; existing?: StoredSession; generation?: StoredSessionGeneration }
+  | { status: "error"; error: Error }
+
 /** Distinguish an authoritative absence from a transient/corrupt read. */
 export function lookupSharedSessionResult(key: string): SharedSessionLookupResult {
-  const backend = activeStoreBackend()
-  if (backend) return backend.lookupSharedSessionResult(getSessionStoreDir(), key)
   try {
-    const document = readStoreDocumentCached(getStorePath())
+    const document = currentDocument()
     const session = document.sessions[key]
     const generation = keyGeneration(key, session, document.meta)
     if (!session) return { status: "missing", generation }
@@ -1052,12 +1234,20 @@ export function lookupSharedSession(key: string): StoredSession | undefined {
   return result.status === "found" ? result.session : undefined
 }
 
+export type PriorityAssignmentLookupResult =
+  | {
+      status: "found"
+      assignment: DurablePriorityAssignment
+      generation: PriorityAssignmentGeneration
+      attempt?: DurablePriorityAttempt
+    }
+  | { status: "missing"; generation: PriorityAssignmentGeneration; attempt?: DurablePriorityAttempt }
+  | { status: "error"; error: Error }
+
 /** Read one exact durable route. V1 documents authoritatively contain none. */
 export function lookupPriorityAssignmentResult(routeKey: string): PriorityAssignmentLookupResult {
-  const backend = activeStoreBackend()
-  if (backend) return backend.lookupPriorityAssignmentResult(getSessionStoreDir(), routeKey)
   try {
-    const document = readStoreDocumentCached(getStorePath())
+    const document = currentDocument()
     const assignment = document.meta.version === PRIORITY_STORE_META_VERSION
       ? document.meta.priorityAssignments[routeKey]
       : undefined
@@ -1076,10 +1266,8 @@ export function lookupPriorityAssignmentResult(routeKey: string): PriorityAssign
 }
 
 export function lookupSharedSessionByClaudeIdResult(claudeSessionId: string): SharedSessionLookupResult {
-  const backend = activeStoreBackend()
-  if (backend) return backend.lookupSharedSessionByClaudeIdResult(getSessionStoreDir(), claudeSessionId)
   try {
-    const document = readStoreDocumentCached(getStorePath())
+    const document = currentDocument()
     let newest: StoredSession | undefined
     let newestKey: string | undefined
     for (const [key, session] of Object.entries(document.sessions)) {
@@ -1125,7 +1313,7 @@ function isPriorityRollbackMapping(meta: SessionStoreMeta, key: string): boolean
     && Object.values(meta.priorityRollbackMappings).some((rollback) => rollback.mappingKey === key)
 }
 
-export function storeSharedSession(
+export async function storeSharedSession(
   key: string,
   claudeSessionId: string,
   messageCount?: number,
@@ -1142,133 +1330,133 @@ export function storeSharedSession(
   clientLineageHash?: string | null,
   resumeContextHash?: string | null,
   beforePublish?: () => void,
-): StoredSessionGeneration | false | Promise<StoredSessionGeneration | false> {
-  const backend = activeStoreBackend()
-  if (backend) {
-    beforePublish?.()
-    return backend.storeSharedSession(getSessionStoreDir(), key, claudeSessionId, messageCount,
-    lineageHash, messageHashes, sdkMessageUuids, contextUsage, messageBlockHashes, passthroughToolCallAssistantUuid,
-    passthroughToolCallIds, currentTranscript, sourceTranscript, expectedGeneration, clientLineageHash, resumeContextHash)
-  }
+): Promise<StoredSessionGeneration | false> {
   // Capture caller-owned history before the queue or disk yields. Validation
   // and publication must refer to the same values even if the caller reuses
   // its arrays or locators while this transaction waits.
-  return (async () => {
-    messageHashes = messageHashes?.slice()
-    sdkMessageUuids = sdkMessageUuids?.slice()
-    contextUsage = contextUsage === undefined ? undefined : structuredClone(contextUsage)
-    messageBlockHashes = messageBlockHashes?.map(blocks => blocks.slice())
-    passthroughToolCallIds = passthroughToolCallIds?.slice() ?? passthroughToolCallIds
-    currentTranscript = currentTranscript === undefined ? undefined : { ...currentTranscript }
-    sourceTranscript = sourceTranscript === undefined ? undefined : { ...sourceTranscript }
-    if (currentTranscript !== undefined) {
-      validateTranscriptLocator(currentTranscript, claudeSessionId)
+  messageHashes = messageHashes?.slice()
+  sdkMessageUuids = sdkMessageUuids?.slice()
+  contextUsage = contextUsage === undefined ? undefined : structuredClone(contextUsage)
+  messageBlockHashes = messageBlockHashes?.map(blocks => blocks.slice())
+  passthroughToolCallIds = passthroughToolCallIds?.slice() ?? passthroughToolCallIds
+  currentTranscript = currentTranscript === undefined ? undefined : { ...currentTranscript }
+  sourceTranscript = sourceTranscript === undefined ? undefined : { ...sourceTranscript }
+  if (currentTranscript !== undefined) {
+    validateTranscriptLocator(currentTranscript, claudeSessionId)
+  }
+  if (sourceTranscript !== undefined) {
+    if (!isAbsolute(sourceTranscript.configDir)) {
+      throw new Error("sourceTranscript.configDir must be an absolute path")
     }
+    if (sourceTranscript.projectDir !== undefined && !isAbsolute(sourceTranscript.projectDir)) {
+      throw new Error("sourceTranscript.projectDir must be an absolute path")
+    }
+  }
+
+  let storedGeneration: StoredSessionGeneration | false = false
+  await mutateStore(({ sessions: store, meta }) => {
+    if (isPriorityRollbackMapping(meta, key)) return false
+    const existing = store[key]
+    if (expectedGeneration !== undefined) {
+      const actual = keyGeneration(key, existing, meta)
+      const expected = expectedGeneration === null
+        ? `a:${keyDigest(key)}:0`
+        : expectedGeneration
+      if (actual !== expected) return false
+    }
+    // Preserve the previous Claude session ID when the mapping changes.
+    // This enables recovery when a lineage bug causes the original session
+    // to be abandoned — the old ID still identifies the full conversation
+    // through the supported Agent SDK session APIs.
+    const sessionIdChanged = existing !== undefined && existing.claudeSessionId !== claudeSessionId
     if (sourceTranscript !== undefined) {
-      if (!isAbsolute(sourceTranscript.configDir)) {
-        throw new Error("sourceTranscript.configDir must be an absolute path")
-      }
-      if (sourceTranscript.projectDir !== undefined && !isAbsolute(sourceTranscript.projectDir)) {
-        throw new Error("sourceTranscript.projectDir must be an absolute path")
+      if (!sessionIdChanged || sourceTranscript.sessionId !== existing?.claudeSessionId) {
+        throw new Error("sourceTranscript.sessionId must match the replaced claudeSessionId")
       }
     }
+    const previousClaudeSessionId = sessionIdChanged
+      ? existing.claudeSessionId
+      : existing?.previousClaudeSessionId
+    const resolvedCurrentTranscript = sessionIdChanged
+      ? currentTranscript
+      : existing?.currentTranscript ?? currentTranscript
+    const previousTranscript = sessionIdChanged
+      ? existing?.currentTranscript ?? sourceTranscript
+      : existing?.previousTranscript
+    store[key] = {
+      claudeSessionId,
+      revision: (existing?.revision ?? 0) + 1,
+      generationId: randomUUID(),
+      createdAt: existing?.createdAt || Date.now(),
+      lastUsedAt: Date.now(),
+      messageCount: messageCount ?? existing?.messageCount ?? 0,
+      lineageHash: lineageHash ?? existing?.lineageHash,
+      clientLineageHash: clientLineageHash === undefined
+        ? existing?.clientLineageHash
+        : clientLineageHash ?? undefined,
+      resumeContextHash: resumeContextHash === undefined
+        ? sessionIdChanged ? undefined : existing?.resumeContextHash
+        : resumeContextHash ?? undefined,
+      messageHashes: messageHashes ?? existing?.messageHashes,
+      messageBlockHashes: messageBlockHashes ?? existing?.messageBlockHashes,
+      sdkMessageUuids: sdkMessageUuids ?? existing?.sdkMessageUuids,
+      passthroughToolCallAssistantUuid: passthroughToolCallAssistantUuid === undefined
+        ? existing?.passthroughToolCallAssistantUuid
+        : passthroughToolCallAssistantUuid ?? undefined,
+      passthroughToolCallIds: passthroughToolCallIds === undefined
+        ? existing?.passthroughToolCallIds
+        : passthroughToolCallIds ?? undefined,
+      contextUsage: contextUsage ?? existing?.contextUsage,
+      // Copy, never alias: the document is republished as the read cache, so a
+      // later mutation of the caller's locator would diverge it from the file.
+      ...(resolvedCurrentTranscript ? { currentTranscript: { ...resolvedCurrentTranscript } } : {}),
+      ...(previousTranscript ? { previousTranscript: { ...previousTranscript } } : {}),
+      ...(previousClaudeSessionId ? { previousClaudeSessionId } : {}),
+    }
 
-    let storedGeneration: StoredSessionGeneration | false = false
-    return mutateStore(({ sessions: store, meta }) => {
-      if (isPriorityRollbackMapping(meta, key)) return false
-      const existing = store[key]
-      if (expectedGeneration !== undefined) {
-        const actual = keyGeneration(key, existing, meta)
-        const expected = expectedGeneration === null
-          ? `a:${keyDigest(key)}:0`
-          : expectedGeneration
-        if (actual !== expected) return false
-      }
-      // Preserve the previous Claude session ID when the mapping changes.
-      // This enables recovery when a lineage bug causes the original session
-      // to be abandoned — the old ID still identifies the full conversation
-      // through the supported Agent SDK session APIs.
-      const sessionIdChanged = existing !== undefined && existing.claudeSessionId !== claudeSessionId
-      if (sourceTranscript !== undefined) {
-        if (!sessionIdChanged || sourceTranscript.sessionId !== existing?.claudeSessionId) {
-          throw new Error("sourceTranscript.sessionId must match the replaced claudeSessionId")
-        }
-      }
-      const previousClaudeSessionId = sessionIdChanged
-        ? existing.claudeSessionId
-        : existing?.previousClaudeSessionId
-      const resolvedCurrentTranscript = sessionIdChanged
-        ? currentTranscript
-        : existing?.currentTranscript ?? currentTranscript
-      const previousTranscript = sessionIdChanged
-        ? existing?.currentTranscript ?? sourceTranscript
-        : existing?.previousTranscript
-      store[key] = {
-        claudeSessionId,
-        revision: (existing?.revision ?? 0) + 1,
-        generationId: randomUUID(),
-        createdAt: existing?.createdAt || Date.now(),
-        lastUsedAt: Date.now(),
-        messageCount: messageCount ?? existing?.messageCount ?? 0,
-        lineageHash: lineageHash ?? existing?.lineageHash,
-        clientLineageHash: clientLineageHash === undefined
-          ? existing?.clientLineageHash
-          : clientLineageHash ?? undefined,
-        resumeContextHash: resumeContextHash === undefined
-          ? sessionIdChanged ? undefined : existing?.resumeContextHash
-          : resumeContextHash ?? undefined,
-        messageHashes: messageHashes ?? existing?.messageHashes,
-        messageBlockHashes: messageBlockHashes ?? existing?.messageBlockHashes,
-        sdkMessageUuids: sdkMessageUuids ?? existing?.sdkMessageUuids,
-        passthroughToolCallAssistantUuid: passthroughToolCallAssistantUuid === undefined
-          ? existing?.passthroughToolCallAssistantUuid
-          : passthroughToolCallAssistantUuid ?? undefined,
-        passthroughToolCallIds: passthroughToolCallIds === undefined
-          ? existing?.passthroughToolCallIds
-          : passthroughToolCallIds ?? undefined,
-        contextUsage: contextUsage ?? existing?.contextUsage,
-        // Copy, never alias: the document is republished as the read cache, so a
-        // later mutation of the caller's locator would diverge it from the file.
-        ...(resolvedCurrentTranscript ? { currentTranscript: { ...resolvedCurrentTranscript } } : {}),
-        ...(previousTranscript ? { previousTranscript: { ...previousTranscript } } : {}),
-        ...(previousClaudeSessionId ? { previousClaudeSessionId } : {}),
-      }
-
-      // Prune only mappings that are not exact route authorities. If the
-      // configured bound cannot admit this protected write, reject the whole CAS
-      // rather than leave a dangling route or silently exceed the limit.
-      const maxEntries = getMaxStoredSessionsLimit()
-      const keys = Object.keys(store)
-      const protectedMappings = meta.version === PRIORITY_STORE_META_VERSION
-        ? new Set([
+    // Prune only mappings that are not exact route authorities. If the
+    // configured bound cannot admit this protected write, reject the whole CAS
+    // rather than leave a dangling route or silently exceed the limit.
+    const maxEntries = getMaxStoredSessionsLimit()
+    const keys = Object.keys(store)
+    const protectedMappings = meta.version === PRIORITY_STORE_META_VERSION
+      ? new Set([
           ...Object.values(meta.priorityAssignments).map((assignment) => assignment.mappingKey),
           ...Object.values(meta.priorityRollbackMappings).map((rollback) => rollback.mappingKey),
         ])
-        : new Set<string>()
-      protectedMappings.add(key)
-      const removeCount = Math.max(0, keys.length - maxEntries)
-      const removable = keys
-        .filter((candidate) => !protectedMappings.has(candidate))
-        .sort((a, b) => (store[a]!.lastUsedAt || 0) - (store[b]!.lastUsedAt || 0))
-      if (removable.length < removeCount) return false
-      for (const candidate of removable.slice(0, removeCount)) {
-        delete store[candidate]
-        advanceKeySlot(candidate, meta)
+      : new Set<string>()
+    protectedMappings.add(key)
+    const removeCount = Math.max(0, keys.length - maxEntries)
+    const removable = keys
+      .filter((candidate) => !protectedMappings.has(candidate))
+      .sort((a, b) => (store[a]!.lastUsedAt || 0) - (store[b]!.lastUsedAt || 0))
+    if (removable.length < removeCount) return false
+    for (const candidate of removable.slice(0, removeCount)) {
+      delete store[candidate]
+      advanceKeySlot(candidate, meta)
+    }
+    storedGeneration = getStoredSessionGeneration(store[key]!, key)
+    if (meta.version === PRIORITY_STORE_META_VERSION) {
+      for (const [routeKey, assignment] of Object.entries(meta.priorityAssignments)) {
+        if (assignment.mappingKey !== key) continue
+        assignment.mappingGeneration = storedGeneration
+        assignment.generationId = randomUUID()
+        assignment.updatedAt = Date.now()
+        advanceKeySlot(priorityGenerationKey(routeKey), meta)
       }
-      advanceKeySlot(key, meta)
-      storedGeneration = getStoredSessionGeneration(store[key]!, key)
-      if (meta.version === PRIORITY_STORE_META_VERSION) {
-        for (const [routeKey, assignment] of Object.entries(meta.priorityAssignments)) {
-          if (assignment.mappingKey !== key) continue
-          assignment.mappingGeneration = storedGeneration
-          assignment.generationId = randomUUID()
-          assignment.updatedAt = Date.now()
-          advanceKeySlot(priorityGenerationKey(routeKey), meta)
-        }
-      }
-      return true
-    }, beforePublish).then(() => storedGeneration)
-  })()
+    }
+    return true
+  }, beforePublish)
+  return storedGeneration
+}
+
+export interface PriorityAttemptTurn {
+  turnId: string
+  issuedAt: number
+}
+
+export interface PriorityAttemptClaim {
+  ownerToken: string
 }
 
 function validatePriorityAttemptTurn(turn: PriorityAttemptTurn | undefined): void {
@@ -1285,79 +1473,76 @@ function validatePriorityAttemptTurn(turn: PriorityAttemptTurn | undefined): voi
  * A blocked/crashed attempt can be superseded only by a strictly newer trusted
  * human turn. The prior blocker remains until the newer turn publishes.
  */
-export function claimPriorityAttempt(options: {
+export async function claimPriorityAttempt(options: {
   routeKey: string
   expectedAssignmentGeneration: PriorityAssignmentGeneration
   turn?: PriorityAttemptTurn
-}): PriorityAttemptClaim | false | Promise<PriorityAttemptClaim | false> {
-  const backend = activeStoreBackend()
-  if (backend) return backend.claimPriorityAttempt(getSessionStoreDir(), options)
-  return (async () => {
-    options = structuredClone(options)
-    if (!options.routeKey || options.routeKey.length > 512) {
-      throw new Error("priority attempt requires a bounded route key")
+}): Promise<PriorityAttemptClaim | false> {
+  options = structuredClone(options)
+  if (!options.routeKey || options.routeKey.length > 512) {
+    throw new Error("priority attempt requires a bounded route key")
+  }
+  validatePriorityAttemptTurn(options.turn)
+  const ownerToken = randomUUID()
+  let claimed = false
+  await mutateStore((document) => {
+    const assignment = document.meta.version === PRIORITY_STORE_META_VERSION
+      ? document.meta.priorityAssignments[options.routeKey]
+      : undefined
+    if (priorityAssignmentGeneration(options.routeKey, assignment, document.meta)
+      !== options.expectedAssignmentGeneration) return false
+
+    const existing = document.meta.version === PRIORITY_STORE_META_VERSION
+      ? document.meta.priorityAttempts[options.routeKey]
+      : undefined
+    if (existing) {
+      const floor = Math.max(
+        assignment?.lastHumanTurnIssuedAt ?? -1,
+        existing.blockedTurnIssuedAt ?? -1,
+        existing.pendingTurnIssuedAt ?? -1,
+      )
+      if (!options.turn || options.turn.issuedAt <= floor) return false
+    } else if (document.meta.version === PRIORITY_STORE_META_VERSION
+      && Object.keys(document.meta.priorityAttempts).length >= getMaxPriorityAttemptsLimit()) {
+      return false
     }
-    validatePriorityAttemptTurn(options.turn)
-    const ownerToken = randomUUID()
-    let claimed = false
-    return mutateStore((document) => {
-      const assignment = document.meta.version === PRIORITY_STORE_META_VERSION
-        ? document.meta.priorityAssignments[options.routeKey]
-        : undefined
-      if (priorityAssignmentGeneration(options.routeKey, assignment, document.meta)
-        !== options.expectedAssignmentGeneration) return false
 
-      const existing = document.meta.version === PRIORITY_STORE_META_VERSION
-        ? document.meta.priorityAttempts[options.routeKey]
-        : undefined
-      if (existing) {
-        const floor = Math.max(
-          assignment?.lastHumanTurnIssuedAt ?? -1,
-          existing.blockedTurnIssuedAt ?? -1,
-          existing.pendingTurnIssuedAt ?? -1,
-        )
-        if (!options.turn || options.turn.issuedAt <= floor) return false
-      } else if (document.meta.version === PRIORITY_STORE_META_VERSION
-        && Object.keys(document.meta.priorityAttempts).length >= getMaxPriorityAttemptsLimit()) {
-        return false
+    if (document.meta.version === STORE_META_VERSION) {
+      document.meta = {
+        version: PRIORITY_STORE_META_VERSION,
+        slots: document.meta.slots,
+        priorityAssignments: {},
+        priorityAttempts: {},
+        priorityRollbackMappings: {},
       }
-
-      if (document.meta.version === STORE_META_VERSION) {
-        document.meta = {
-          version: PRIORITY_STORE_META_VERSION,
-          slots: document.meta.slots,
-          priorityAssignments: {},
-          priorityAttempts: {},
-          priorityRollbackMappings: {},
-        }
+    }
+    const previous = document.meta.priorityAttempts[options.routeKey]
+    let blocked = previous?.blocked ?? false
+    let blockedTurnDigest = previous?.blockedTurnDigest ?? null
+    let blockedTurnIssuedAt = previous?.blockedTurnIssuedAt ?? null
+    if (previous?.ownerToken) {
+      blocked = true
+      if (previous.pendingTurnIssuedAt !== null
+        && (blockedTurnIssuedAt === null || previous.pendingTurnIssuedAt > blockedTurnIssuedAt)) {
+        blockedTurnDigest = previous.pendingTurnDigest
+        blockedTurnIssuedAt = previous.pendingTurnIssuedAt
       }
-      const previous = document.meta.priorityAttempts[options.routeKey]
-      let blocked = previous?.blocked ?? false
-      let blockedTurnDigest = previous?.blockedTurnDigest ?? null
-      let blockedTurnIssuedAt = previous?.blockedTurnIssuedAt ?? null
-      if (previous?.ownerToken) {
-        blocked = true
-        if (previous.pendingTurnIssuedAt !== null
-          && (blockedTurnIssuedAt === null || previous.pendingTurnIssuedAt > blockedTurnIssuedAt)) {
-          blockedTurnDigest = previous.pendingTurnDigest
-          blockedTurnIssuedAt = previous.pendingTurnIssuedAt
-        }
-      }
-      document.meta.priorityAttempts[options.routeKey] = {
-        blocked,
-        blockedTurnDigest,
-        blockedTurnIssuedAt,
-        pendingTurnDigest: options.turn?.turnId ?? null,
-        pendingTurnIssuedAt: options.turn?.issuedAt ?? null,
-        ownerToken,
-        generationId: randomUUID(),
-        updatedAt: Date.now(),
-      }
-      advanceKeySlot(`priority-attempt:${options.routeKey}`, document.meta)
-      claimed = true
-      return true
-    }).then(() => claimed ? { ownerToken } : false)
-  })()
+    }
+    document.meta.priorityAttempts[options.routeKey] = {
+      blocked,
+      blockedTurnDigest,
+      blockedTurnIssuedAt,
+      pendingTurnDigest: options.turn?.turnId ?? null,
+      pendingTurnIssuedAt: options.turn?.issuedAt ?? null,
+      ownerToken,
+      generationId: randomUUID(),
+      updatedAt: Date.now(),
+    }
+    advanceKeySlot(`priority-attempt:${options.routeKey}`, document.meta)
+    claimed = true
+    return true
+  })
+  return claimed ? { ownerToken } : false
 }
 
 async function settlePriorityAttempt(
@@ -1367,7 +1552,7 @@ async function settlePriorityAttempt(
 ): Promise<boolean> {
   if (!routeKey || routeKey.length > 512 || !UUID_PATTERN.test(ownerToken)) return false
   let settled = false
-  return mutateStore((document) => {
+  await mutateStore((document) => {
     if (document.meta.version !== PRIORITY_STORE_META_VERSION) return false
     const attempt = document.meta.priorityAttempts[routeKey]
     if (!attempt || attempt.ownerToken !== ownerToken) return false
@@ -1395,21 +1580,56 @@ async function settlePriorityAttempt(
     advanceKeySlot(`priority-attempt:${routeKey}`, document.meta)
     settled = true
     return true
-  }).then(() => settled)
+  })
+  return settled
 }
 
 /** Release an unexposed attempt; an older blocker remains intact. */
-export function releasePriorityAttempt(routeKey: string, ownerToken: string): boolean | Promise<boolean> {
-  const backend = activeStoreBackend()
-  if (backend) return backend.releasePriorityAttempt(getSessionStoreDir(), routeKey, ownerToken)
+export function releasePriorityAttempt(routeKey: string, ownerToken: string): Promise<boolean> {
   return settlePriorityAttempt(routeKey, ownerToken, "release")
 }
 
 /** Persist exposure before returning an account-shaped error or cancellation. */
-export function blockPriorityAttempt(routeKey: string, ownerToken: string): boolean | Promise<boolean> {
-  const backend = activeStoreBackend()
-  if (backend) return backend.blockPriorityAttempt(getSessionStoreDir(), routeKey, ownerToken)
+export function blockPriorityAttempt(routeKey: string, ownerToken: string): Promise<boolean> {
   return settlePriorityAttempt(routeKey, ownerToken, "block")
+}
+
+export interface SharedSessionPriorityPublication {
+  routeKey: string
+  profileId: string
+  lastHumanTurnDigest: string
+  lastHumanTurnIssuedAt: number
+  expectedAssignmentGeneration: PriorityAssignmentGeneration
+}
+
+export interface SharedSessionAndPriorityAssignmentOptions {
+  key: string
+  claudeSessionId: string
+  messageCount: number
+  lineageHash: string
+  clientLineageHash?: string
+  resumeContextHash?: string
+  messageHashes: string[]
+  sdkMessageUuids?: Array<string | null>
+  contextUsage?: TokenUsage
+  messageBlockHashes: string[][]
+  passthroughToolCallAssistantUuid?: string | null
+  passthroughToolCallIds?: string[] | null
+  currentTranscript?: TranscriptLocator
+  sourceTranscript?: TranscriptLocator
+  expectedMappingGeneration: StoredSessionGeneration
+  /** Original routed mapping retained across chained publications for rollback. */
+  rollbackMappingKey?: string
+  /** Exact pre-SDK durable claim cleared only by this winning publication. */
+  attemptOwnerToken?: string
+  priority: SharedSessionPriorityPublication
+}
+
+export interface SharedSessionAndPriorityAssignmentResult {
+  mappingGeneration: StoredSessionGeneration
+  assignmentGeneration: PriorityAssignmentGeneration
+  previousMapping: StoredSession | null
+  previousAssignment: DurablePriorityAssignment | null
 }
 
 function validatePriorityPublicationInput(options: SharedSessionAndPriorityAssignmentOptions): void {
@@ -1450,336 +1670,347 @@ function validatePriorityPublicationInput(options: SharedSessionAndPriorityAssig
  * durable compare-and-swap. A v1 document upgrades only when this transaction
  * wins; all ordinary mapping writes preserve either input version.
  */
-export function storeSharedSessionAndPriorityAssignment(
+export async function storeSharedSessionAndPriorityAssignment(
   options: SharedSessionAndPriorityAssignmentOptions,
   beforePublish?: () => void,
-): SharedSessionAndPriorityAssignmentResult | false | Promise<SharedSessionAndPriorityAssignmentResult | false> {
-  const backend = activeStoreBackend()
-  if (backend) {
-    beforePublish?.()
-    return backend.storeSharedSessionAndPriorityAssignment(getSessionStoreDir(), options)
-  }
-  return (async () => {
-    options = structuredClone(options)
-    validatePriorityPublicationInput(options)
-    let result: SharedSessionAndPriorityAssignmentResult | false = false
-    return mutateStore((document) => {
-      const existing = document.sessions[options.key]
-      const actualMappingGeneration = keyGeneration(options.key, existing, document.meta)
-      if (actualMappingGeneration !== options.expectedMappingGeneration) return false
-      if (document.meta.version === PRIORITY_STORE_META_VERSION) {
-        const markerOwners = Object.entries(document.meta.priorityRollbackMappings)
-          .filter(([, rollback]) => rollback.mappingKey === options.key)
-        if (markerOwners.some(([routeKey]) => routeKey !== options.priority.routeKey)) return false
-        const ownMarker = document.meta.priorityRollbackMappings[options.priority.routeKey]
-        if (ownMarker?.mappingKey === options.key && ownMarker.mappingGeneration !== actualMappingGeneration) return false
-      }
+): Promise<SharedSessionAndPriorityAssignmentResult | false> {
+  options = structuredClone(options)
+  validatePriorityPublicationInput(options)
+  let result: SharedSessionAndPriorityAssignmentResult | false = false
+  await mutateStore((document) => {
+    const existing = document.sessions[options.key]
+    const actualMappingGeneration = keyGeneration(options.key, existing, document.meta)
+    if (actualMappingGeneration !== options.expectedMappingGeneration) return false
+    if (document.meta.version === PRIORITY_STORE_META_VERSION) {
+      const markerOwners = Object.entries(document.meta.priorityRollbackMappings)
+        .filter(([, rollback]) => rollback.mappingKey === options.key)
+      if (markerOwners.some(([routeKey]) => routeKey !== options.priority.routeKey)) return false
+      const ownMarker = document.meta.priorityRollbackMappings[options.priority.routeKey]
+      if (ownMarker?.mappingKey === options.key && ownMarker.mappingGeneration !== actualMappingGeneration) return false
+    }
 
-      const existingAssignments = document.meta.version === PRIORITY_STORE_META_VERSION
-        ? document.meta.priorityAssignments
-        : {}
-      const existingAssignment = existingAssignments[options.priority.routeKey]
-      const actualAssignmentGeneration = priorityAssignmentGeneration(
-        options.priority.routeKey,
-        existingAssignment,
-        document.meta,
-      )
-      if (actualAssignmentGeneration !== options.priority.expectedAssignmentGeneration) return false
-      const existingAttempt = document.meta.version === PRIORITY_STORE_META_VERSION
-        ? document.meta.priorityAttempts[options.priority.routeKey]
-        : undefined
-      if (options.attemptOwnerToken !== undefined) {
-        if (existingAttempt?.ownerToken !== options.attemptOwnerToken) return false
-      } else if (existingAttempt) {
-        // A direct/older writer cannot bypass an in-flight or exposed claim.
-        return false
-      }
+    const existingAssignments = document.meta.version === PRIORITY_STORE_META_VERSION
+      ? document.meta.priorityAssignments
+      : {}
+    const existingAssignment = existingAssignments[options.priority.routeKey]
+    const actualAssignmentGeneration = priorityAssignmentGeneration(
+      options.priority.routeKey,
+      existingAssignment,
+      document.meta,
+    )
+    if (actualAssignmentGeneration !== options.priority.expectedAssignmentGeneration) return false
+    const existingAttempt = document.meta.version === PRIORITY_STORE_META_VERSION
+      ? document.meta.priorityAttempts[options.priority.routeKey]
+      : undefined
+    if (options.attemptOwnerToken !== undefined) {
+      if (existingAttempt?.ownerToken !== options.attemptOwnerToken) return false
+    } else if (existingAttempt) {
+      // A direct/older writer cannot bypass an in-flight or exposed claim.
+      return false
+    }
 
-      const sessionIdChanged = existing !== undefined && existing.claudeSessionId !== options.claudeSessionId
-      if (options.sourceTranscript !== undefined) {
-        if (!sessionIdChanged || options.sourceTranscript.sessionId !== existing?.claudeSessionId) {
-          throw new Error("sourceTranscript.sessionId must match the replaced claudeSessionId")
-        }
+    const sessionIdChanged = existing !== undefined && existing.claudeSessionId !== options.claudeSessionId
+    if (options.sourceTranscript !== undefined) {
+      if (!sessionIdChanged || options.sourceTranscript.sessionId !== existing?.claudeSessionId) {
+        throw new Error("sourceTranscript.sessionId must match the replaced claudeSessionId")
       }
-      const previousClaudeSessionId = sessionIdChanged
-        ? existing.claudeSessionId
-        : existing?.previousClaudeSessionId
-      const resolvedCurrentTranscript = sessionIdChanged
-        ? options.currentTranscript
-        : existing?.currentTranscript ?? options.currentTranscript
-      const previousTranscript = sessionIdChanged
-        ? existing?.currentTranscript ?? options.sourceTranscript
-        : existing?.previousTranscript
-      const stored: StoredSession = {
-        claudeSessionId: options.claudeSessionId,
-        revision: (existing?.revision ?? 0) + 1,
-        generationId: randomUUID(),
-        createdAt: existing?.createdAt || Date.now(),
-        lastUsedAt: Date.now(),
-        messageCount: options.messageCount,
-        lineageHash: options.lineageHash,
-        clientLineageHash: options.clientLineageHash,
-        resumeContextHash: options.resumeContextHash,
-        messageHashes: options.messageHashes,
-        messageBlockHashes: options.messageBlockHashes,
-        sdkMessageUuids: options.sdkMessageUuids,
-        passthroughToolCallAssistantUuid: options.passthroughToolCallAssistantUuid ?? undefined,
-        passthroughToolCallIds: options.passthroughToolCallIds ?? undefined,
-        contextUsage: options.contextUsage,
-        ...(resolvedCurrentTranscript ? { currentTranscript: { ...resolvedCurrentTranscript } } : {}),
-        ...(previousTranscript ? { previousTranscript: { ...previousTranscript } } : {}),
-        ...(previousClaudeSessionId ? { previousClaudeSessionId } : {}),
-      }
-      document.sessions[options.key] = stored
-      advanceKeySlot(options.key, document.meta)
-      const mappingGeneration = getStoredSessionGeneration(stored, options.key)
+    }
+    const previousClaudeSessionId = sessionIdChanged
+      ? existing.claudeSessionId
+      : existing?.previousClaudeSessionId
+    const resolvedCurrentTranscript = sessionIdChanged
+      ? options.currentTranscript
+      : existing?.currentTranscript ?? options.currentTranscript
+    const previousTranscript = sessionIdChanged
+      ? existing?.currentTranscript ?? options.sourceTranscript
+      : existing?.previousTranscript
+    const stored: StoredSession = {
+      claudeSessionId: options.claudeSessionId,
+      revision: (existing?.revision ?? 0) + 1,
+      generationId: randomUUID(),
+      createdAt: existing?.createdAt || Date.now(),
+      lastUsedAt: Date.now(),
+      messageCount: options.messageCount,
+      lineageHash: options.lineageHash,
+      clientLineageHash: options.clientLineageHash,
+      resumeContextHash: options.resumeContextHash,
+      messageHashes: options.messageHashes,
+      messageBlockHashes: options.messageBlockHashes,
+      sdkMessageUuids: options.sdkMessageUuids,
+      passthroughToolCallAssistantUuid: options.passthroughToolCallAssistantUuid ?? undefined,
+      passthroughToolCallIds: options.passthroughToolCallIds ?? undefined,
+      contextUsage: options.contextUsage,
+      // Copy, never alias — same reason as in storeSharedSession.
+      ...(resolvedCurrentTranscript ? { currentTranscript: { ...resolvedCurrentTranscript } } : {}),
+      ...(previousTranscript ? { previousTranscript: { ...previousTranscript } } : {}),
+      ...(previousClaudeSessionId ? { previousClaudeSessionId } : {}),
+    }
+    document.sessions[options.key] = stored
+    const mappingGeneration = getStoredSessionGeneration(stored, options.key)
 
-      if (document.meta.version === STORE_META_VERSION) {
-        document.meta = {
-          version: PRIORITY_STORE_META_VERSION,
-          slots: document.meta.slots,
-          priorityAssignments: {},
-          priorityAttempts: {},
-          priorityRollbackMappings: {},
-        }
+    if (document.meta.version === STORE_META_VERSION) {
+      document.meta = {
+        version: PRIORITY_STORE_META_VERSION,
+        slots: document.meta.slots,
+        priorityAssignments: {},
+        priorityAttempts: {},
+        priorityRollbackMappings: {},
       }
-      const assignment: DurablePriorityAssignment = {
-        profileId: options.priority.profileId,
-        lastHumanTurnDigest: options.priority.lastHumanTurnDigest,
-        lastHumanTurnIssuedAt: options.priority.lastHumanTurnIssuedAt,
-        mappingKey: options.key,
-        mappingGeneration,
-        generationId: randomUUID(),
-        updatedAt: Date.now(),
+    }
+    const assignment: DurablePriorityAssignment = {
+      profileId: options.priority.profileId,
+      lastHumanTurnDigest: options.priority.lastHumanTurnDigest,
+      lastHumanTurnIssuedAt: options.priority.lastHumanTurnIssuedAt,
+      mappingKey: options.key,
+      mappingGeneration,
+      generationId: randomUUID(),
+      updatedAt: Date.now(),
+    }
+    const priorityAssignments = document.meta.priorityAssignments
+    const priorityRollbackMappings = document.meta.priorityRollbackMappings
+    priorityAssignments[options.priority.routeKey] = assignment
+    const existingRollback = priorityRollbackMappings[options.priority.routeKey]
+    const rollbackMappingKey = options.rollbackMappingKey ?? existingAssignment?.mappingKey
+    if (rollbackMappingKey && rollbackMappingKey !== options.key) {
+      const rollbackMapping = document.sessions[rollbackMappingKey]
+      if (!rollbackMapping) {
+        throw new Error("priority rollback mapping disappeared before publication")
       }
-      const priorityAssignments = document.meta.priorityAssignments
-      const priorityRollbackMappings = document.meta.priorityRollbackMappings
-      priorityAssignments[options.priority.routeKey] = assignment
-      const existingRollback = priorityRollbackMappings[options.priority.routeKey]
-      const rollbackMappingKey = options.rollbackMappingKey ?? existingAssignment?.mappingKey
-      if (rollbackMappingKey && rollbackMappingKey !== options.key) {
-        const rollbackMapping = document.sessions[rollbackMappingKey]
-        if (!rollbackMapping) {
-          throw new Error("priority rollback mapping disappeared before publication")
-        }
-        const rollbackMappingGeneration = getStoredSessionGeneration(rollbackMapping, rollbackMappingKey)
-        if (
-          existingAssignment?.mappingKey === rollbackMappingKey
-          && existingAssignment.mappingGeneration !== rollbackMappingGeneration
-        ) return false
-        priorityRollbackMappings[options.priority.routeKey] = existingRollback?.mappingKey === rollbackMappingKey
-          ? existingRollback
-          : { mappingKey: rollbackMappingKey, mappingGeneration: rollbackMappingGeneration }
-      } else {
-        delete priorityRollbackMappings[options.priority.routeKey]
-      }
-      advanceKeySlot(priorityGenerationKey(options.priority.routeKey), document.meta)
+      const rollbackMappingGeneration = getStoredSessionGeneration(rollbackMapping, rollbackMappingKey)
+      if (
+        existingAssignment?.mappingKey === rollbackMappingKey
+        && existingAssignment.mappingGeneration !== rollbackMappingGeneration
+      ) return false
+      priorityRollbackMappings[options.priority.routeKey] = existingRollback?.mappingKey === rollbackMappingKey
+        ? existingRollback
+        : { mappingKey: rollbackMappingKey, mappingGeneration: rollbackMappingGeneration }
+    } else {
+      delete priorityRollbackMappings[options.priority.routeKey]
+    }
+    advanceKeySlot(priorityGenerationKey(options.priority.routeKey), document.meta)
 
-      const maxSessions = getMaxStoredSessionsLimit()
-      const maxAssignments = getMaxPriorityAssignmentsLimit()
-      const referencedMappingKeys = (): Set<string> => new Set(
-        Object.values(priorityAssignments).map((candidate) => candidate.mappingKey),
-      )
+    const maxSessions = getMaxStoredSessionsLimit()
+    const maxAssignments = getMaxPriorityAssignmentsLimit()
+    const referencedMappingKeys = (): Set<string> => new Set(
+      Object.values(priorityAssignments).map((candidate) => candidate.mappingKey),
+    )
 
-      // Route retention cannot exceed the number of exact mapping proofs the
-      // session bound can retain. Evict unrelated routes first, then their now-
-      // unreferenced mappings. The route being published is never a victim.
-      const sortedRoutes = Object.keys(priorityAssignments)
-        .filter((candidate) => (
-          candidate !== options.priority.routeKey
-          && priorityRollbackMappings[candidate] === undefined
-        ))
-        .sort((left, right) => (
-          priorityAssignments[left]!.updatedAt - priorityAssignments[right]!.updatedAt
-        ))
-      while (
-        Object.keys(priorityAssignments).length > maxAssignments
-        || referencedMappingKeys().size > maxSessions
-      ) {
-        const candidate = sortedRoutes.shift()
-        if (!candidate) return false
-        delete priorityAssignments[candidate]
-        delete priorityRollbackMappings[candidate]
-        advanceKeySlot(priorityGenerationKey(candidate), document.meta)
-      }
+    // Route retention cannot exceed the number of exact mapping proofs the
+    // session bound can retain. Evict unrelated routes first, then their now-
+    // unreferenced mappings. The route being published is never a victim.
+    const sortedRoutes = Object.keys(priorityAssignments)
+      .filter((candidate) => (
+        candidate !== options.priority.routeKey
+        && priorityRollbackMappings[candidate] === undefined
+      ))
+      .sort((left, right) => (
+        priorityAssignments[left]!.updatedAt - priorityAssignments[right]!.updatedAt
+      ))
+    while (
+      Object.keys(priorityAssignments).length > maxAssignments
+      || referencedMappingKeys().size > maxSessions
+    ) {
+      const candidate = sortedRoutes.shift()
+      if (!candidate) return false
+      delete priorityAssignments[candidate]
+      delete priorityRollbackMappings[candidate]
+      advanceKeySlot(priorityGenerationKey(candidate), document.meta)
+    }
 
-      const protectedMappings = referencedMappingKeys()
-      protectedMappings.add(options.key)
-      // A late cancel must be able to restore every in-flight pre-publication
-      // route. Those different fallback mappings form a separately bounded
-      // rollback backlog: at most one retained mapping per durable route.
-      for (const rollback of Object.values(priorityRollbackMappings)) {
-        protectedMappings.add(rollback.mappingKey)
-      }
-      const protectedExistingCount = [...protectedMappings]
-        .filter((candidate) => document.sessions[candidate] !== undefined)
-        .length
-      const retainedSessionLimit = Math.max(maxSessions, protectedExistingCount)
-      const sortedSessions = Object.keys(document.sessions)
-        .filter((candidate) => !protectedMappings.has(candidate))
-        .sort((left, right) => document.sessions[left]!.lastUsedAt - document.sessions[right]!.lastUsedAt)
-      while (Object.keys(document.sessions).length > retainedSessionLimit) {
-        const candidate = sortedSessions.shift()
-        if (!candidate) break
-        delete document.sessions[candidate]
-        advanceKeySlot(candidate, document.meta)
-      }
+    const protectedMappings = referencedMappingKeys()
+    protectedMappings.add(options.key)
+    // A late cancel must be able to restore every in-flight pre-publication
+    // route. Those different fallback mappings form a separately bounded
+    // rollback backlog: at most one retained mapping per durable route.
+    for (const rollback of Object.values(priorityRollbackMappings)) {
+      protectedMappings.add(rollback.mappingKey)
+    }
+    const protectedExistingCount = [...protectedMappings]
+      .filter((candidate) => document.sessions[candidate] !== undefined)
+      .length
+    const retainedSessionLimit = Math.max(maxSessions, protectedExistingCount)
+    const sortedSessions = Object.keys(document.sessions)
+      .filter((candidate) => !protectedMappings.has(candidate))
+      .sort((left, right) => document.sessions[left]!.lastUsedAt - document.sessions[right]!.lastUsedAt)
+    while (Object.keys(document.sessions).length > retainedSessionLimit) {
+      const candidate = sortedSessions.shift()
+      if (!candidate) break
+      delete document.sessions[candidate]
+      advanceKeySlot(candidate, document.meta)
+    }
 
-      result = {
-        mappingGeneration,
-        assignmentGeneration: getPriorityAssignmentGeneration(assignment, options.priority.routeKey),
-        previousMapping: existing ? structuredClone(existing) : null,
-        previousAssignment: existingAssignment ? structuredClone(existingAssignment) : null,
-      }
-      return true
-    }, beforePublish).then(() => result)
-  })()
+    result = {
+      mappingGeneration,
+      assignmentGeneration: getPriorityAssignmentGeneration(assignment, options.priority.routeKey),
+      previousMapping: existing ? structuredClone(existing) : null,
+      previousAssignment: existingAssignment ? structuredClone(existingAssignment) : null,
+    }
+    return true
+  }, beforePublish)
+  return result
+}
+
+export interface FinalizeSharedSessionAndPriorityAssignmentOptions {
+  key: string
+  routeKey: string
+  expectedMappingGeneration: StoredSessionGeneration
+  expectedAssignmentGeneration: PriorityAssignmentGeneration
+  rollbackMappingKey?: string
+  attemptOwnerToken?: string
 }
 
 /**
  * Make a successful publication irrevocable and prune its rollback backlog.
  * Exact route+mapping CAS prevents a late finalizer from touching newer work.
  */
-export function finalizeSharedSessionAndPriorityAssignment(
+export async function finalizeSharedSessionAndPriorityAssignment(
   options: FinalizeSharedSessionAndPriorityAssignmentOptions,
   beforePublish?: () => void,
-): boolean | Promise<boolean> {
-  const backend = activeStoreBackend()
-  if (backend) {
-    beforePublish?.()
-    return backend.finalizeSharedSessionAndPriorityAssignment(getSessionStoreDir(), options)
-  }
-  return (async () => {
-    options = structuredClone(options)
-    let finalized = false
-    return mutateStore((document) => {
-      if (document.meta.version !== PRIORITY_STORE_META_VERSION) return false
-      const mapping = document.sessions[options.key]
-      if (keyGeneration(options.key, mapping, document.meta) !== options.expectedMappingGeneration) return false
-      const assignment = document.meta.priorityAssignments[options.routeKey]
-      if (
-        !assignment
-        || priorityAssignmentGeneration(options.routeKey, assignment, document.meta)
+): Promise<boolean> {
+  options = structuredClone(options)
+  let finalized = false
+  await mutateStore((document) => {
+    if (document.meta.version !== PRIORITY_STORE_META_VERSION) return false
+    const mapping = document.sessions[options.key]
+    if (keyGeneration(options.key, mapping, document.meta) !== options.expectedMappingGeneration) return false
+    const assignment = document.meta.priorityAssignments[options.routeKey]
+    if (
+      !assignment
+      || priorityAssignmentGeneration(options.routeKey, assignment, document.meta)
         !== options.expectedAssignmentGeneration
-      ) return false
-      const rollback = document.meta.priorityRollbackMappings[options.routeKey]
-      if (rollback?.mappingKey !== options.rollbackMappingKey) return false
-      const attempt = document.meta.priorityAttempts[options.routeKey]
-      if (options.attemptOwnerToken !== undefined) {
-        if (attempt?.ownerToken !== options.attemptOwnerToken) return false
-      } else if (attempt) return false
+    ) return false
+    const rollback = document.meta.priorityRollbackMappings[options.routeKey]
+    if (rollback?.mappingKey !== options.rollbackMappingKey) return false
+    const attempt = document.meta.priorityAttempts[options.routeKey]
+    if (options.attemptOwnerToken !== undefined) {
+      if (attempt?.ownerToken !== options.attemptOwnerToken) return false
+    } else if (attempt) return false
 
-      delete document.meta.priorityRollbackMappings[options.routeKey]
-      if (options.attemptOwnerToken !== undefined) {
-        delete document.meta.priorityAttempts[options.routeKey]
-        advanceKeySlot(`priority-attempt:${options.routeKey}`, document.meta)
-      }
-      assignment.generationId = randomUUID()
-      assignment.updatedAt = Date.now()
-      advanceKeySlot(priorityGenerationKey(options.routeKey), document.meta)
-      const protectedMappings = new Set([
-        ...Object.values(document.meta.priorityAssignments).map((candidate) => candidate.mappingKey),
-        ...Object.values(document.meta.priorityRollbackMappings).map((rollback) => rollback.mappingKey),
-      ])
-      const maxSessions = getMaxStoredSessionsLimit()
-      const protectedExistingCount = [...protectedMappings]
-        .filter((candidate) => document.sessions[candidate] !== undefined)
-        .length
-      const retainedLimit = Math.max(maxSessions, protectedExistingCount)
-      const removable = Object.keys(document.sessions)
-        .filter((candidate) => !protectedMappings.has(candidate))
-        .sort((left, right) => document.sessions[left]!.lastUsedAt - document.sessions[right]!.lastUsedAt)
-      while (Object.keys(document.sessions).length > retainedLimit) {
-        const candidate = removable.shift()
-        if (!candidate) break
-        delete document.sessions[candidate]
-        advanceKeySlot(candidate, document.meta)
-      }
-      finalized = true
-      return true
-    }, beforePublish).then(() => finalized)
-  })()
+    delete document.meta.priorityRollbackMappings[options.routeKey]
+    if (options.attemptOwnerToken !== undefined) {
+      delete document.meta.priorityAttempts[options.routeKey]
+      advanceKeySlot(`priority-attempt:${options.routeKey}`, document.meta)
+    }
+    assignment.generationId = randomUUID()
+    assignment.updatedAt = Date.now()
+    advanceKeySlot(priorityGenerationKey(options.routeKey), document.meta)
+    const protectedMappings = new Set([
+      ...Object.values(document.meta.priorityAssignments).map((candidate) => candidate.mappingKey),
+      ...Object.values(document.meta.priorityRollbackMappings).map((rollback) => rollback.mappingKey),
+    ])
+    const maxSessions = getMaxStoredSessionsLimit()
+    const protectedExistingCount = [...protectedMappings]
+      .filter((candidate) => document.sessions[candidate] !== undefined)
+      .length
+    const retainedLimit = Math.max(maxSessions, protectedExistingCount)
+    const removable = Object.keys(document.sessions)
+      .filter((candidate) => !protectedMappings.has(candidate))
+      .sort((left, right) => document.sessions[left]!.lastUsedAt - document.sessions[right]!.lastUsedAt)
+    while (Object.keys(document.sessions).length > retainedLimit) {
+      const candidate = removable.shift()
+      if (!candidate) break
+      delete document.sessions[candidate]
+      advanceKeySlot(candidate, document.meta)
+    }
+    finalized = true
+    return true
+  }, beforePublish)
+  return finalized
+}
+
+export interface RollbackSharedSessionAndPriorityAssignmentOptions {
+  key: string
+  routeKey: string
+  expectedMappingGeneration: StoredSessionGeneration
+  expectedAssignmentGeneration: PriorityAssignmentGeneration
+  previousMapping: StoredSession | null
+  previousAssignment: DurablePriorityAssignment | null
+  attemptOwnerToken?: string
+}
+
+export interface RollbackSharedSessionAndPriorityAssignmentResult {
+  mappingGeneration: StoredSessionGeneration
+  assignmentGeneration: PriorityAssignmentGeneration
+  restoredMapping: StoredSession | null
+  restoredAssignment: DurablePriorityAssignment | null
 }
 
 /** Restore the exact pre-request authorities after a canceled late publication. */
-export function rollbackSharedSessionAndPriorityAssignment(
+export async function rollbackSharedSessionAndPriorityAssignment(
   options: RollbackSharedSessionAndPriorityAssignmentOptions,
-): RollbackSharedSessionAndPriorityAssignmentResult | false | Promise<RollbackSharedSessionAndPriorityAssignmentResult | false> {
-  const backend = activeStoreBackend()
-  if (backend) return backend.rollbackSharedSessionAndPriorityAssignment(getSessionStoreDir(), options)
-  return (async () => {
-    options = structuredClone(options)
-    let result: RollbackSharedSessionAndPriorityAssignmentResult | false = false
-    return mutateStore((document) => {
-      if (document.meta.version !== PRIORITY_STORE_META_VERSION) return false
-      const currentMapping = document.sessions[options.key]
-      if (keyGeneration(options.key, currentMapping, document.meta) !== options.expectedMappingGeneration) return false
-      const currentAssignment = document.meta.priorityAssignments[options.routeKey]
-      if (
-        priorityAssignmentGeneration(options.routeKey, currentAssignment, document.meta)
-        !== options.expectedAssignmentGeneration
-      ) return false
-      const attempt = document.meta.priorityAttempts[options.routeKey]
-      if (options.attemptOwnerToken !== undefined) {
-        if (attempt?.ownerToken !== options.attemptOwnerToken) return false
-      } else if (attempt) return false
-      const expectedRollback = options.previousAssignment
-        && options.previousAssignment.mappingKey !== options.key
-        ? {
+): Promise<RollbackSharedSessionAndPriorityAssignmentResult | false> {
+  options = structuredClone(options)
+  let result: RollbackSharedSessionAndPriorityAssignmentResult | false = false
+  await mutateStore((document) => {
+    if (document.meta.version !== PRIORITY_STORE_META_VERSION) return false
+    const currentMapping = document.sessions[options.key]
+    if (keyGeneration(options.key, currentMapping, document.meta) !== options.expectedMappingGeneration) return false
+    const currentAssignment = document.meta.priorityAssignments[options.routeKey]
+    if (
+      priorityAssignmentGeneration(options.routeKey, currentAssignment, document.meta)
+      !== options.expectedAssignmentGeneration
+    ) return false
+    const attempt = document.meta.priorityAttempts[options.routeKey]
+    if (options.attemptOwnerToken !== undefined) {
+      if (attempt?.ownerToken !== options.attemptOwnerToken) return false
+    } else if (attempt) return false
+    const expectedRollback = options.previousAssignment
+      && options.previousAssignment.mappingKey !== options.key
+      ? {
           mappingKey: options.previousAssignment.mappingKey,
           mappingGeneration: options.previousAssignment.mappingGeneration,
         }
-        : undefined
-      const actualRollback = document.meta.priorityRollbackMappings[options.routeKey]
-      if (
-        actualRollback?.mappingKey !== expectedRollback?.mappingKey
-        || actualRollback?.mappingGeneration !== expectedRollback?.mappingGeneration
-      ) return false
+      : undefined
+    const actualRollback = document.meta.priorityRollbackMappings[options.routeKey]
+    if (
+      actualRollback?.mappingKey !== expectedRollback?.mappingKey
+      || actualRollback?.mappingGeneration !== expectedRollback?.mappingGeneration
+    ) return false
 
-      let restoredMapping: StoredSession | null = null
-      if (options.previousMapping) {
-        restoredMapping = {
-          ...structuredClone(options.previousMapping),
-          revision: (options.previousMapping.revision ?? 0) + 1,
-          generationId: randomUUID(),
-        }
-        document.sessions[options.key] = restoredMapping
-      } else {
-        delete document.sessions[options.key]
+    let restoredMapping: StoredSession | null = null
+    if (options.previousMapping) {
+      restoredMapping = {
+        ...structuredClone(options.previousMapping),
+        revision: (options.previousMapping.revision ?? 0) + 1,
+        generationId: randomUUID(),
       }
+      document.sessions[options.key] = restoredMapping
+    } else {
+      delete document.sessions[options.key]
       advanceKeySlot(options.key, document.meta)
-      const mappingGeneration = keyGeneration(options.key, restoredMapping ?? undefined, document.meta)
+    }
+    const mappingGeneration = keyGeneration(options.key, restoredMapping ?? undefined, document.meta)
 
-      let restoredAssignment: DurablePriorityAssignment | null = null
-      if (options.previousAssignment) {
-        restoredAssignment = {
-          ...structuredClone(options.previousAssignment),
-          mappingGeneration: options.previousAssignment.mappingKey === options.key
-            ? mappingGeneration
-            : options.previousAssignment.mappingGeneration,
-          generationId: randomUUID(),
-          updatedAt: Date.now(),
-        }
-        document.meta.priorityAssignments[options.routeKey] = restoredAssignment
-      } else {
-        delete document.meta.priorityAssignments[options.routeKey]
+    let restoredAssignment: DurablePriorityAssignment | null = null
+    if (options.previousAssignment) {
+      restoredAssignment = {
+        ...structuredClone(options.previousAssignment),
+        mappingGeneration: options.previousAssignment.mappingKey === options.key
+          ? mappingGeneration
+          : options.previousAssignment.mappingGeneration,
+        generationId: randomUUID(),
+        updatedAt: Date.now(),
       }
-      delete document.meta.priorityRollbackMappings[options.routeKey]
-      advanceKeySlot(priorityGenerationKey(options.routeKey), document.meta)
-      const assignmentGeneration = priorityAssignmentGeneration(
-        options.routeKey,
-        restoredAssignment ?? undefined,
-        document.meta,
-      )
-      result = {
-        mappingGeneration,
-        assignmentGeneration,
-        restoredMapping,
-        restoredAssignment,
-      }
-      return true
-    }).then(() => result)
-  })()
+      document.meta.priorityAssignments[options.routeKey] = restoredAssignment
+    } else {
+      delete document.meta.priorityAssignments[options.routeKey]
+    }
+    delete document.meta.priorityRollbackMappings[options.routeKey]
+    advanceKeySlot(priorityGenerationKey(options.routeKey), document.meta)
+    const assignmentGeneration = priorityAssignmentGeneration(
+      options.routeKey,
+      restoredAssignment ?? undefined,
+      document.meta,
+    )
+    result = {
+      mappingGeneration,
+      assignmentGeneration,
+      restoredMapping,
+      restoredAssignment,
+    }
+    return true
+  })
+  return result
 }
 
 function sameTranscriptLocator(left: TranscriptLocator | undefined, right: TranscriptLocator): boolean {
@@ -1791,84 +2022,74 @@ function sameTranscriptLocator(left: TranscriptLocator | undefined, right: Trans
 
 /** Attach an exact transcript locator without changing lineage or SDK identity.
  * The durable revision advances so concurrent readers cannot miss the mutation. */
-export function attachSharedTranscriptLocator(
+export async function attachSharedTranscriptLocator(
   key: string,
   expectedClaudeSessionId: string,
   locator: TranscriptLocator,
   expectedGeneration?: StoredSessionGeneration,
   beforePublish?: () => void,
-): StoredSessionGeneration | false | Promise<StoredSessionGeneration | false> {
-  const backend = activeStoreBackend()
-  if (backend) {
-    beforePublish?.()
-    return backend.attachSharedTranscriptLocator(getSessionStoreDir(), key,
-    expectedClaudeSessionId, locator, expectedGeneration)
-  }
-  return (async () => {
-    locator = { ...locator }
-    validateTranscriptLocator(locator, expectedClaudeSessionId)
-    let attachedGeneration: StoredSessionGeneration | false = false
-    return mutateStore(({ sessions: store, meta }) => {
-      if (isPriorityRollbackMapping(meta, key)) return false
-      const existing = store[key]
-      if (!existing || existing.claudeSessionId !== expectedClaudeSessionId) return false
-      if (expectedGeneration !== undefined && getStoredSessionGeneration(existing, key) !== expectedGeneration) return false
-      if (!sameTranscriptLocator(existing.currentTranscript, locator)) {
-        // Copy, never alias — same reason as in storeSharedSession.
-        const attached: StoredSession = {
-          ...existing,
-          currentTranscript: { ...locator },
-          revision: (existing.revision ?? 0) + 1,
-          generationId: randomUUID(),
-        }
-        store[key] = attached
-        advanceKeySlot(key, meta)
-        attachedGeneration = getStoredSessionGeneration(attached, key)
-        if (meta.version === PRIORITY_STORE_META_VERSION) {
-          for (const [routeKey, assignment] of Object.entries(meta.priorityAssignments)) {
-            if (assignment.mappingKey !== key) continue
-            assignment.mappingGeneration = attachedGeneration
-            assignment.generationId = randomUUID()
-            assignment.updatedAt = Date.now()
-            advanceKeySlot(priorityGenerationKey(routeKey), meta)
-          }
-        }
-      } else {
-        attachedGeneration = getStoredSessionGeneration(existing, key)
-        // API success is independent of publication: this locked draft is unchanged.
-        return false
+): Promise<StoredSessionGeneration | false> {
+  locator = { ...locator }
+  validateTranscriptLocator(locator, expectedClaudeSessionId)
+  let attachedGeneration: StoredSessionGeneration | false = false
+  await mutateStore(({ sessions: store, meta }) => {
+    if (isPriorityRollbackMapping(meta, key)) return false
+    const existing = store[key]
+    if (!existing || existing.claudeSessionId !== expectedClaudeSessionId) return false
+    if (expectedGeneration !== undefined && getStoredSessionGeneration(existing, key) !== expectedGeneration) return false
+    if (!sameTranscriptLocator(existing.currentTranscript, locator)) {
+      // Copy, never alias — same reason as in storeSharedSession. The entry is
+      // replaced rather than edited: cached entries are shared and frozen.
+      const attached: StoredSession = {
+        ...existing,
+        currentTranscript: { ...locator },
+        revision: (existing.revision ?? 0) + 1,
+        generationId: randomUUID(),
       }
-      return true
-    }, beforePublish).then(() => attachedGeneration)
-  })()
+      store[key] = attached
+      attachedGeneration = getStoredSessionGeneration(attached, key)
+      if (meta.version === PRIORITY_STORE_META_VERSION) {
+        for (const [routeKey, assignment] of Object.entries(meta.priorityAssignments)) {
+          if (assignment.mappingKey !== key) continue
+          assignment.mappingGeneration = attachedGeneration
+          assignment.generationId = randomUUID()
+          assignment.updatedAt = Date.now()
+          advanceKeySlot(priorityGenerationKey(routeKey), meta)
+        }
+      }
+    } else {
+      attachedGeneration = getStoredSessionGeneration(existing, key)
+      // API success is independent of publication: this locked draft is unchanged.
+      return false
+    }
+    return true
+  }, beforePublish)
+  return attachedGeneration
 }
 
 /** Ensure a single session is absent from the shared file store.
  *  Used when a session is detected as stale (e.g. expired upstream).
  *  Absence is an idempotent success; false is reserved for a present mapping
  *  whose exact expected generation no longer matches. */
-export function evictSharedSession(
+export async function evictSharedSession(
   key: string,
   expectedGeneration?: StoredSessionGeneration,
-): boolean | Promise<boolean> {
-  const backend = activeStoreBackend()
-  if (backend) return backend.evictSharedSession(getSessionStoreDir(), key, expectedGeneration)
-  return (async () => {
-    let evicted = false
-    return mutateStore(({ sessions: store, meta }) => {
-      const existing = store[key]
-      if (!existing) {
-        evicted = true
-        return false
-      }
-      if (expectedGeneration !== undefined && getStoredSessionGeneration(existing, key) !== expectedGeneration) return false
-      if (isPriorityRollbackMapping(meta, key)) return false
-      delete store[key]
-      advanceKeySlot(key, meta)
+): Promise<boolean> {
+  let evicted = false
+  await mutateStore(({ sessions: store, meta }) => {
+    const existing = store[key]
+    if (!existing) {
       evicted = true
-      return true
-    }).then(() => evicted)
-  })()
+      return false
+    }
+    if (expectedGeneration !== undefined && getStoredSessionGeneration(existing, key) !== expectedGeneration) return false
+    if (isPriorityRollbackMapping(meta, key)) return false
+    delete store[key]
+    advanceKeySlot(key, meta)
+    evicted = true
+    return true
+  })
+  return evicted
 }
 
 /**
@@ -1882,6 +2103,17 @@ export function evictSharedSession(
  */
 export const DEFAULT_PROFILE_COPY_GRACE_MS = 24 * 60 * 60_000
 
+export interface ProfileCopyPruneOptions {
+  /** Configured non-default profile IDs; only their `${id}:` prefixes are recognized. */
+  profileIds: Iterable<string>
+  /** Copies used within this window are kept alongside the newest one. */
+  graceMs: number
+  /** Most transcripts the removed mappings may stop pinning in this call. */
+  maxUnpinnedTranscripts: number
+  /** A conversation with a request arrived or running keeps every copy. */
+  isConversationActive: (conversationId: string) => boolean
+}
+
 function pinnedTranscriptCount(session: StoredSession): number {
   let count = 0
   if (session.currentTranscript?.sessionId === session.claudeSessionId) count++
@@ -1894,22 +2126,52 @@ function selectSupersededProfileCopies(
   options: ProfileCopyPruneOptions,
   now: number,
 ): string[] {
+  const profileIds = new Set(options.profileIds)
+  profileIds.delete("default")
   const protectedKeys = new Set(document.meta.version === PRIORITY_STORE_META_VERSION
     ? [
-        ...Object.values(document.meta.priorityAssignments).map(assignment => assignment.mappingKey),
-        ...Object.values(document.meta.priorityRollbackMappings).map(rollback => rollback.mappingKey),
-      ] : [])
-  return selectProfileCopies(Object.entries(document.sessions).map(([key, session]) => ({
-    key, lastUsedAt: session.lastUsedAt || 0, pinnedTranscripts: pinnedTranscriptCount(session),
-  })), protectedKeys, options, now)
+        ...Object.values(document.meta.priorityAssignments).map((assignment) => assignment.mappingKey),
+        ...Object.values(document.meta.priorityRollbackMappings).map((rollback) => rollback.mappingKey),
+      ]
+    : [])
+  const copiesByConversation = new Map<string, string[]>()
+  for (const key of Object.keys(document.sessions)) {
+    const separator = key.indexOf(":")
+    const conversationId = separator > 0 && profileIds.has(key.slice(0, separator))
+      ? key.slice(separator + 1)
+      : key
+    const copies = copiesByConversation.get(conversationId)
+    if (copies) copies.push(key)
+    else copiesByConversation.set(conversationId, [key])
+  }
+
+  const lastUsed = (key: string): number => document.sessions[key]!.lastUsedAt || 0
+  const candidates: string[] = []
+  for (const [conversationId, copies] of copiesByConversation) {
+    if (copies.length < 2) continue
+    const newest = copies.reduce((best, key) => (lastUsed(key) > lastUsed(best) ? key : best))
+    const superseded = copies.filter((key) => (
+      key !== newest && !protectedKeys.has(key) && now - lastUsed(key) > options.graceMs
+    ))
+    if (superseded.length > 0 && !options.isConversationActive(conversationId)) candidates.push(...superseded)
+  }
+  candidates.sort((left, right) => lastUsed(left) - lastUsed(right))
+
+  const victims: string[] = []
+  let remaining = options.maxUnpinnedTranscripts
+  for (const key of candidates) {
+    const cost = pinnedTranscriptCount(document.sessions[key]!)
+    if (cost > remaining) continue
+    remaining -= cost
+    victims.push(key)
+  }
+  return victims
 }
 
 /** Candidate conversations only; callers must fence turns before deleting their mappings. */
 export function listSupersededProfileConversations(options: ProfileCopyPruneOptions): string[] {
-  const backend = activeStoreBackend()
-  if (backend) return backend.listSupersededProfileConversations(getSessionStoreDir(), options)
   const profileIds = new Set(options.profileIds)
-  const candidates = selectSupersededProfileCopies(readStoreDocumentCached(getStorePath()),
+  const candidates = selectSupersededProfileCopies(currentDocument(),
     { ...options, profileIds }, Date.now())
   return [...new Set(candidates.map(key => {
     const separator = key.indexOf(":")
@@ -1926,27 +2188,24 @@ export function listSupersededProfileConversations(options: ProfileCopyPruneOpti
  * reconciliation retires them through the normal bounded backlog.
  * Returns the number of mappings removed.
  */
-export function pruneSupersededProfileCopies(options: ProfileCopyPruneOptions): number | Promise<number> {
-  const backend = activeStoreBackend()
-  if (backend) return backend.pruneSupersededProfileCopies(getSessionStoreDir(), options)
-  return (async () => {
-    options = { ...options, profileIds: new Set(options.profileIds) }
-    // Select from the cached document first so the common no-op sweep takes no
-    // lock and writes nothing.
-    if (selectSupersededProfileCopies(readStoreDocumentCached(getStorePath()), options, Date.now()).length === 0) {
-      return 0
+export async function pruneSupersededProfileCopies(options: ProfileCopyPruneOptions): Promise<number> {
+  options = { ...options, profileIds: new Set(options.profileIds) }
+  // Select from the cached document first so the common no-op sweep takes no
+  // lock and writes nothing.
+  if (selectSupersededProfileCopies(currentDocument(), options, Date.now()).length === 0) {
+    return 0
+  }
+  let pruned = 0
+  await mutateStore(({ sessions, meta }) => {
+    const victims = selectSupersededProfileCopies({ sessions, meta }, options, Date.now())
+    for (const key of victims) {
+      delete sessions[key]
+      advanceKeySlot(key, meta)
     }
-    let pruned = 0
-    return mutateStore(({ sessions, meta }) => {
-      const victims = selectSupersededProfileCopies({ sessions, meta }, options, Date.now())
-      for (const key of victims) {
-        delete sessions[key]
-        advanceKeySlot(key, meta)
-      }
-      pruned = victims.length
-      return pruned > 0
-    }).then(() => pruned)
-  })()
+    pruned = victims.length
+    return pruned > 0
+  })
+  return pruned
 }
 
 /** Look up recovery information for a session key.
@@ -1959,8 +2218,6 @@ export function lookupSessionRecovery(key: string): {
   lastUsedAt: number
   messageCount: number
 } | undefined {
-  const backend = activeStoreBackend()
-  if (backend) return backend.lookupSessionRecovery(getSessionStoreDir(), key)
   const store = readStore()
   const session = store[key]
   if (!session) return undefined
@@ -1983,8 +2240,6 @@ export function listStoredSessions(): Array<{
   lastUsedAt: number
   messageCount: number
 }> {
-  const backend = activeStoreBackend()
-  if (backend) return backend.listStoredSessions(getSessionStoreDir())
   const store = readStore()
   return Object.entries(store).map(([key, session]) => ({
     key,
@@ -1996,10 +2251,8 @@ export function listStoredSessions(): Array<{
   }))
 }
 
-export function clearSharedSessions(afterCommit?: () => void): void | Promise<void> {
-  const backend = activeStoreBackend()
-  if (backend) return backend.clearSharedSessions(getSessionStoreDir(), afterCommit)
-  return mutateStore(({ sessions: store, meta }) => {
+export async function clearSharedSessions(afterCommit?: () => void): Promise<void> {
+  await mutateStore(({ sessions: store, meta }) => {
     for (const key of Object.keys(store)) {
       delete store[key]
       advanceKeySlot(key, meta)
@@ -2017,4 +2270,12 @@ export function clearSharedSessions(afterCommit?: () => void): void | Promise<vo
     }
     return true
   }, undefined, afterCommit)
+}
+
+/**
+ * For upstream's bookkeeping migration, which this build refuses to run: the
+ * store is sessions.db, and there is no sessions.json lock to hold.
+ */
+export function withLegacyStoreMaintenanceLock<T>(_directory: string, _operation: () => T): T {
+  throw new Error("SQLite bookkeeping migration is not supported by this build: sessions are kept in sessions.db")
 }

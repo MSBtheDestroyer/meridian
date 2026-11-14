@@ -19,6 +19,7 @@
 import { isDeepStrictEqual } from "node:util"
 import type { ChatGptAccount } from "../chatgpt/credentials"
 import { chatGptNameProblem, chatGptProfiles, type ChatGptProfile } from "../chatgpt/profiles"
+import { chatGptAuthLifecycleKey } from "../chatgpt/refresh"
 import type { ChatGptSeatView } from "../chatgpt/source"
 
 /** One Meridian instance's persisted state, as its files hold it. */
@@ -29,6 +30,8 @@ export interface InstanceState {
   settings: Record<string, unknown>
   /** profiles.json: the Claude profiles. */
   claudeProfiles: Array<{ id: string; aliases?: unknown }>
+  /** auth-lifecycle.json: login records by credential key. */
+  authLifecycles: Record<string, unknown>
   /** model-pricing.json: price overrides by model. */
   pricing: Record<string, unknown>
 }
@@ -53,6 +56,8 @@ export interface InstanceImportPlan {
   renamed: ReadonlyMap<string, string>
   /** Top-level settings.json keys to set on the destination. Empty when it already holds them. */
   settings: Record<string, unknown>
+  /** auth-lifecycle.json records to add to the destination. */
+  authLifecycles: Record<string, unknown>
   /** model-pricing.json overrides to add to the destination. */
   pricing: Record<string, unknown>
   /** Why the plan cannot be applied. Empty means it can. */
@@ -68,6 +73,8 @@ const IMPORTED_SETTINGS = new Set([
   "chatGptProfileAliases",
   "chatgpt",
   "integrations",
+  "routingExcludedProfiles",
+  "routingManagedExcludedProfiles",
   "profileOrder",
 ])
 
@@ -262,13 +269,13 @@ export function planInstanceImport(input: {
     if (!isDeepStrictEqual(merged, into)) settings[key] = merged
   }
 
-  // The profile order names seats: an entry is carried over when it names an
-  // imported seat, by its seat id or by a name the source knows it by.
+  // Lists that name seats: an entry is carried over when it names an imported
+  // seat, by its seat id or by a name the source knows it by.
   const seatOfEntry = (entry: string): SeatImport | undefined => seats.find(seat => {
     if (seat.seat === entry || seat.sourceId === entry) return true
     return sourceBySeat.get(seat.seat)?.aliases.includes(entry) ?? false
   })
-  for (const key of ["profileOrder"] as const) {
+  for (const key of ["routingExcludedProfiles", "routingManagedExcludedProfiles", "profileOrder"] as const) {
     if (!(key in source.settings)) continue
     const into = stringList(destination.settings[key])
     const merged = [...into]
@@ -289,6 +296,20 @@ export function planInstanceImport(input: {
   const own = Object.keys(source.settings).filter(key => !IMPORTED_SETTINGS.has(key))
   if (own.length > 0) notes.push(`not imported, each instance keeps its own: ${own.join(", ")}`)
 
+  const authLifecycles: Record<string, unknown> = {}
+  const seatKeys = new Set(seats.map(seat => chatGptAuthLifecycleKey(seat.seat)))
+  for (const seat of seats) {
+    const key = chatGptAuthLifecycleKey(seat.seat)
+    if (!(key in source.authLifecycles)) continue
+    const record = source.authLifecycles[key]
+    if (!(key in destination.authLifecycles)) authLifecycles[key] = record
+    else if (!isDeepStrictEqual(destination.authLifecycles[key], record)) {
+      conflicts.push(`${seat.label}'s login record differs between the two instances`)
+    }
+  }
+  const otherRecords = Object.keys(source.authLifecycles).filter(key => !seatKeys.has(key)).length
+  if (otherRecords > 0) notes.push(`${otherRecords} login record(s) of accounts outside the ChatGPT store stay behind`)
+
   const pricing: Record<string, unknown> = {}
   for (const [model, price] of Object.entries(source.pricing)) {
     if (!(model in destination.pricing)) pricing[model] = price
@@ -298,5 +319,5 @@ export function planInstanceImport(input: {
   }
 
   const renamed = new Map([...input.renames].filter(([from]) => known.has(from)))
-  return { seats, renamed, settings, pricing, conflicts, notes }
+  return { seats, renamed, settings, authLifecycles, pricing, conflicts, notes }
 }

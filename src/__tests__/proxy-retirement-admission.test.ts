@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, rmSync } from "node:fs"
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { installSdkMock } from "./sdkMock"
@@ -36,12 +36,16 @@ installSdkMock(() => ({
 installLoggerMock(() => ({ claudeLog: () => {}, withClaudeLogContext: (_ctx, fn) => fn() }))
 installMcpToolsMock(() => ({ createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }) }))
 
+const models = await import("../proxy/models")
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { resetActiveProfile } = await import("../proxy/profiles")
+const { readSessionGcSnapshot } = await import("../proxy/sessionLifecycle")
 const { setSessionStoreDir, readSessionStoreSnapshot } = await import("../proxy/sessionStore")
+const { commitRawSession } = await import("./storeDatabaseHelpers")
 
 let root: string
 let proxy: ReturnType<typeof createProxyServer> | undefined
+let restoreAuth: (() => void) | undefined
 const savedEnv: Record<string, string | undefined> = {}
 const overrides = {
   MERIDIAN_SESSION_GC_MAX_PENDING: "2",
@@ -51,6 +55,8 @@ const overrides = {
 }
 
 beforeEach(async () => {
+  const auth = spyOn(models, "getClaudeAuthStatusAsync").mockImplementation(async () => ({ loggedIn: true }))
+  restoreAuth = () => auth.mockRestore()
   root = realpathSync(mkdtempSync(join(tmpdir(), "meridian-retirement-http-")))
   for (const key of [...Object.keys(overrides), "MERIDIAN_WORKDIR", "MERIDIAN_CONFIG_DIR", "MERIDIAN_SESSION_PROFILE_COPY_PRUNE", "MERIDIAN_SESSION_PROFILE_COPY_GRACE_MS", "CLAUDE_PROXY_SESSION_PROFILE_COPY_PRUNE"]) savedEnv[key] = process.env[key]
   Object.assign(process.env, overrides, { MERIDIAN_WORKDIR: root, MERIDIAN_CONFIG_DIR: join(root, "config") })
@@ -66,6 +72,8 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  restoreAuth?.()
+  restoreAuth = undefined
   await proxy?.sweepSessionGc?.()
   proxy = undefined
   await clearSessionCache()
@@ -111,7 +119,7 @@ describe("profile switch admission with bounded retirement", () => {
     await clearSessionCache()
     expect(Object.values(readSessionStoreSnapshot())).toHaveLength(0)
     await sweep()
-    const sidecar = JSON.parse(readFileSync(join(root, "sessions", "session-gc.json"), "utf8")) as {
+    const sidecar = readSessionGcSnapshot(join(root, "sessions")) as {
       resources: Record<string, { state: string }>
     }
     expect(Object.values(sidecar.resources).some(resource => resource.state === "retired")).toBe(true)
@@ -139,7 +147,7 @@ describe("profile switch admission with bounded retirement", () => {
     await sweep()
     await clearSessionCache()
     await sweep()
-    const retired = () => Object.values((JSON.parse(readFileSync(join(root, "sessions", "session-gc.json"), "utf8")) as {
+    const retired = () => Object.values((readSessionGcSnapshot(join(root, "sessions")) as {
       resources: Record<string, { state: string }>
     }).resources).filter(resource => resource.state === "retired").length
     expect(retired()).toBe(1)
@@ -176,8 +184,8 @@ describe("profile-copy pruning consent", () => {
         "personal:policy": { claudeSessionId: "older", createdAt: 1, lastUsedAt: 1, messageCount: 1 },
         "work:policy": { claudeSessionId: "newer", createdAt: 2, lastUsedAt: 2, messageCount: 1 },
       }
-      mkdirSync(join(root, "sessions"), { recursive: true })
-      writeFileSync(join(root, "sessions", "sessions.json"), JSON.stringify(document))
+      readSessionStoreSnapshot()
+      for (const [key, entry] of Object.entries(document)) commitRawSession(join(root, "sessions"), key, entry)
       proxy = createProxyServer({ port: 0, host: "127.0.0.1", profiles: ["personal", "work"].map(id => ({ id, claudeConfigDir: join(root, id) })) })
       await proxy.sweepSessionGc?.()
       expect(Object.keys(readSessionStoreSnapshot()).sort()).toEqual(enabled === "1"

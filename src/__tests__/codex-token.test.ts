@@ -41,7 +41,12 @@ describe("decodeCodexToken", () => {
       planType: "pro",
       expiresAt: 1789494103000,
       issuedAt: 1788630103000,
+      signedInAt: null,
     })
+  })
+
+  test("reads when the person signed in, in milliseconds as OpenAI states it", () => {
+    expect(decodeCodexToken(makeToken({ exp: 1789494103, pwd_auth_time: 1788630000123 }))?.signedInAt).toBe(1788630000123)
   })
 
   test("converts exp from seconds to milliseconds", () => {
@@ -58,6 +63,7 @@ describe("decodeCodexToken", () => {
       planType: null,
       expiresAt: 1788905341000,
       issuedAt: null,
+      signedInAt: null,
     })
   })
 
@@ -85,11 +91,13 @@ describe("decodeCodexToken", () => {
   test("ignores claim values of the wrong type instead of propagating them", () => {
     const decoded = decodeCodexToken(makeToken({
       exp: "not-a-number",
+      pwd_auth_time: "yesterday",
       [AUTH_NAMESPACE]: { chatgpt_plan_type: 42, chatgpt_account_id: null },
     }))
     expect(decoded?.planType).toBeNull()
     expect(decoded?.accountId).toBeNull()
     expect(decoded?.expiresAt).toBeNull()
+    expect(decoded?.signedInAt).toBeNull()
   })
 })
 

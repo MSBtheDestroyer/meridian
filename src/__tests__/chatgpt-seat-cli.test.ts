@@ -128,6 +128,8 @@ describe("ChatGPT seats from the CLI, with no Meridian running", () => {
     expect(switchChatGptSeat("f-ffffff", h.ctx)).toBe(true)
     expect(getSetting("chatGptActiveSeat")).toBe(FREE)
     expect(h.out.join("\n")).toContain("free plan")
+    saveSettings({ routingExcludedProfiles: ["p-pppppp"] })
+    expect(switchChatGptSeat("p-pppppp", h.ctx)).toBe(false)
   })
 
   it("removes a seat itself: credentials, settings and the active pointer, then lets the lease go", async () => {

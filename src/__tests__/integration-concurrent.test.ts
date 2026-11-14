@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test"
 import { AsyncLocalStorage } from "node:async_hooks"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs"
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk"
@@ -13,6 +13,7 @@ import { assertSyntheticClaudeBoundary, setSdkMock } from "./sdkMock"
 import { setLoggerMock } from "./loggerMock"
 import { setMcpToolsMock } from "./mcpToolsMock"
 import { getSessionStoreDir, readSessionStoreSnapshot } from "../proxy/sessionStore"
+import { committedLifecycleResources } from "./storeDatabaseHelpers"
 import { computeLineageHash } from "../proxy/session/lineage"
 import { assistantMessage, withMockSdkSessionId } from "./helpers"
 
@@ -109,12 +110,8 @@ type OwnedResource = {
 }
 function readOwnedResources(): OwnedResource[] {
   expect(getSessionStoreDir()).toBe(sessionDirectory)
-  const lifecyclePath = join(sessionDirectory, "session-gc.json")
-  if (!existsSync(lifecyclePath)) return []
-  const sidecar = JSON.parse(readFileSync(lifecyclePath, "utf8")) as {
-    resources: Record<string, OwnedResource>
-  }
-  const resources = Object.values(sidecar.resources)
+  // The fork keeps the transcript lifecycle journal in sessions.db.
+  const resources = Object.values(committedLifecycleResources(sessionDirectory)) as OwnedResource[]
   for (const resource of resources) {
     expect(resource.locator.configDir).toBe(claudeDirectory)
     expect(resource.locator.projectDir).toBe(workingDirectory)

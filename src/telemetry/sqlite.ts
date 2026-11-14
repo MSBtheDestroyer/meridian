@@ -46,9 +46,9 @@ CREATE TABLE IF NOT EXISTS metrics (
   route_group_id       TEXT,
   route_attempt        INTEGER,
   route_refused_bucket TEXT,
-  resolved_model       TEXT,
   reasoning_output_tokens INTEGER,
-  fallback_from_model  TEXT
+  fallback_from_model  TEXT,
+  resolved_model       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_ts    ON metrics(timestamp);
 CREATE INDEX IF NOT EXISTS idx_metrics_model ON metrics(model);
@@ -71,9 +71,9 @@ const METRICS_MIGRATIONS = [
   "ALTER TABLE metrics ADD COLUMN route_group_id TEXT",
   "ALTER TABLE metrics ADD COLUMN route_attempt INTEGER",
   "ALTER TABLE metrics ADD COLUMN route_refused_bucket TEXT",
-  "ALTER TABLE metrics ADD COLUMN resolved_model TEXT",
   "ALTER TABLE metrics ADD COLUMN reasoning_output_tokens INTEGER",
   "ALTER TABLE metrics ADD COLUMN fallback_from_model TEXT",
+  "ALTER TABLE metrics ADD COLUMN resolved_model TEXT",
 ]
 
 const LOGS_SCHEMA = `

@@ -277,6 +277,8 @@ src/
 │   ├── query.ts               ← SDK query options builder (shared between stream/non-stream paths)
 │   ├── transcriptRetention.ts ← Opt-in Claude Code retention period per SDK config root (off by default)
 │   ├── transcriptRetentionSettings.ts ← GET/PUT /settings/api/transcripts (same-origin browser writes)
+│   ├── transcriptRetention.ts ← Claude Code transcript retention period per SDK config root
+│   ├── transcriptSweep.ts     ← Idle sweep: an offline, promptless Claude Code process per idle config root
 │   ├── errors.ts              ← Error classification (SDK errors → HTTP responses)
 │   ├── toolInputJson.ts       ← Tool input JSON repair for raw control characters in strings (PURE)
 │   ├── retryAfter.ts          ← Retry-After computation for 429/503/529 (PURE)
@@ -313,10 +315,13 @@ src/
 │   │   ├── turnCoordinator.ts ← Process-wide serialization for reliable session IDs
 │   │   ├── crossProcessTurnCoordinator.ts ← Durable coordination across proxy processes
 │   │   ├── processIncarnation.ts ← Process/host identity for lock ownership
+│   │   ├── storeDatabase.ts   ← SQLite database behind the session store and lifecycle journal (WAL, off-loop commits)
 │   │   └── durableFileSystem.ts ← Durable file operations
-│   ├── sessionStore.ts        ← Shared file store (cross-proxy session resume)
+│   ├── sessionStore.ts        ← Shared session store (cross-proxy session resume)
 │   ├── profiles.ts            ← Multi-profile support: resolve, list, switch auth contexts (leaf)
 │   ├── profileCli.ts          ← CLI commands for profile management (leaf, I/O)
+│   ├── authLifecycle.ts       ← Credential-keyed login, renewal, refusal and recovery records (leaf, I/O)
+│   ├── profileLoginState.ts   ← Shared effective login decision and Claude metadata reconciliation (leaf)
 │   ├── profileConfigStore.ts  ← cross-process profile writer lock and atomic snapshots (leaf, I/O)
 │   ├── profileLogin.ts        ← Browser re-authentication state, redirect/paste completion and status
 │   ├── profileAdd.ts          ← Browser profile creation and isolated credential persistence
@@ -529,7 +534,9 @@ prompt-cache keepalive beats, control/provider operations and their finalizers
 before releasing its owner.
 `ProxyInstance.close()` bounds the wait after HTTP drain: an unjoined cleanup
 rejects instead of reporting success, while the original cleanup retains SQL
-and ChatGPT ownership until those operations join. Repeated calls return the
+ownership until those operations join. ChatGPT ownership is released once
+admitted work has joined, beside GC and backend close (`joinShutdownCleanup`),
+so a slow GC sweep cannot keep the writer lease past the deadline. The deadline is `MERIDIAN_SHUTDOWN_CLEANUP_DEADLINE_MS` (10 s): GC, backend close and ChatGPT release do fsyncs and join child processes, which on a loaded host routinely took longer than the former 2 s and made every restart exit 1. Cleanup still running after 2 s is logged with each step's time (`ShutdownProgress`), and a missed deadline names the step that held it. Repeated calls return the
 same promise. `session/deletionCleanup.ts` separately owns GC from admission,
 including gaps between transactions and native child creation. Its per-proxy
 async context keeps sibling shutdown independent; its directory ledger retains
@@ -845,6 +852,17 @@ but a running durable callback always finishes before returning ownership.
 Cleanup never receives the canceled admission signal. Publication callbacks
 remain synchronous; same-context recursive acquisition is rejected explicitly.
 
+## Transcript deletion throughput
+
+Every resumed request writes a new SDK fork, so a busy instance supersedes about one transcript per request. A superseded transcript is retired into the pending budget (`maxPending`), waits its grace period there and is then deleted; superseded transcripts that find the budget full stay live until a slot frees. Deletion therefore has to outpace fork creation in two ways:
+
+- **Pending capacity.** A retired transcript holds its slot through the grace period, so the budget caps throughput at `maxPending` per grace period. The server default is 2048 (about 11,000 per hour at the default grace); 256 capped it at about 1,400 per hour and less once deletion lagged.
+- **Lock cost.** Each deletion takes three lifecycle transactions: claim, executor handshake and verdict. Under request load the lifecycle lock is saturated and each transaction waits in its FIFO, so deleting one transcript at a time ran at a few hundred per hour. `runGc` claims up to 8 transcripts in one transaction, runs their children side by side, each with its own token, executor and process group, and records their verdicts in one transaction.
+
+The run deadline stops new claims only. A claimed deletion keeps its whole budget, and its child waits for its gate past that budget long enough for a handshake queued behind two stalled-holder windows. Truncating the budget to the run's remainder made the last claim of nearly every sweep fail with exit 75 on a loaded host. While transcripts are still due and runs make progress, the server starts the next run at once, for up to 5 minutes per sweep. Once shutdown starts, a run claims nothing new and returns after the batch it already claimed, so the shutdown sweep fits its join deadline; a claimed deletion it leaves running stays fenced and is recovered by the next process.
+
+Each sweep reports its backlog (`GcBacklog`: pending, budget, superseded transcripts awaiting retirement, transcripts due for deletion). When superseded transcripts wait for a full budget the backlog is saturated: the server logs `session GC backlog saturated` at most every 10 minutes, and healthy `/health` carries the latest backlog as `sessionGc`. Saturation never changes the health status: deletion lagging is not a reason to stop routing requests.
+
 ## Session store write cost
 
 `sessionStore.ts` JSON mutations await filesystem work off the event loop; reading, parsing and serialization still run on it, so their CPU cost is lag for every request. The parsed document is cached by file identity (device, inode, size, mtime, ctime); every writer publishes by rename while holding the store lock, so a locked mutation that finds the cache current builds on it without re-parsing. Mutators receive a copy-on-write draft and replace entries rather than editing them. New entries own a deep copy of caller data before serialization. Cached entries/maps and metadata are frozen; privately parsed nested arrays are frozen before a lookup or snapshot exposes them, avoiding a full nested walk for a single cold lookup. Each entry's serialized UTF-8 bytes are memoized, so a write encodes only the entries it changed. Unchanged entries keep their identity and serialized bytes. The file format and lock/fsync/rename durability protocol are unchanged; lock retries and filesystem writes now yield instead of blocking other requests.
@@ -908,6 +926,14 @@ per-request alerts. Recovery exhaustion is critical; individual child exits rema
 in the in-app history.
 
 ## Auth-status refresh lifetime
+
+`planRecheck.ts` bounds Claude plan observations to six-hour freshness and
+five-minute retry cadence. Plan-only writes and token rotations share per-store
+maintenance admission; a forced rotation waits for a plan write rather than
+joining its result. `tokenRefresh.ts` persists fresh returned plan fields during
+normal credential maintenance and invalidates facts-cache generations after writes.
+The existing 45-second maintenance loop explicitly enables plan observations;
+valid-token SDK admission retains its no-network fast path.
 
 Auth-status caches remain shared by profile/default context. Each proxy instance
 owns only the refreshes its routes or keepalive requested; closing one owner

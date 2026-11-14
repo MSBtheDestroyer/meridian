@@ -160,6 +160,10 @@ describe("meridian instance-import", () => {
       layout: "wide",
       claudeExecutable: "bundled",
     })
+    writeJson(join(from.configDir, "auth-lifecycle.json"), {
+      [`chatgpt:${ALICE}`]: { authObtainedAt: 1_790_000_000_000, authObtainedVia: "login", events: [{ at: 1_790_000_000_000, kind: "login" }] },
+      "file:/somewhere/.credentials.json": { lastRefreshAt: 1_790_000_000_000, events: [] },
+    })
     writeJson(join(from.configDir, "model-pricing.json"), { "gpt-6-luna": { inputPerMTok: 1, outputPerMTok: 8 } })
     sourceMetrics = [
       ...Array.from({ length: 12 }, (_, i) => metric("alice-team", 1 + i, 400 + i)),
@@ -177,6 +181,7 @@ describe("meridian instance-import", () => {
       { id: "personal", claudeConfigDir: join(root, "dev", "profiles", "personal"), aliases: ["old-personal"] },
     ])
     writeJson(join(to.configDir, "settings.json"), { activeProfile: "personal", profileOrder: ["personal"], layout: "compact", showHostname: true })
+    writeJson(join(to.configDir, "auth-lifecycle.json"), { "file:/dev/.credentials.json": { lastRefreshAt: 1_790_000_000_001, events: [] } })
     record(to.telemetryPath, [
       ...Array.from({ length: 6 }, (_, i) => ({ ...metric("personal", 1 + i, 1000), adapter: "opencode", model: "claude-opus-4-7" })),
       metric(undefined, 2, 0),
@@ -204,7 +209,7 @@ describe("meridian instance-import", () => {
     expect(fingerprint(root)).toEqual(before)
   }, TIMEOUT)
 
-  it("moves every seat, setting, price and request, proves the copy, then retires the source", async () => {
+  it("moves every seat, setting, login record, price and request, proves the copy, then retires the source", async () => {
     const seatIds = ["alice-team", "alice-aaaaaa", "bob-plus", "bob-old", "carol-cccccc"]
     const before = { day: usage(from.telemetryPath, 24 * HOUR), week: usage(from.telemetryPath, 7 * 24 * HOUR) }
     const sourceAccounts = createChatGptCredentialStore({ path: from.storePath }).readAccounts()
@@ -229,6 +234,7 @@ describe("meridian instance-import", () => {
       chatGptActiveSeat: BOB,
       chatgpt: { creditsPolicy: "reserve", seatCreditsPolicy: { [BOB]: "never" } },
     })
+    expect(Object.keys(readJsonFile(join(to.configDir, "auth-lifecycle.json"))).sort()).toEqual([`chatgpt:${ALICE}`, "file:/dev/.credentials.json"])
     expect(readJsonFile(join(to.configDir, "model-pricing.json"))).toEqual({ "gpt-6-luna": { inputPerMTok: 1, outputPerMTok: 8 } })
 
     // Every request once, and each seat's history on / unchanged: the same
@@ -251,7 +257,7 @@ describe("meridian instance-import", () => {
     expect(verifyTelemetry({ snapshot: readTelemetry(retiredTelemetry)!, destinationPath: to.telemetryPath, renamed: new Map() })).toMatchObject({ missing: 0, differing: 0 })
 
     // Retired by renaming, so a full copy stays; nothing was deleted.
-    for (const path of [from.storePath, join(from.configDir, "settings.json"), join(from.configDir, "model-pricing.json"), from.telemetryPath]) {
+    for (const path of [from.storePath, join(from.configDir, "settings.json"), join(from.configDir, "auth-lifecycle.json"), join(from.configDir, "model-pricing.json"), from.telemetryPath]) {
       expect(existsSync(path)).toBe(false)
       expect(existsSync(`${path}${RETIRED}`)).toBe(true)
     }

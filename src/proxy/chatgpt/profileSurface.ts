@@ -1,9 +1,10 @@
 /**
  * The ChatGPT half of Meridian's profile surface.
  *
- * `/profiles/list`, `/v1/usage/quota/all`, `POST /profiles/active` and
- * `/profiles/events` are the one interface an account supervisor drives
- * Claude accounts through. ChatGPT seats join that interface here
+ * `/profiles/list`, `/v1/usage/quota/all`, `POST /profiles/active`,
+ * `POST /profiles/:id/warm`, `/profiles/events` and the routing exclusions are
+ * the one interface an account supervisor (Vibeterm's switcher and warmer)
+ * drives Claude accounts through. ChatGPT seats join that interface here
  * instead of getting a second one: server.ts keeps the routes and appends what
  * this returns, so the supervisor's code is the same for both providers and
  * only `type: "chatgpt"` tells them apart.
@@ -15,9 +16,11 @@
  * of the exclusions (settings, injected), the usage reading (injected), and
  * any credential - nothing here sees a token.
  */
+import { authLifecycleFor, noteApiRejected, noteCredentialObserved, noteProviderAccepted, type AuthLifecycleRecord } from "../authLifecycle"
 import type { CodexUsageResponse } from "../codex/types"
 import type { LimitDiagnosis } from "../limitDetection"
 import type { SpentRecord } from "../profileHealth"
+import { profileLoginState } from "../profileLoginState"
 import {
   CHATGPT_PROFILE_TYPE,
   chatGptOwner,
@@ -31,12 +34,37 @@ import {
   profileWindowType,
   seatWindows,
   type ChatGptProfile,
+  type ChatGptTokenState,
   type ObservedRateLimit,
 } from "./profiles"
+import { chatGptAuthLifecycleKey } from "./refresh"
 import type { CreditBurn } from "./creditRates"
 import type { ChatGptCreditsPolicy, ChatGptFreeSeatOrder } from "./features"
 import type { ChatGptCredentialSource } from "./source"
 import type { ChatGptRateLimit, ChatGptUsageWindow } from "./windows"
+
+/**
+ * The warm request's model, cheapest first. GPT-6 Luna is listed for every
+ * plan and served on the probed seats; an account outside the GPT-6 rollout
+ * refuses it as unsupported, and 5.6 Luna is the same tier one generation
+ * back. A refusal of the model is a request refusal (400), never a seat one.
+ */
+export const CHATGPT_WARM_MODELS = ["gpt-6-luna", "gpt-5.6-luna"] as const
+
+/**
+ * The smallest real Responses request: one short user turn, the lowest
+ * reasoning effort both warm models accept, terse output. No
+ * `max_output_tokens` - the backend refuses that field outright.
+ */
+export function chatGptWarmBody(model: string): Record<string, unknown> {
+  return {
+    model,
+    stream: false,
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+    reasoning: { effort: "low" },
+    text: { verbosity: "low" },
+  }
+}
 
 export interface ChatGptProfileSurfaceDeps {
   source: ChatGptCredentialSource
@@ -57,6 +85,11 @@ export interface ChatGptProfileSurfaceDeps {
   activeSeat: () => string | undefined
   /** Seats kept out of work: profile ids, seat ids, or Claude ids (ignored here). None when absent. */
   excluded?: () => readonly string[]
+  /**
+   * Seats held out of rotation: no unpinned work and no warm reaches them,
+   * but a turn pinned to one is served there. None when absent.
+   */
+  held?: () => readonly string[]
   /** The saved profile order (`profileOrder`), Claude ids included; ChatGPT failover follows it after the active seat. */
   order?: () => readonly string[] | undefined
   spent: (profileId: string) => SpentRecord | undefined
@@ -64,9 +97,35 @@ export interface ChatGptProfileSurfaceDeps {
   freeSeatOrder?: () => ChatGptFreeSeatOrder
 }
 
+/**
+ * A seat's token state as authLifecycle.ts reads a credential. Only a seat
+ * with no usable sign-in at all counts as logged out: an expired or refused
+ * access token is the owner's next refresh to make, not yet a lost login.
+ */
+function seatLoginPresence(tokenState: ChatGptTokenState): "present" | "absent" | "unknown" {
+  if (tokenState === "ok") return "present"
+  if (tokenState === "no_token" || tokenState === "requires_reauth") return "absent"
+  return "unknown"
+}
+
+/**
+ * When the seat signed in. A login Meridian recorded - performed here, or
+ * noticed after a logout - wins. Otherwise it is the OpenAI sign-in the seat's
+ * access token states: refreshing keeps it, and it can predate the seat's own
+ * authorization when that reused a browser already signed in.
+ */
+function seatSignIn(
+  lifecycle: AuthLifecycleRecord | undefined,
+  profile: ChatGptProfile,
+): { at: number | null; via: "login" | "observed" | "token" | null } {
+  if (lifecycle?.authObtainedAt) return { at: lifecycle.authObtainedAt, via: lifecycle.authObtainedVia ?? null }
+  if (profile.signedInAt !== null) return { at: profile.signedInAt, via: "token" }
+  return { at: null, via: null }
+}
+
 export type ChatGptActivation =
   | { ok: true; profile: ChatGptProfile }
-  | { ok: false; status: 400 | 409; error: string }
+  | { ok: false; status: 400 | 409; error: string; code?: "needs_login" | "held" }
 
 export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
   const planTypes = (): Map<string, string | null> => new Map(
@@ -80,6 +139,26 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
     aliases: deps.aliases?.(),
   })
 
+  const loginFor = (profile: ChatGptProfile) => {
+    const reading = deps.usage()?.entries.find(entry => entry.id === profile.seat)
+    const key = chatGptAuthLifecycleKey(profile.seat)
+    const prior = authLifecycleFor(key)
+    const failureAt = reading?.failure?.lastFailureAt
+    let error = reading?.error
+    if (error === "unauthorized" && failureAt) {
+      if (Math.max(prior?.authObtainedAt ?? 0, prior?.lastRefreshAt ?? 0, prior?.lastAcceptedAt ?? 0) > failureAt) error = null
+      else noteApiRejected(key, { startedAt: failureAt, at: failureAt })
+    }
+    if (reading?.fetchedAt && !reading.error && !reading.stale && !reading.failure) {
+      noteProviderAccepted(key, { startedAt: reading.fetchedAt })
+    }
+    const tokenState = chatGptTokenState(profile.unavailable, error)
+    const presence = seatLoginPresence(tokenState)
+    const lifecycle = noteCredentialObserved(key, { presence })
+    const state = profileLoginState({ loggedIn: tokenState === "ok" ? true : tokenState === "refused" ? false : undefined, presence, firstUnauthedAt: lifecycle?.firstUnauthedAt })
+    return { tokenState, lifecycle, state }
+  }
+
   /** Seats in the saved order, or undefined while the order names none of them. */
   const savedSeatOrder = (list: readonly ChatGptProfile[]): string[] | undefined => {
     const seats: string[] = []
@@ -90,14 +169,27 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
     return seats.length > 0 ? seats : undefined
   }
 
-  const excludedSeats = (list: readonly ChatGptProfile[]): Set<string> => {
+  const seatsNamed = (list: readonly ChatGptProfile[], ids: readonly string[]): Set<string> => {
     const seats = new Set<string>()
-    for (const id of deps.excluded?.() ?? []) {
+    for (const id of ids) {
       const profile = findChatGptProfile(list, id)
       if (profile) seats.add(profile.seat)
     }
     return seats
   }
+
+  /** Seats no work may be pinned to: logged out, or excluded from work. */
+  const refusedSeats = (list: readonly ChatGptProfile[]): Set<string> => {
+    const seats = seatsNamed(list, deps.excluded?.() ?? [])
+    for (const profile of list) if (loginFor(profile).state === "needs_login") seats.add(profile.seat)
+    return seats
+  }
+
+  const heldSeats = (list: readonly ChatGptProfile[]): Set<string> => seatsNamed(list, deps.held?.() ?? [])
+
+  /** Seats unpinned work never reaches: the refused ones and the held ones. */
+  const excludedSeats = (list: readonly ChatGptProfile[]): Set<string> =>
+    new Set([...refusedSeats(list), ...heldSeats(list)])
 
   /**
    * The pointer while it names a seat that may take work; otherwise the
@@ -144,6 +236,10 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
   return {
     profiles,
     resolve: (idOrSeat: string | null | undefined) => findChatGptProfile(profiles(), idOrSeat),
+    loginState(idOrSeat: string) {
+      const profile = findChatGptProfile(profiles(), idOrSeat)
+      return profile ? loginFor(profile).state : "unverified"
+    },
     activeProfileId: (): string | null => active(profiles())?.id ?? null,
 
     /** Validate a switch; the caller persists `profile.seat` and logs it. */
@@ -151,6 +247,12 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
       const list = profiles()
       const profile = findChatGptProfile(list, idOrSeat)
       if (!profile) return { ok: false, status: 400, error: `Unknown profile: ${idOrSeat}` }
+      if (loginFor(profile).state === "needs_login") {
+        return { ok: false, status: 409, code: "needs_login", error: `Profile "${profile.id}" needs a login before it can be activated` }
+      }
+      if (heldSeats(list).has(profile.seat)) {
+        return { ok: false, status: 409, code: "held", error: `Profile "${profile.id}" is held out of rotation` }
+      }
       if (excludedSeats(list).has(profile.seat)) {
         return { ok: false, status: 409, error: `Profile "${profile.id}" is excluded from work routing` }
       }
@@ -160,16 +262,26 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
     /**
      * Where one turn may go. `pin` is the request's own profile header and is
      * obeyed only when it names a ChatGPT seat - on an instance serving both
-     * providers it may name a Claude profile, which says nothing here. A warm
-     * may use an excluded seat, as a Claude warm may; work may not.
+     * providers it may name a Claude profile, which says nothing here. A pin
+     * naming neither is `unknown`: the client asked for one account, and the
+     * pool would serve it from another. A warm may use an excluded seat, as a
+     * Claude warm may; work may not. A held seat is the reverse: work pinned
+     * to it is served, a warm is refused.
      */
     route(pin: string | undefined, purpose: "work" | "warm") {
       const list = profiles()
       const excluded = excludedSeats(list)
       const pinned = findChatGptProfile(list, pin)
+      const named = pin?.trim()
+      if (!pinned && named && !deps.reserved().has(named)) {
+        return { kind: "unknown" as const, id: named }
+      }
       if (pinned) {
-        if (purpose === "work" && excluded.has(pinned.seat)) {
-          return { kind: "refuse" as const, profile: pinned }
+        if (purpose === "work" && refusedSeats(list).has(pinned.seat)) {
+          return { kind: "refuse" as const, profile: pinned, reason: "excluded" as const }
+        }
+        if (purpose === "warm" && heldSeats(list).has(pinned.seat)) {
+          return { kind: "refuse" as const, profile: pinned, reason: "held" as const }
         }
         return { kind: "pinned" as const, seat: pinned.seat }
       }
@@ -226,7 +338,8 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
       const usageById = new Map((usage?.entries ?? []).map(entry => [entry.id, entry]))
       return list.map(profile => {
         const reading = usageById.get(profile.seat)
-        const tokenState = chatGptTokenState(profile.unavailable, reading?.error)
+        const { tokenState, lifecycle, state } = loginFor(profile)
+        const signIn = seatSignIn(lifecycle, profile)
         const owner = chatGptOwner(deps.source.mode, profile.storeIndex)
         const ahead = profile.id === activeId ? paidAhead(list, profile) : []
         return {
@@ -255,7 +368,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           freeSeatDeferred: ahead.length > 0
             ? { servedFirstBy: ahead.map(other => other.id), freeSeatOrder }
             : null,
-          loggedIn: tokenState === "ok",
+          loggedIn: state === "authenticated",
           tokenState,
           unavailable: profile.unavailable,
           resets: chatGptResetsView(reading?.resetCredits),
@@ -266,6 +379,18 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           lastCheckedAt: reading?.failure?.lastFailureAt ?? reading?.fetchedAt ?? null,
           lastSuccessAt: reading?.fetchedAt ?? null,
           authProvenance: "live" as const,
+          // The fields a Claude profile reports about its login. A seat's
+          // provider states no login deadline, so those three stay empty.
+          refreshTokenExpiresAt: null,
+          daysUntilRenewal: null,
+          renewalRequiredSoon: false,
+          accessTokenExpiresAt: profile.accessTokenExpiresAt,
+          renewalRetryAt: profile.renewalRetryAt,
+          authObtainedAt: signIn.at,
+          authObtainedVia: signIn.via,
+          lastRefreshAt: lifecycle?.lastRefreshAt ?? null,
+          firstUnauthedAt: lifecycle?.firstUnauthedAt ?? null,
+          unauthedReason: lifecycle?.unauthedReason ?? null,
           credentialDir: null,
         }
       })

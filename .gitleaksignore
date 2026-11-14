@@ -1,0 +1,79 @@
+# gitleaks false positives, all in upstream's own test files.
+#
+# Each entry is file:rule:line for a `generic-api-key` hit on a TEST FIXTURE,
+# not a credential: openai-responses/proxy-responses-endpoint use 36-char
+# session cache keys, priority-session-store uses "conversation-*" route keys.
+# The rule matches on entropy and variable naming, not on a real secret.
+#
+# All three files are byte-identical to rynfar/meridian upstream/main, so this
+# content is already public. Verified at the 1.75.0 merge.
+#
+# Fingerprints carry line numbers on purpose: if upstream edits these files the
+# entries stop matching and the scan blocks again, forcing a fresh look.
+src/__tests__/openai-responses.test.ts:generic-api-key:629
+src/__tests__/openai-responses.test.ts:generic-api-key:636
+src/__tests__/openai-responses.test.ts:generic-api-key:644
+src/__tests__/proxy-responses-endpoint.test.ts:generic-api-key:253
+src/__tests__/priority-session-store.test.ts:generic-api-key:101
+src/__tests__/priority-session-store.test.ts:generic-api-key:440
+src/__tests__/priority-session-store.test.ts:generic-api-key:459
+src/__tests__/priority-session-store.test.ts:generic-api-key:479
+src/__tests__/priority-session-store.test.ts:generic-api-key:530
+src/__tests__/priority-session-store.test.ts:generic-api-key:538
+src/__tests__/priority-session-store.test.ts:generic-api-key:549
+src/__tests__/priority-session-store.test.ts:generic-api-key:867
+
+# Same story under the DreamHost custom ruleset: an upstream test sets
+# process.env.OPENAI_API_KEY to a literal beginning "fixture-". File is
+# byte-identical to upstream/main.
+src/__tests__/antigravity-gaps.test.ts:dreamhost-service-credentials:297
+
+# Upstream's #1249 live driver hands Claude Code a letters-only placeholder
+# ANTHROPIC_API_KEY to talk to a local Meridian, which ignores it. File is
+# byte-identical to upstream/main; verified at the f299fe06 merge.
+scripts/e2e-thinking-display-interactive-driver.py:dreamhost-service-credentials:22
+
+# The same placeholder pattern from upstream's Haiku 5.5 (#1337) and Nix
+# runtime-dependency (#1357) harnesses and the copies escrowed with their evidence:
+# each asserts or passes one hyphenated-words placeholder ANTHROPIC_API_KEY
+# for a local Meridian, which ignores it. All eight hits are that one value,
+# and every file is byte-identical to upstream/main; verified at the 8d447ea3
+# merge.
+scripts/e2e-haiku55-native-compat.mjs:dreamhost-service-credentials:70
+scripts/e2e-haiku55-nix-compat.mjs:dreamhost-service-credentials:107
+docs/maintenance/evidence/1342-nix-runtime-20261012/runtime-harness.mjs:dreamhost-service-credentials:107
+docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-11defd43ce328ba318cf52a3377b225725b845c7a1e26909607f0c5a87b20276.mjs:dreamhost-service-credentials:99
+docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-17c45cc7a365b176f49c31ae353722de07e55e19019c282402ec7e8e3e7d95f3.mjs:dreamhost-service-credentials:92
+docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-250b62094991939221a6957bd777505cc27ea30debd92b7170321354b3326960.mjs:dreamhost-service-credentials:99
+docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-73bd0dedd306b27ea588c4549182809ea628683aaca6dfeb6ac4f6bb8663d330.mjs:dreamhost-service-credentials:92
+docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-f67367a69d896f5d9ba8c12598672e336de6e50541c1094708691e7e2295d87e.mjs:dreamhost-service-credentials:92
+
+# generic-api-key on upstream's own drain prose (#1224, 09ae9316): the line
+# listing which control operations a drain leaves usable is documentation
+# text, byte-identical to upstream/main; verified at the 74ee9675 merge.
+docs/configuration.md:generic-api-key:782
+
+# Upstream 075e9e47 evidence scripts, e2e harnesses and bookkeeping code, byte-identical
+# to upstream/main: synthetic env tokens, empty or flag values, session mapping
+# keys, an SSH signing-key fingerprint and prose. Verified at the 075e9e47 merge.
+docs/maintenance/evidence/backlog-20261018/1396-live/baseline/analysis.json:generic-api-key:100
+docs/maintenance/evidence/backlog-20261018/1396-live/baseline/analysis.json:generic-api-key:127
+docs/maintenance/evidence/backlog-20261018/1396-live/candidate/analysis.json:generic-api-key:140
+docs/maintenance/evidence/backlog-20261018/1396-live/candidate/analysis.json:generic-api-key:167
+docs/maintenance/evidence/backlog-20261018/1396-live/candidate-owned-locators.json:generic-api-key:11
+docs/maintenance/evidence/backlog-20261018/1396-live/candidate-owned-locators.json:generic-api-key:5
+docs/maintenance/evidence/backlog-20261018/1396-live/native-fable-probe-attempt1.mjs:dreamhost-service-credentials:136
+docs/maintenance/evidence/backlog-20261018/1396-live/native-fable-probe.mjs:dreamhost-service-credentials:142
+docs/maintenance/evidence/backlog-20261018/1400-correction/signature-local.log:generic-api-key:1
+docs/maintenance/evidence/backlog-20261018/1410-live-heap/e42-preparation/extended-stable-flow.mjs:generic-api-key:31
+docs/maintenance/evidence/backlog-20261018/passthrough.md:generic-api-key:15
+docs/maintenance/evidence/backlog-20261018/passthrough.md:generic-api-key:3
+docs/maintenance/evidence/backlog-20261019/1399/native-client-preflight.mjs:dreamhost-service-credentials:45
+docs/maintenance/evidence/backlog-20261019/1399/native-refusal-control.mjs:dreamhost-service-credentials:30
+docs/maintenance/evidence/backlog-20261019/1399/run-native-load.mjs:dreamhost-service-credentials:80
+docs/maintenance/evidence/backlog-20261019/1406/resumed-session-probe.mjs:dreamhost-service-credentials:92
+scripts/e2e-opencode-one-shot-beta.mjs:dreamhost-service-credentials:151
+scripts/e2e-opencode-one-shot-stable.mjs:dreamhost-service-credentials:151
+scripts/e2e-passthrough-tool-isolation.mjs:dreamhost-service-credentials:86
+scripts/e2e-profile-history-client.mjs:dreamhost-service-credentials:168
+src/proxy/session/bookkeeping/mappings.ts:generic-api-key:137

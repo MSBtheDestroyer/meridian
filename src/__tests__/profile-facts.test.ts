@@ -186,6 +186,19 @@ describe("a ChatGPT seat's card", () => {
     expect(profileAccessHelp({ id: "work" })).toMatchObject({ pill: "needs login", summary: "Cannot serve requests — run: meridian profile login work" })
   })
 
+  test("says when Meridian renews a seat whose access token was refused, instead of asking for a sign-in", () => {
+    const owned = { name: "meridian", webSignIn: true }
+    const now = Date.now()
+    const renewing = seat({ loggedIn: false, tokenState: "refused", owner: owned, renewalRetryAt: now + 5 * 60_000 + 30_000 })
+    expect(valueOf(renewing, "Next renewal")).toBe("in 5m")
+    expect(valueOf(seat({ loggedIn: false, tokenState: "refused", owner: owned, renewalRetryAt: now - 1000 }), "Next renewal")).toBe("now")
+    expect(labels(seat({ loggedIn: false, tokenState: "refused", owner: owned }))).not.toContain("Next renewal")
+    const help = profileAccessHelp(renewing)
+    expect(help.pill).toBe("renewing")
+    expect(help.reason).toContain("Meridian renews it on its own")
+    expect(profileAccessHelp(seat({ loggedIn: false, tokenState: "refused", owner: owned })).pill).toBe("needs login")
+  })
+
   test("states purchased Codex credits where a Claude card states extra usage, and nothing without them", () => {
     const credits = (extra: Record<string, unknown>) => ({ hasCredits: false, unlimited: false, overageLimitReached: false, balance: null, ...extra })
     expect(codexCreditsView(credits({ hasCredits: true, balance: 1234.5 })))
@@ -217,7 +230,9 @@ describe("a ChatGPT seat's card", () => {
     const trace = { ...burning, mix: [{ model: "gpt-6.1-sol", share: 0.9999 }, { model: "gpt-6-luna", share: 0.0001 }] }
     expect(codexCreditsView(credits, { servingOnCredits: true, creditsBurn: trace })?.pace?.title).toContain("100% gpt-6.1-sol / <1% gpt-6-luna")
     expect(codexCreditsView(credits, { creditsPolicy: "reserve", creditsBurn: burning })?.pace?.text)
-      .toBe("starts after every seat\u2019s plan limits; would last ~1h34m at current pace")
+      .toBe("after all seats\u2019 plan limits; lasts ~1h34m at current pace")
+    expect(codexCreditsView(credits, { creditsPolicy: "immediately", creditsBurn: burning })?.pace?.text)
+      .toBe("after plan limits; lasts ~1h34m at current pace")
     expect(codexCreditsView(credits, { creditsPolicy: "never", creditsBurn: burning })?.pace?.text)
       .toBe("not spent (policy never); would last ~1h34m at current pace")
     expect(codexCreditsView(credits, { servingOnCredits: true, creditsBurn: { ...burning, approximate: ["promo"] } })?.pace?.text)
@@ -235,6 +250,44 @@ describe("a ChatGPT seat's card", () => {
     expect(chatGptUsageGap(null)).toBe("")
     expect(refusalSubject(seat())).toEqual({ vendor: "ChatGPT", noun: "seat" })
     expect(refusalSubject({ id: "work" })).toEqual({ vendor: "Anthropic", noun: "account" })
+  })
+})
+
+describe("the login's lifetime", () => {
+  const HOUR = 3_600_000
+  const DAY = 24 * HOUR
+
+  function fact(p: Record<string, unknown>, label: string): (Fact & { title?: string }) | undefined {
+    return profileFacts(p).find(f => f.label === label)
+  }
+
+  test("sits directly under Status", () => {
+    const now = Date.now()
+    expect(labels({ email: "a@b.c", refreshTokenExpiresAt: now + 5 * DAY, authObtainedAt: now - 25 * DAY }))
+      .toEqual(["Status", "Refresh deadline", "Logged in", "Email"])
+  })
+
+  test("counts down to the deadline, warning inside the window", () => {
+    const now = Date.now()
+    const calm = fact({ refreshTokenExpiresAt: now + 22 * DAY + 4 * HOUR + 30_000, renewalRequiredSoon: false }, "Refresh deadline")!
+    expect(calm.value).toBe("in 22d 4h")
+    expect(calm.tone).toBe("")
+    expect(fact({ refreshTokenExpiresAt: now + 2 * HOUR + 60_000, renewalRequiredSoon: true }, "Refresh deadline")!.tone).toBe("warn")
+  })
+
+  test("a recorded logout replaces the countdown", () => {
+    const now = Date.now()
+    const p = { firstUnauthedAt: now - 5 * HOUR, unauthedReason: "refresh_rejected", refreshTokenExpiresAt: now + DAY, accessTokenExpiresAt: now + HOUR }
+    expect(labels(p)).toEqual(["Status", "Logged out"])
+    expect(fact(p, "Logged out")!.value).toBe("5h 0m ago")
+    expect(fact(p, "Logged out")!.title).toContain("refused to renew")
+  })
+
+  test("says when a login was only noticed rather than performed here", () => {
+    const now = Date.now()
+    expect(fact({ authObtainedAt: now - 6 * DAY, authObtainedVia: "observed" }, "Logged in")!.title).toContain("when Meridian found it")
+    expect(fact({ authObtainedAt: now - 6 * DAY, authObtainedVia: "login" }, "Logged in")!.value).toBe("6d 0h ago")
+    expect(fact({ authObtainedAt: now - 114 * DAY, authObtainedVia: "token" }, "Logged in")!.title).toContain("its access token states")
   })
 })
 
@@ -273,10 +326,11 @@ describe("qualified current credential expiry facts", () => {
     expect(facts[2]!.title).toContain("may be estimated")
   })
 
+  // Recorded logouts and logins (auth-lifecycle.json) are this fork's own
+  // facts, tested under "the login's lifetime"; none is recorded here.
   test("a passed refresh deadline retains future access expiry and never invents logout or login age", () => {
     const facts = currentFacts({ loggedIn: true, refreshTokenExpiresAt: now - hour,
-      accessTokenExpiresAt: now + 3 * hour, firstUnauthedAt: now - hour,
-      unauthedReason: "refresh_rejected", authObtainedAt: now - day })
+      accessTokenExpiresAt: now + 3 * hour })
     expect(facts[0]!.value).toBe("✓ Authenticated")
     expect(facts[1]!.value).toBe("passed — login may need renewal")
     expect(facts[1]!.tone).toBe("warn")

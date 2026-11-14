@@ -111,6 +111,7 @@ function readInstance(paths: InstancePaths): InstanceState {
       const entry = profile as Record<string, unknown>
       return typeof entry.id === "string" ? [{ id: entry.id, aliases: entry.aliases }] : []
     }),
+    authLifecycles: readObject(join(paths.configDir, "auth-lifecycle.json")),
     pricing: readObject(join(paths.configDir, "model-pricing.json")),
   }
 }
@@ -219,6 +220,7 @@ function retireSource(from: InstancePaths, stamp: string): Array<{ from: string;
   for (const path of [
     from.storePath,
     join(from.configDir, "settings.json"),
+    join(from.configDir, "auth-lifecycle.json"),
     join(from.configDir, "model-pricing.json"),
   ]) {
     if (existsSync(path)) rename(path, aside(path), moved)
@@ -279,6 +281,7 @@ function printPlan(log: (line: string) => void, input: {
   const settingKeys = Object.keys(plan.settings)
   log("")
   log(`Settings      ${settingKeys.length > 0 ? settingKeys.join(", ") : "nothing to change"}`)
+  log(`Login records ${Object.keys(plan.authLifecycles).length} to add`)
   log(`Prices        ${Object.keys(plan.pricing).length} override(s) to add`)
   log(`Telemetry     ${snapshot.rows.length - input.requestsHeld} requests to copy (${input.requestsHeld} already there), ${snapshot.logs.length - input.logsHeld} log entries to copy (${input.logsHeld} already there)`)
   if (input.missingColumns.length > 0) log(`              the destination's database gains the columns ${input.missingColumns.join(", ")}`)
@@ -383,11 +386,12 @@ async function run(options: InstanceImportOptions): Promise<InstanceImportResult
       if (telemetryProblems.length > 0) {
         log(`Copied ${copied.requests} request(s) and ${copied.logs} log entr${copied.logs === 1 ? "y" : "ies"}, then verification FAILED:`)
         for (const problem of telemetryProblems) log(`  - ${problem}`)
-        log("No seat or setting was copied, and the source was left in place. Running the command again continues the import.")
+        log("No seat, setting or login record was copied, and the source was left in place. Running the command again continues the import.")
         return { exitCode: 1, plan: planned, copied: { seats: 0, ...copied } }
       }
 
       mergeIntoFile(join(to.configDir, "settings.json"), planned.settings)
+      mergeIntoFile(join(to.configDir, "auth-lifecycle.json"), planned.authLifecycles)
       mergeIntoFile(join(to.configDir, "model-pricing.json"), planned.pricing)
       const store = createChatGptCredentialStore({ path: to.storePath, lease: destinationLease })
       const accounts = new Map(source.accounts.map(account => [account.accountUserId, account]))
@@ -407,6 +411,7 @@ async function run(options: InstanceImportOptions): Promise<InstanceImportResult
         ...again.conflicts,
         ...again.seats.filter(seat => seat.action !== "present").map(seat => `${seat.label} is not in the destination's store`),
         ...Object.keys(again.settings).map(key => `the destination's ${key} setting does not hold what was imported`),
+        ...Object.keys(again.authLifecycles).map(key => `the destination has no login record ${key}`),
         ...Object.keys(again.pricing).map(model => `the destination has no price override for ${model}`),
         ...(telemetryMark(from.telemetryPath) === snapshotMark(snapshot) ? [] : ["the source's telemetry changed during the import, so something still writes it"]),
       ]

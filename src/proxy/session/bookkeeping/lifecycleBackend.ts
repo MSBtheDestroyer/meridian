@@ -1,4 +1,5 @@
 import type * as Lifecycle from "../../sessionLifecycle"
+import type { TranscriptLocator } from "./types"
 import { assertBookkeepingIdentityChangeAllowed, assertLegacyStoreAccessAllowed } from "./storeIdentity"
 
 /** Preserve ledger signatures, including generic publication callbacks. Type-only facade dependency. */
@@ -12,8 +13,12 @@ export interface SessionLifecycleBackend {
   ensureTranscriptJournaled: typeof Lifecycle.ensureTranscriptJournaled
   registerLiveTranscript: typeof Lifecycle.registerLiveTranscript
   commitFork: typeof Lifecycle.commitFork
-  publishPinnedTranscript: typeof Lifecycle.publishPinnedTranscript
-  attachPinnedTranscript: typeof Lifecycle.attachPinnedTranscript
+  publishPinnedTranscript: <T extends boolean | string>(
+    locator: TranscriptLocator, publish: () => T, options?: Lifecycle.SessionLifecycleOptions,
+  ) => Promise<T>
+  attachPinnedTranscript: <T extends boolean | string>(
+    locator: TranscriptLocator, publish: () => T, options?: Lifecycle.SessionLifecycleOptions,
+  ) => Promise<T>
   abandonFork: typeof Lifecycle.abandonFork
   reconcile: typeof Lifecycle.reconcile
   runGc: typeof Lifecycle.runGc

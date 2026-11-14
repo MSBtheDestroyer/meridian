@@ -16,14 +16,18 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_API_KEY` | — | unset | Shared secret for API key authentication. When set, all API and admin routes require a matching `x-api-key` or `Authorization: Bearer` header. `/` and `/health` remain open. |
 | `MERIDIAN_PORT` | `CLAUDE_PROXY_PORT` | `3456` | Port to listen on |
 | `MERIDIAN_HOST` | `CLAUDE_PROXY_HOST` | `127.0.0.1` | Host to bind to |
+| `MERIDIAN_PUBLIC_URL` | `CLAUDE_PROXY_PUBLIC_URL` | unset | The address people reach this instance at, e.g. `https://meridian.example`. Public OAuth callback URLs are built on it. Wins over `publicUrl` saved at `/settings`; with neither, the address a sign-in was started from is used. See [Event hooks](#event-hooks) |
+| `MERIDIAN_HOOK_COMMAND` | `CLAUDE_PROXY_HOOK_COMMAND` | unset | One more [event hook](#event-hooks) command, receiving every event, beside those saved at `/settings` |
+| `MERIDIAN_HOOK_URL` | `CLAUDE_PROXY_HOOK_URL` | unset | One more [event hook](#event-hooks) webhook, receiving every event, beside those saved at `/settings` |
 | `MERIDIAN_PASSTHROUGH` | `CLAUDE_PROXY_PASSTHROUGH` | unset | Forward tool calls to client instead of executing |
 | `MERIDIAN_MAX_CONCURRENT` | `CLAUDE_PROXY_MAX_CONCURRENT` | `10` | Maximum SDK queries running concurrently within one Meridian process. The budget is shared by every proxy instance in the process, and is re-read whenever an instance starts — so raising or lowering it takes effect for a later instance without a restart. Embedders that need a distinct budget can pass `maxConcurrent` in `ProxyConfig`, which opts that instance out of the shared pool. |
 | `MERIDIAN_MAX_SESSIONS` | `CLAUDE_PROXY_MAX_SESSIONS` | `1000` | In-memory LRU session cache size |
-| `MERIDIAN_MAX_STORED_SESSIONS` | `CLAUDE_PROXY_MAX_STORED_SESSIONS` | `10000` | File-based session store capacity |
+| `MERIDIAN_MAX_STORED_SESSIONS` | `CLAUDE_PROXY_MAX_STORED_SESSIONS` | `10000` | Session store capacity, in stored session mappings |
 | `MERIDIAN_WORKDIR` | `CLAUDE_PROXY_WORKDIR` | `cwd()` | Default working directory for SDK |
 | `MERIDIAN_IDLE_TIMEOUT_SECONDS` | `CLAUDE_PROXY_IDLE_TIMEOUT_SECONDS` | `120` | HTTP keep-alive timeout |
 | `MERIDIAN_IDLE_EXIT_SECONDS` | `CLAUDE_PROXY_IDLE_EXIT_SECONDS` | unset | Exit through graceful shutdown after this many seconds without a model request; intended for socket activation. `/health` polls do not reset the timer. |
 | `MERIDIAN_SHUTDOWN_GRACE_MS` | `CLAUDE_PROXY_SHUTDOWN_GRACE_MS` | `30000` | Milliseconds `close()` waits for in-flight `/v1/messages` requests to finish after it stops admitting new ones, before closing the port. See [Graceful shutdown](#graceful-shutdown). |
+| `MERIDIAN_SHUTDOWN_CLEANUP_DEADLINE_MS` | `CLAUDE_PROXY_SHUTDOWN_CLEANUP_DEADLINE_MS` | `10000` | Milliseconds `close()` waits, after the HTTP drain, for its cleanup (session GC sweep, backend close, ChatGPT release) before it fails and the CLI exits 1. Cleanup still running after 2 s is logged as `Shutdown cleanup still running after 2000ms (...)` with each step's time, and a missed deadline names the step that held it. |
 | `MERIDIAN_SESSION_TURN_MAX_HOLD_MS` | `CLAUDE_PROXY_SESSION_TURN_MAX_HOLD_MS` | `600000` | Hard ceiling on how long one turn may hold its session's serialization lease. On timeout the lease is force-released with a warning and queued turns for that session proceed concurrently. See [Concurrent requests to the same session](#concurrent-requests-to-the-same-session). |
 | `MERIDIAN_TELEMETRY_SIZE` | `CLAUDE_PROXY_TELEMETRY_SIZE` | `1000` | Telemetry ring buffer size, in rows. Pool routing writes one row **per account attempted**, so a request that failed over twice spends three. `/telemetry` reports what is actually held. |
 | `MERIDIAN_DIAGNOSTIC_LOG_SIZE` | `CLAUDE_PROXY_DIAGNOSTIC_LOG_SIZE` | `500` | Diagnostic log ring buffer size (the Logs tab and `GET /telemetry/logs`) |
@@ -42,6 +46,8 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_PASSTHROUGH_MAX_TURNS` | `CLAUDE_PROXY_PASSTHROUGH_MAX_TURNS` | *(unset — capped at 1)* | Pin the passthrough SDK turn budget. An explicit positive value wins over the one-turn cap. With early stop enabled, a budget above one still stops after a batch forwarded to the client (see [digest-turn elimination](#how-tool-calling-works-in-passthrough)), so the pin adds headroom before the tool boundary; structured-output requests retain the normal SDK completion loop. Unset it unless you still need it. |
 | `MERIDIAN_PASSTHROUGH_UNCAPTURED_TOOL_RECOVERY` | — | *(unset — confirmed CLI rejection only)* | In streaming passthrough, complete tool calls can be returned as `tool_use` when every call has a CLI dispatch rejection matching its ID and tool name: `No such tool available`, or `InputValidationError: … could not be parsed as JSON`. Input must still form a complete JSON object after the supported control-character/invalid-escape repair; schema validation failures do not count. Explicit rejection can also qualify an undeclared tool name for the client's own invalid-tool response. The rejected SDK session is evicted so the next client result replays against a fresh one. Set to `1` to **also** allow experimental uncaptured abort-window recovery without explicit rejection (no live positive gate yet); every call must then name a declared tool. Set to `0` to disable both recoveries. Non-streaming responses are unaffected. Confirmed-rejection recovery applies at any turn budget, including deferred tools; abort-window recovery requires `maxTurns=1`. Both require a complete open envelope and no cancellation. When neither applies, the `sdk_termination` error log names the blocking condition as `uncaptured_veto=…`. |
 | `MERIDIAN_SESSION_GC_LOCK_WAIT_MS` | `CLAUDE_PROXY_SESSION_GC_LOCK_WAIT_MS` | `2000` | External lifecycle-lock acquisition budget, starting only at the head of the local FIFO; minimum 100 ms. Local queue waiting does not consume this budget and is not bounded by two seconds. Each lock allows 256 waiting callers; a holder stalled for 60 seconds rejects queued/new callers without unlocking its transaction, unless the deadline itself ran late because the event loop was blocked. An answered turn whose terminal publication meets any of these errors is still delivered; its next turn replays history. Request cancellation removes queued work or cancels acquisition, never an executing durable transaction; cleanup remains uncanceled. External timeout, queue capacity and stalled-holder failures answer **503 `overloaded_error`** with distinct reasons. |
+| `MERIDIAN_SESSION_GC_MAX_PENDING` | `CLAUDE_PROXY_SESSION_GC_MAX_PENDING` | `2048` | Transcripts that may wait for deletion at once (prepared, retired or being deleted). A superseded transcript waits its grace period in this budget, so it caps deletion throughput at this many per grace period; superseded transcripts beyond it stay live. When it is full and superseded transcripts are waiting, the log says `session GC backlog saturated` (at most every 10 minutes) and healthy `/health` reports `sessionGc.saturated: true`. |
+| `MERIDIAN_SESSION_GC_MAX_DELETES` | `CLAUDE_PROXY_SESSION_GC_MAX_DELETES` | `64` | Deletions one GC run claims, in batches of 8 that run side by side. While transcripts are still due for deletion and runs make progress, the next run follows at once, for up to 5 minutes per sweep. |
 | `MERIDIAN_SESSION_PROFILE_COPY_PRUNE` | `CLAUDE_PROXY_SESSION_PROFILE_COPY_PRUNE` | `0` | Opt in to removing stale cross-profile session mappings during GC. Off preserves native resume history. Returning to a pruned profile uses flattened, context-trimmed replay, which cannot restore SDK thinking. |
 | `MERIDIAN_SESSION_PROFILE_COPY_GRACE_MS` | `CLAUDE_PROXY_SESSION_PROFILE_COPY_GRACE_MS` | `86400000` (24 hours) | With several profiles, the same conversation gets its own stored session under each profile it has run on. When profile-copy pruning is enabled, on every session GC sweep a copy is removed once a newer copy of that conversation exists under another profile and the older copy has not been used for this many milliseconds. The newest copy, copies of a conversation with a request in flight, and mappings a priority route depends on are always kept. A conversation that returns to a profile while its copy exists resumes that profile's own session, unless another profile's copy holds more of the history the client sends (the conversation took turns there since), in which case it is replayed as below; after removal it is replayed into a fresh session on that account, as flattened history trimmed to the model's context window. The default covers an account's 5-hour usage window resetting and a day of switching back and forth. `0` keeps only the newest copy. Removal is paced to leave at least half of `MERIDIAN_SESSION_GC_MAX_PENDING` free for new requests, so a large store is trimmed over several sweeps. |
 | `MERIDIAN_SILENT_TURN_RECOVERY` | `CLAUDE_PROXY_SILENT_TURN_RECOVERY` | `1` | Set to `0` to stop spending a recovery turn on a [silent turn](#silent-turns). Detection and telemetry stay on either way |
@@ -64,11 +70,12 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_TELEMETRY_DB` | `CLAUDE_PROXY_TELEMETRY_DB` | `~/.config/meridian/telemetry.db` | SQLite database path (when persistence is enabled) |
 | `MERIDIAN_TELEMETRY_RETENTION_DAYS` | `CLAUDE_PROXY_TELEMETRY_RETENTION_DAYS` | `7` | Days to retain telemetry data before cleanup |
 | `MERIDIAN_TRANSCRIPT_RETENTION_DAYS` | `CLAUDE_PROXY_TRANSCRIPT_RETENTION_DAYS` | unset (off) | **Opt-in.** `1`-`3650` turns on Claude Code's own cleanup in request processes, which deletes **all** of its files older than that many days in each profile's config directory, not only transcripts. `0` pins it off over a saved setting; any other value is ignored. Wins over `transcriptRetentionDays` in `settings.json` (or the `/settings` page). See [Transcript retention](#transcript-retention). |
+| `MERIDIAN_TRANSCRIPT_SWEEP_INTERVAL_MS` | `CLAUDE_PROXY_TRANSCRIPT_SWEEP_INTERVAL_MS` | `10800000` (3 hours) | How often Meridian sweeps the transcripts of idle profiles; `0` leaves the sweep to requests alone. See [Transcript retention](#transcript-retention). |
 | `MERIDIAN_DEFAULT_PROFILE` | — | *(first profile)* | Default profile ID when no header is sent |
 | `MERIDIAN_ADAPTER_INSTANCES` | — | unset | JSON [adapter instance](agents.md#adapter-instances) definitions, overriding `~/.config/meridian/adapter-instances.json` |
 | `MERIDIAN_BETA_POLICY` | — | `allow-safe` | Client `anthropic-beta` header handling: `allow-safe`, `strip-all`, or `allow-all` |
 | `MERIDIAN_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` | — | canonical ids | Pin the model id the SDK resolves for each tier alias (e.g. `MERIDIAN_DEFAULT_OPUS_MODEL`); Haiku defaults to `claude-haiku-5-5` |
-| `MERIDIAN_SESSION_DIR` | `CLAUDE_PROXY_SESSION_DIR` | `~/.cache/meridian` | Directory for the persisted session store |
+| `MERIDIAN_SESSION_DIR` | `CLAUDE_PROXY_SESSION_DIR` | `~/.cache/meridian` | Directory for the persisted session store and the transcript lifecycle journal, both in the SQLite database `sessions.db`. On the first start after an upgrade, the `sessions.json` and `session-gc.json` an earlier version left are imported once and kept as `<name>.migrated-<timestamp>`; nothing is deleted. Upgrade every Meridian sharing the directory together: one still on the JSON files writes them again, and the newer one merges them without removing anything it holds. |
 | `MERIDIAN_NO_UPDATE_CHECK` | — | unset | Set to `1` to force the update check off even when the `checkForUpdates` setting is on. No outbound request is made at all when set. See [Build provenance](#build-provenance-and-staying-current). |
 | `MERIDIAN_UPDATE_CHECK_URL` | — | npm dist-tags | Registry endpoint for the update check. Point it at a mirror on restricted networks; it must return `{"latest":"<version>"}`. |
 | `MERIDIAN_UPDATE_CHECK_PATH` | — | `~/.cache/meridian/update-check.json` | Where the update check caches its result. |
@@ -82,7 +89,7 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_ENFORCE_MAX_TOKENS` | `CLAUDE_PROXY_ENFORCE_MAX_TOKENS` | unset | Set to `1` to apply the client output budget; see [output limits](#known-limitations). |
 | `MERIDIAN_HOST_ID` | — | derived | Stable, unique container identity for session locks; see [deployment](deployment.md#persistence-and-host-identity). |
 | `MERIDIAN_QUIET` | `CLAUDE_PROXY_QUIET` | unset | Suppress informational telemetry startup output; warnings and errors still print. |
-| `MERIDIAN_AUTH_RENEWAL_WARN_DAYS` | — | `3` | Renewal warning horizon reported by health when credential renewal information is available. |
+| `MERIDIAN_AUTH_RENEWAL_WARN_DAYS` | — | `3` | Renewal warning horizon reported by `/health` and per profile by `/profiles/list` when credential renewal information is available. |
 | `MERIDIAN_PLUGIN_DIR` | — | `<config dir>/plugins` | Plugin auto-discovery directory |
 | `MERIDIAN_PLUGIN_CONFIG` | — | `<config dir>/plugins.json` | Plugin manifest path |
 | `MERIDIAN_CHATGPT_CREDENTIALS` | — | unset | Serve GPT models from ChatGPT subscriptions: `owned`, `follow-external` or `off`. Unset means `owned` when Meridian's own ChatGPT store holds seats, else off. See [ChatGPT subscriptions](#chatgpt-subscriptions). |
@@ -373,6 +380,8 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `GET /settings` | Routing, SDK feature toggles, model pricing, telemetry storage, update-check, site-header and page layout UI |
 | `GET/PUT /settings/api/updates` | Read or set `checkForUpdates` (JSON `{"checkForUpdates": true}`); takes effect on the running proxy. Also reports each loaded plugin's installed and latest version in `plugins`; turning it on also sends loaded plugins' npm package names to the registry |
 | `GET/PUT /settings/api/header` | Read or set `showHostname` (JSON `{"showHostname": true}`): name the machine beside the header's status; takes effect on the running proxy |
+| `GET/PUT /settings/api/hooks`, `POST /settings/api/hooks/test` | [Event hooks](#event-hooks) and the public URL (JSON); `test` sends a `hooks.test` event |
+| `GET /callback/<id>/<path>` | A loopback OAuth redirect, relayed from another machine (see [Event hooks](#event-hooks)). No API key; unknown ids are 404 |
 | `GET/PUT /settings/api/layout` | Read or set the web pages' `layout`: `contained` (default, a centered column) or `wide` (spans the window, more cards per row). JSON `{"layout": "wide"}`, `null` to unset; applies on the next page load |
 | `GET /plugins` | Plugin management page (`/plugins/list`, `POST /plugins/reload` for JSON/actions) |
 
@@ -780,7 +789,8 @@ HTTP requests before requesting a graceful shutdown:
   are not counted. The standalone
   `MERIDIAN_BACKEND=antigravity` server does not serve `/inflight`.
 - `chatgpt` appears only when the ChatGPT gateway is configured and counts
-  every turn it serves on `/v1/responses` and `/v1/messages`.
+  every turn it serves on `/v1/responses` and `/v1/messages`, seat warms
+  included.
 - Meridian's own background work (token refresh, usage polling, session
   cleanup) is never counted.
 - Only a loopback peer (`127.0.0.0/8`, `::1`) gets an answer, and not through a
@@ -811,7 +821,10 @@ background work can still prevent idle; a supervisor must give up or retry.
 - Held requests are not in `total`; `drain.held` counts them.
 - It holds Claude Messages and public OpenAI generation translations once,
   plus combined Antigravity generation submissions (`/v1/messages`,
-  `/messages`, `/v1/chat/completions`, `/v1/responses` under `/antigravity`).
+  `/messages`, `/v1/chat/completions`, `/v1/responses` under `/antigravity`)
+  and ChatGPT gateway turns (a GPT model on `/v1/messages`, `/messages` or
+  `/v1/responses`, and the Images API). A seat warm was admitted by the route
+  that made it and is not held again.
   Cancellation, token estimates, polling/retrieval/deletion and other control
   operations remain usable. Every admitted combined-provider POST retains its
   existing HTTP count. Background Responses
@@ -954,8 +967,8 @@ interactive Claude Code.
   a request's process starts, at most once a day per config directory
   (`.last-cleanup` there records the last run). A short request's process often
   ends before the cleanup gets going (in testing, a process that lived under
-  about 5 s never cleaned up), and a profile that serves no requests is never
-  cleaned: Meridian runs no cleanup process of its own.
+  about 5 s never cleaned up), so a profile that serves no requests is cleaned
+  only by the idle sweep below.
 - **The first cleanup can wait a day.** Claude Code stamps `.last-cleanup`
   even when retention is off and it skips the deletion, so after you turn
   retention on, a config directory that served a request in the previous
@@ -973,6 +986,28 @@ outside passthrough), Claude Code's user settings are enabled and it applies
 your own `cleanupPeriodDays`, or its default of 30 days, as it always has. A
 loaded project settings file or your organisation's managed settings that name
 a period are applied the same way.
+
+**Idle profiles.** With retention on, two minutes after startup and then every
+three hours, Meridian looks at every profile's config directory, one at a time.
+Where Claude Code has not cleaned up for a day and no request is running, it
+starts one Claude Code process just for the cleanup and stops it once
+`.last-cleanup` advances, or after ten minutes. That process gets no prompt,
+makes no model call, writes no transcript, and cannot reach the network: every
+connection it opens goes to a local proxy that refuses it. It starts only when
+an SDK slot is free and no request is waiting for one, and holds that slot
+until the cleanup finishes: about half a minute in testing, ten minutes at
+most. Change the interval with `MERIDIAN_TRANSCRIPT_SWEEP_INTERVAL_MS`; `0`
+turns idle sweeps off and leaves the cleanup to requests.
+
+**Logins are never touched by the idle sweep.** A Claude Code process whose
+stored login is about to expire refreshes it, so the idle sweep skips a
+directory whose login expires within 30 minutes, leaving it until Meridian's
+own refresher has rolled it over. The refusing proxy would stop a refresh from
+reaching Anthropic anyway. The stored login is compared before and after each
+sweep process; if it ever changed, Meridian logs `transcript sweep STOPPED` and
+runs no further idle sweeps until it restarts. An instance under
+`MERIDIAN_CREDENTIALS_READONLY` never runs idle sweeps; whichever instance owns
+the logins does.
 
 ## Session identity
 
@@ -1367,7 +1402,56 @@ Clients just set their `ANTHROPIC_API_KEY` to the shared secret — since most t
 ANTHROPIC_API_KEY=your-secret-key ANTHROPIC_BASE_URL=http://meridian-host:3456 opencode
 ```
 
+## Event hooks
+
+Meridian can tell other programs when something happens. Configure targets on `/settings` -> **Event Hooks** (saved as `hooks` in `settings.json`), or add one of each kind with `MERIDIAN_HOOK_URL` and `MERIDIAN_HOOK_COMMAND`. Targets are re-read for every event; no restart is needed.
+
+| Target | Delivery |
+| --- | --- |
+| Webhook | `POST <url>`, `Content-Type: application/json`, headers `X-Meridian-Event` and `X-Meridian-Delivery`. Any 2xx is success. Redirects are not followed. 5s limit |
+| Command | Run through the system shell with the event as JSON on **stdin**, never in argv; `MERIDIAN_HOOK_EVENT` and `MERIDIAN_HOOK_DELIVERY` are set. Exit 0 is success. 10s limit, then its process group is stopped |
+
+Each delivery is tried once. At most 16 run at once; past that an event is dropped for that target. The last 25 deliveries, with the command's first line of output (or the webhook's status), are shown on `/settings` and in `[hooks]` log lines, so a command must not print secrets. Logs name a webhook by host and a command by program name only.
+
+Every event is one JSON object:
+
+```json
+{
+  "version": 1,
+  "event": "oauth.callback.listening",
+  "id": "8b0c…",
+  "at": "2026-10-02T23:59:00.000Z",
+  "instance": { "host": "desktop", "pid": 1234, "port": 3459, "version": "1.77.1" },
+  "callback": {
+    "id": "Q3x…",
+    "provider": "chatgpt",
+    "redirect": { "host": "127.0.0.1", "port": 1455, "path": "/auth/callback", "url": "http://127.0.0.1:1455/auth/callback" },
+    "url": "https://meridian.example/callback/Q3x…",
+    "expiresAt": "2026-10-03T00:09:00.000Z",
+    "expiresAtMs": 1790985540000,
+    "localListener": true
+  }
+}
+```
+
+| Event | When | `callback` adds |
+| --- | --- | --- |
+| `oauth.callback.listening` | A sign-in waits for a loopback redirect. Sent again, with a later expiry, when another sign-in joins the same listener | `expiresAt`, `expiresAtMs`, `localListener` (whether Meridian holds the port on its own machine) |
+| `oauth.callback.closed` | No sign-in waits any more | `reason`: `completed`, `failed`, `cancelled`, `expired`, `replaced` or `shutdown` |
+| `hooks.test` | **Send test event** on `/settings` | none (`test: true`) |
+
+No event carries an authorization code, `state`, verifier, token or API key.
+
+### Signing in from another machine
+
+ChatGPT's sign-in only accepts the redirect `http://127.0.0.1:1455/auth/callback`, so it lands on whatever listens on port 1455 of the **browser's** machine. While a sign-in waits, Meridian also serves that listener at `<public URL>/callback/<id>/auth/callback`. A relay on the browser's machine that hears `oauth.callback.listening` can listen on `callback.redirect.host:port` there and forward each request (path and query) to `callback.url` + path, returning Meridian's response. Close it on `oauth.callback.closed` or at `expiresAt`. The sign-in start waits up to 3 seconds for hooks to answer, so the relay is up before the sign-in tab opens, and the sign-in panel shows each hook's answer.
+
+- `<id>` is 128 random bits, one per open listener, and exists only while a sign-in waits. Treat it as a short-lived secret.
+- The route needs no API key, because a browser redirect carries none. Unknown, closed or expired ids answer 404 and change nothing. Behind a valid id, the provider's `state` must still match a waiting sign-in, and the code is useless without the PKCE verifier, which never leaves the Meridian process.
+- `callback.url` is `null` when Meridian does not know its public address: set `MERIDIAN_PUBLIC_URL` or **Public URL** on `/settings`, or start the sign-in from the public address (a reverse proxy's `X-Forwarded-Proto`/`X-Forwarded-Host` are honoured; a loopback address is never announced).
 ## Session bookkeeping maintenance
+
+This fork keeps its session store and transcript lifecycle journal in `sessions.db` (see `MERIDIAN_SESSION_DIR`) and does not use upstream's opt-in SQLite bookkeeping: it refuses to start with `MERIDIAN_BOOKKEEPING=sqlite`, and `meridian-bookkeeping` has no data to migrate. The commands below describe upstream's JSON-to-SQLite bookkeeping.
 
 Node 22: `meridian-bookkeeping <command> --session-dir /absolute/private/session-directory [--json]`.
 The npm entry is `dist/session-bookkeeping.js`; this is not a proxy request endpoint.
@@ -1588,13 +1672,14 @@ meridian instance-import --from ~/.config/meridian-gpt --to ~/.config/meridian -
 |---|---|
 | ChatGPT seats | Every account in the source's store, with its credentials unchanged and in its order, written through the destination store's writer lease |
 | Seat names | `chatGptProfileNames`, `chatGptProfileAliases` and `chatGptActiveSeat` (unless the destination has an active seat of its own), so every seat keeps its profile name and former names |
-| ChatGPT features | `chatgpt` and `integrations` keys the destination does not set; a value both set differently is a conflict. Routing order entries that name a seat |
+| ChatGPT features | `chatgpt` and `integrations` keys the destination does not set; a value both set differently is a conflict. Routing order and exclusions that name a seat |
+| Login records | The seats' `auth-lifecycle.json` records |
 | Prices | `model-pricing.json` overrides the destination does not have |
 | Telemetry | Every request and diagnostic log entry, with all its columns, under the same profile ids, so each seat's requests and estimated value on `/` and `/telemetry` are what they were |
 
 Other settings (`layout`, `claudeExecutable`, ...) and Claude profiles stay with their instance; a source with Claude profiles is refused. The plan is computed the way the destination will name its seats: a name the destination already uses for a Claude profile, a former name, or another seat, and requests filed under such a name, are conflicts, and nothing is written. `--rename <old>=<new>` files a seat, or requests filed under `<old>`, under another name.
 
-With `--apply`, neither instance may be serving ChatGPT: stop the source, and the destination unless it has no ChatGPT seats yet (a destination still serving Claude may keep running). Telemetry is copied first, in short transactions beside the running destination, and read back column by column; then the settings; the seats last. Only after the whole destination has been checked again is the source retired: each file it read is renamed to `<name>.imported-<time>`, and nothing is deleted. A run that stops part-way leaves the source in place, and running the command again continues it without copying a request twice. Once it succeeds, restart the destination with `MERIDIAN_CHATGPT_CREDENTIALS=owned` (or unset).
+With `--apply`, neither instance may be serving ChatGPT: stop the source, and the destination unless it has no ChatGPT seats yet (a destination still serving Claude may keep running). Telemetry is copied first, in short transactions beside the running destination, and read back column by column; then the settings and login records; the seats last. Only after the whole destination has been checked again is the source retired: each file it read is renamed to `<name>.imported-<time>`, and nothing is deleted. A run that stops part-way leaves the source in place, and running the command again continues it without copying a request twice. Once it succeeds, restart the destination with `MERIDIAN_CHATGPT_CREDENTIALS=owned` (or unset).
 
 ## SDK Feature Toggles (Experimental)
 
@@ -1776,11 +1861,11 @@ Coverage: `E38` in [E2E.md](../E2E.md), with `MERIDIAN_DEBUG_FORCE_SILENT_TURN=1
   The reason is that the Agent SDK exposes no output cap at all: its options carry `maxBudgetUsd`, `maxThinkingTokens`, `maxTurns` and `taskBudget`, and nothing for output tokens. The only lever is the CLI's own cap, which counts thinking *plus* text — so applying a client's answer-sized budget to a whole agentic turn can leave no room for an answer. Measured: a 128-token cap could not complete a turn whose visible answer was ~15 tokens, and a 16-token cap produced no text at all.
 
   Set **`MERIDIAN_ENFORCE_MAX_TOKENS=1`** to honour it exactly. With it on, a capped turn stops generating and reports `stop_reason: "max_tokens"` (empty content included, which is what the wire defines when thinking spent the budget) instead of overrunning. A cap that lands mid tool call still fails the request rather than delivering a half-built call. Verified by the E49 gate in [`E2E.md`](../E2E.md): `max_tokens=16` goes from 3900 output tokens with `end_turn` to 64 with `max_tokens`.
-- **Container host identity needs pinning** — `hostId` is derived from the machine-id *and* the pid-namespace inode. Inside a container that inode changes on every `docker restart`, while the session store survives in the writable layer; a proxy killed while holding a store lock therefore returns with a different `hostId`, cannot retire its own stale lock, and every request fails with `timed out waiting for lock` until the container is recreated. Separately, containers from one image tag share a baked `/etc/machine-id`, so two hosts sharing a session directory can read each other's live locks as dead.
+- **Container host identity needs pinning** — `hostId` is derived from the machine-id *and* the pid-namespace inode. Inside a container that inode changes on every `docker restart`, while the session store survives in the writable layer; a proxy killed while holding a session turn or lifecycle lock therefore returns with a different `hostId`, cannot retire its own stale lock, and every request fails with `timed out waiting for lock` until the container is recreated. Separately, containers from one image tag share a baked `/etc/machine-id`, so two hosts sharing a session directory can read each other's live locks as dead.
 
   Set **`MERIDIAN_HOST_ID`** to something stable across restarts and unique per container — the container ID works — and both go away. Unset outside containers, where the derived value is genuinely stable and unique. The value is hashed, so a pinned hostname does not travel in a lock file.
 - **`MERIDIAN_QUIET=1` suppresses informational startup banners** — currently the `[telemetry] SQLite persistence enabled: ...` line. It does **not** change behaviour: persistence stays on, and warnings and errors still print. Intended for Meridian spawned by a wrapper or plugin, where stderr surfaces in the agent's UI and a per-session confirmation is noise. The `silent` config option cannot gate this line: the telemetry stores are created at module load, before any config exists.
-- **Boot identity is required to serve** — every session-store write takes a lock stamped with a process incarnation, which needs a host boot identity (`/etc/machine-id` or `/var/lib/dbus/machine-id` on Linux, the hardware UUID on macOS, the machine GUID on Windows). Without one, every request that touches a session fails with `500 cannot capture lock owner process incarnation`.
+- **Boot identity is required to serve** — the locks that serialize a session's turns and its transcript bookkeeping are stamped with a process incarnation, which needs a host boot identity (`/etc/machine-id` or `/var/lib/dbus/machine-id` on Linux, the hardware UUID on macOS, the machine GUID on Windows). Without one, every request that touches a session fails with `500 cannot capture lock owner process incarnation`.
 
   Meridian **refuses to start** in that state rather than binding a port it cannot serve from, and names the missing artefact. Distroless, scratch, chroot and gVisor images commonly lack `machine-id`: generate one (`dbus-uuidgen > /etc/machine-id`) or bind-mount the host's. `/health` also probes it and returns `503 unhealthy` with the cause, so Docker's `HEALTHCHECK` and orchestrators see the failure instead of routing traffic to a process serving nothing.
 

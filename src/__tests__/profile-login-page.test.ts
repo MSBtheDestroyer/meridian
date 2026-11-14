@@ -125,7 +125,7 @@ function renderCards(profiles: Array<Record<string, unknown>>, quota: Array<Reco
     loginPanelOpen: () => false, lastProfilesRequestedAt: null, updatePollTimer: null,
     afterRender: none, loginSlot: () => null, activeLogin: null, editingProfile: null, renameError: null,
     removingProfile: null, removeError: null, renderProviderChips: none, renderLoginChips: none, providersPresent: [],
-    chatGptOwnerInfo: null, renderAccessNote: none, renderLoginRows: none,
+    chatGptOwnerInfo: null, renderAccessNote: none, renderLoginRows: none, PROFILE_INPUT_ATTRS: "",
     ICON_PENCIL: "", ICON_CHECK: "", ICON_X: "", ICON_TRASH: "",
   })
   const cards = content.innerHTML.split(/<div class="profile-card(?=[ "])/).slice(1)
@@ -146,7 +146,7 @@ test("a profile that cannot serve gets the needs-login border and badge, as on /
     expect(cards[id]).toContain('class="profile-badge badge-needs-login"')
     expect(cards[id]).toContain(">needs login</span>")
   }
-  expect(cards.lapsed).toContain('title="Cannot serve requests. Log in again below."')
+  expect(cards.lapsed).toContain('title="Cannot serve requests \u2014 run: meridian profile login lapsed"')
   expect(cards["seat-out"]).toStartWith(' provider-chatgpt active needs-login"')
   for (const id of ["healthy", "api", "seat-ok"]) {
     expect(cards[id]).not.toContain("needs-login")

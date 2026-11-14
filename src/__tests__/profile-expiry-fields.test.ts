@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict"
 import * as childProcess from "node:child_process"
-import { existsSync, mkdtempSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -261,17 +261,20 @@ if (!isScenario(arg)) {
         const item = body.profiles[i]!
         const input = profiles[i]!
         for (const field of expiryFields) check(Object.hasOwn(item, field), `Four-field expiry contract missing ${field}`)
-        for (const field of historyFields) check(!Object.hasOwn(item, field), `Unapproved history field ${field} appeared`)
+        // This fork also reports what auth-lifecycle.json recorded about the login.
+        for (const field of historyFields) check(Object.hasOwn(item, field), `Login history field ${field} missing`)
         equal(
           Object.keys(item).sort(),
-          [...baseFields, ...expiryFields, ...statusFields, ...(input.aliases ? ["aliases"] : [])].sort(),
-          "Profile response changed fields beyond the approved expiry (four) and #1446 duplicate/factsRefresh (three) additions",
+          [...baseFields, ...expiryFields, ...historyFields, ...statusFields, ...(input.aliases ? ["aliases"] : [])].sort(),
+          "Profile response changed fields beyond the expiry and login-history additions",
         )
         equal(item.type, input.type ?? "claude-max", "Existing profile type changed")
         equal(item.isActive, i === 0, "Existing active-profile flag changed")
         if (input.aliases) equal(item.aliases, input.aliases, "Existing aliases changed")
       }
-      check(!existsSync(join(root, "config", "auth-lifecycle.json")), "Profile polling persisted unapproved lifetime history")
+      const history = join(root, "config", "auth-lifecycle.json")
+      check(!existsSync(history) || !/synthetic-access|synthetic-refresh/.test(readFileSync(history, "utf8")),
+        "Login history persisted credential values")
       return body.profiles
     }
     const facts = (item: Record<string, unknown>, deadline: unknown, accessExpiry: unknown, warnDays = 3) => {

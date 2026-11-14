@@ -95,6 +95,12 @@ export interface ChatGptProfile extends ChatGptPlanFields {
   aliases: string[]
   /** 0-based position in the credential owner's store, when it has one. */
   storeIndex: number | null
+  /** When the seat's current access token runs out, epoch ms. */
+  accessTokenExpiresAt: number | null
+  /** When the seat signed in to OpenAI, as its access token states, epoch ms. */
+  signedInAt: number | null
+  /** When Meridian renews the seat next because chatgpt.com refused its access token, epoch ms. */
+  renewalRetryAt: number | null
 }
 
 /** One window in Claude's `/v1/usage/quota` vocabulary. */
@@ -256,6 +262,9 @@ export function chatGptProfiles(
       ownerActive: seat.active === true,
       aliases,
       storeIndex: seat.storeIndex ?? null,
+      accessTokenExpiresAt: seat.expiresAt,
+      signedInAt: seat.signedInAt ?? null,
+      renewalRetryAt: seat.renewalRetryAt ?? null,
       ...chatGptPlanFields(options.planTypes?.get(seat.id) ?? seat.planType),
     }
   })
@@ -435,11 +444,13 @@ export interface ChatGptRemovalSettings {
   chatGptProfileNames?: Record<string, string>
   chatGptProfileAliases?: Record<string, string[]>
   profileOrder?: string[]
+  routingExcludedProfiles?: string[]
+  routingManagedExcludedProfiles?: string[]
 }
 
 /**
  * Every setting keyed on a removed seat, rewritten without it: its name and
- * former names and its place in the order. Only keys
+ * former names, its place in the order and its routing exclusions. Only keys
  * that change are returned. The caller moves the active pointer and drops the
  * credits override (a ChatGPT feature). Telemetry is history and keeps the seat.
  */
@@ -457,8 +468,9 @@ export function chatGptRemovalSettings(
     const { [profile.seat]: _aliases, ...rest } = settings.chatGptProfileAliases
     update.chatGptProfileAliases = rest
   }
-  if (settings.profileOrder?.some(id => names.has(id))) {
-    update.profileOrder = settings.profileOrder.filter(id => !names.has(id))
+  for (const key of ["profileOrder", "routingExcludedProfiles", "routingManagedExcludedProfiles"] as const) {
+    const list = settings[key]
+    if (list?.some(id => names.has(id))) update[key] = list.filter(id => !names.has(id))
   }
   return update
 }
@@ -555,7 +567,10 @@ function toProfileWindows(windows: readonly CodexUsageWindow[], readAt: number):
  * the headers of the seat's latest response. Either one is a complete
  * statement of which windows the seat has.
  */
-export function seatWindows(input: { usage?: CodexUsageEntry; observed?: ObservedRateLimit }): SeatWindowsReading {
+export function seatWindows(input: {
+  usage?: Pick<CodexUsageEntry, "fetchedAt" | "windows" | "stale">
+  observed?: ObservedRateLimit
+}): SeatWindowsReading {
   const usageAt = input.usage && input.usage.fetchedAt !== null && input.usage.windows.length > 0 ? input.usage.fetchedAt : null
   const observedWindows = observedUsageWindows(input.observed)
   const observedAt = observedWindows.length > 0 && input.observed ? input.observed.at : null

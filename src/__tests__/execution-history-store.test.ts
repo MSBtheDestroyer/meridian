@@ -1,14 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
-import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
-import { hostname, tmpdir } from "node:os"
-import { randomUUID } from "node:crypto"
-import { captureProcessIncarnation } from "../proxy/session/processIncarnation"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { getConversationFingerprint } from "../proxy/session/fingerprint"
 import { join } from "node:path"
 import { clearSessionCache, lookupSession, rollbackPrioritySessionPublication, storeSession, type PrioritySessionPublication } from "../proxy/session/cache"
 import { computeLineageHash } from "../proxy/session/lineage"
 import { openCodePrimaryAgentContextHash } from "../proxy/adapters/opencodeAgentContext"
 import { claimPriorityAttempt, lookupPriorityAssignmentResult, lookupSharedSession, lookupSharedSessionResult, setSessionStoreDir } from "../proxy/sessionStore"
+import { commitRawSession, holdWriteLock, readCommittedSession, releaseStoreDatabase } from "./storeDatabaseHelpers"
 
 const messages = [{ role: "user", content: "raw original objective" }]
 const continuation = [...messages, { role: "assistant", content: "answer" }, { role: "user", content: "next question" }]
@@ -28,8 +27,9 @@ describe("durable raw proof and execution reuse proof", () => {
     directory = mkdtempSync(join(tmpdir(), "meridian-execution-proof-"))
     setSessionStoreDir(directory)
   })
-  afterEach(() => {
+  afterEach(async () => {
     setSessionStoreDir(null)
+    await releaseStoreDatabase(directory)
     rmSync(directory, { recursive: true, force: true })
   })
 
@@ -43,19 +43,18 @@ describe("durable raw proof and execution reuse proof", () => {
     expect(stored?.passthroughToolCallAssistantUuid).toBeUndefined()
     expect(stored?.passthroughToolCallIds).toBeUndefined()
     expect(lookupSession("ordinary", continuation).type).toBe("continuation")
-    // Reset the disk cache, then load from the serialized record.
-    setSessionStoreDir(null)
-    setSessionStoreDir(directory)
+    // Close the store, so the next lookup loads the committed row.
+    await releaseStoreDatabase(directory)
     expect(lookupSession("ordinary", continuation).type).toBe("continuation")
-    const serialized = JSON.parse(readFileSync(join(directory, "sessions.json"), "utf8"))
-    expect(serialized.ordinary.clientLineageHash).toBe(computeLineageHash(messages))
-    expect(serialized.ordinary.lineageHash).toBe("")
+    const serialized = readCommittedSession(directory, "ordinary")
+    expect(serialized?.clientLineageHash).toBe(computeLineageHash(messages))
+    expect(serialized?.lineageHash).toBe("")
 
     expect(await storeSession("ordinary", continuation, "sdk-full-replay")).not.toBe(false)
     const restored = lookupSharedSession("ordinary")
     expect(restored?.lineageHash).toBe(computeLineageHash(continuation))
     expect(restored?.clientLineageHash).toBeUndefined()
-    expect(JSON.parse(readFileSync(join(directory, "sessions.json"), "utf8")).ordinary.clientLineageHash).toBeUndefined()
+    expect(readCommittedSession(directory, "ordinary")?.clientLineageHash).toBeUndefined()
   })
 
   it("priority atomic publication, reload and rollback retain distinct proofs", async () => {
@@ -65,9 +64,9 @@ describe("durable raw proof and execution reuse proof", () => {
       undefined, undefined, undefined, undefined, undefined, undefined, false, originalSystem)
     const before = lookupSharedSessionResult("work:priority")
     if (before.status !== "found") throw new Error("fixture mapping missing")
-    const publication = (await priorityPublication("priority"))
-    expect((await storeSession("work:priority", continuation, "sdk-full-replay", undefined, undefined, undefined,
-      undefined, undefined, undefined, undefined, before.generation, publication, true, revisedSystem))).not.toBe(false)
+    const publication = await priorityPublication("priority")
+    expect(await storeSession("work:priority", continuation, "sdk-full-replay", undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, before.generation, publication, true, revisedSystem)).not.toBe(false)
     expect(lookupSharedSession("work:priority")?.resumeContextHash).toBe(revisedSystem)
     expect(lookupSharedSession("work:priority")?.clientLineageHash).toBeUndefined()
     expect(lookupSharedSession("work:priority")?.lineageHash).toBe(computeLineageHash(continuation))
@@ -77,8 +76,7 @@ describe("durable raw proof and execution reuse proof", () => {
     expect(restored?.clientLineageHash).toBe(computeLineageHash(messages))
     expect(restored?.sdkMessageUuids).toEqual([null, "current-only"])
     expect(restored?.resumeContextHash).toBe(originalSystem)
-    setSessionStoreDir(null)
-    setSessionStoreDir(directory)
+    await releaseStoreDatabase(directory)
     const reloaded = lookupSession("work:priority", continuation)
     expect(reloaded.type).toBe("continuation")
     if (reloaded.type === "diverged") throw new Error("Expected restored mapping")
@@ -103,12 +101,10 @@ describe("durable raw proof and execution reuse proof", () => {
   it("fails closed on malformed persisted raw proof rather than granting SDK resume", async () => {
     await storeSession("malformed", messages, "sdk-malformed", undefined, undefined, undefined,
       undefined, undefined, undefined, undefined, undefined, undefined, false)
-    const file = join(directory, "sessions.json")
-    const document = JSON.parse(readFileSync(file, "utf8"))
-    document.malformed.clientLineageHash = 7
-    writeFileSync(file, JSON.stringify(document))
-    setSessionStoreDir(null)
-    setSessionStoreDir(directory)
+    const entry = readCommittedSession(directory, "malformed")
+    if (!entry) throw new Error("fixture mapping missing")
+    commitRawSession(directory, "malformed", { ...entry, clientLineageHash: 7 })
+    await releaseStoreDatabase(directory)
     const errors = spyOn(console, "error").mockImplementation(() => {})
     try {
       expect(lookupSharedSessionResult("malformed").status).toBe("error")
@@ -117,16 +113,16 @@ describe("durable raw proof and execution reuse proof", () => {
 
   it("fails closed on malformed persisted adapter context proof", async () => {
     await storeSession("malformed-system", messages, "sdk-malformed-system")
-    const file = join(directory, "sessions.json")
-    const document = JSON.parse(readFileSync(file, "utf8"))
-    document["malformed-system"].resumeContextHash = "not-a-digest"
-    writeFileSync(file, JSON.stringify(document))
+    const entry = readCommittedSession(directory, "malformed-system")
+    if (!entry) throw new Error("fixture mapping missing")
+    commitRawSession(directory, "malformed-system", { ...entry, resumeContextHash: "not-a-digest" })
+    await releaseStoreDatabase(directory)
     const errors = spyOn(console, "error").mockImplementation(() => {})
     try { expect(lookupSharedSessionResult("malformed-system").status).toBe("error") }
     finally { errors.mockRestore() }
   })
 
-  it("captures the headerless rollback key before an ordered JSON write yields", async () => {
+  it("captures the headerless rollback key before an ordered store write yields", async () => {
     const history = [{ role: "user", content: "headerless rollback original objective" }]
     const originalHistory = structuredClone(history)
     const cwd = "/fixture/headerless-rollback"
@@ -138,25 +134,22 @@ describe("durable raw proof and execution reuse proof", () => {
     expect(await storeSession(undefined, history, "sdk-published", cwd, undefined, undefined,
       undefined, undefined, undefined, undefined, before.generation, publication)).not.toBe(false)
 
-    const incarnation = captureProcessIncarnation()
-    if (!incarnation) throw new Error("fixture lock owner unavailable")
-    const path = join(directory, "sessions.json")
-    const lockPath = path + ".lock"
-    const token = JSON.stringify({ pid: process.pid, hostname: hostname(), token: randomUUID(), incarnation })
-    writeFileSync(lockPath, token, { flag: "wx", mode: 0o600 })
+    const holder = await holdWriteLock(directory)
     const pending = rollbackPrioritySessionPublication(undefined, history, cwd, publication)
     try {
       expect(pending).toBeInstanceOf(Promise)
       history[0]!.content = "caller changed its input while rollback waited"
       expect(lookupSharedSession(key)?.claudeSessionId).toBe("sdk-published")
     } finally {
-      if (readFileSync(lockPath, "utf8") === token) unlinkSync(lockPath)
+      await holder.release()
       await pending
     }
     expect(lookupSharedSession(key)?.claudeSessionId).toBe("sdk-before")
     // Force the genuine store-error fallback so disk reads cannot hide a stale LRU.
-    const stored = readFileSync(path, "utf8")
-    writeFileSync(path, "controlled read failure")
+    const entry = readCommittedSession(directory, key)
+    if (!entry) throw new Error("fixture mapping missing")
+    commitRawSession(directory, key, { ...entry, resumeContextHash: "not-a-digest" })
+    await releaseStoreDatabase(directory)
     const errors = spyOn(console, "error").mockImplementation(() => {})
     try {
       const result = lookupSession(undefined, [...originalHistory,
@@ -166,19 +159,13 @@ describe("durable raw proof and execution reuse proof", () => {
       expect(result.session.claudeSessionId).toBe("sdk-before")
     } finally {
       errors.mockRestore()
-      writeFileSync(path, stored)
     }
   })
 
-  it.each(["pending-clear", undefined])("clears JSON fallback repopulated while durable cleanup waits (%s)", async (key) => {
+  it.each(["pending-clear", undefined])("clears the fallback repopulated while durable cleanup waits (%s)", async (key) => {
     const cwd = "/fixture/pending-json-clear"
     await storeSession(key, messages, "old-sdk", cwd)
-    const incarnation = captureProcessIncarnation()
-    if (!incarnation) throw new Error("fixture lock owner unavailable")
-    const path = join(directory, "sessions.json")
-    const lockPath = path + ".lock"
-    const token = JSON.stringify({ pid: process.pid, hostname: hostname(), token: randomUUID(), incarnation })
-    writeFileSync(lockPath, token, { flag: "wx", mode: 0o600 })
+    const holder = await holdWriteLock(directory)
     const pending = clearSessionCache()
     const later = storeSession("later", messages, "later-sdk", cwd)
     try {
@@ -187,12 +174,16 @@ describe("durable raw proof and execution reuse proof", () => {
       const during = lookupSession(key, continuation, cwd)
       expect(during.type).toBe("continuation")
     } finally {
-      if (readFileSync(lockPath, "utf8") === token) unlinkSync(lockPath)
+      await holder.release()
       await Promise.all([pending, later])
     }
-    expect(lookupSharedSessionResult(key ?? getConversationFingerprint(messages, cwd)).status).toBe("missing")
-    const stored = readFileSync(path, "utf8")
-    writeFileSync(path, "controlled read failure")
+    const durableKey = key ?? getConversationFingerprint(messages, cwd)
+    expect(lookupSharedSessionResult(durableKey).status).toBe("missing")
+    // Force the genuine store-error fallback for the cleared key.
+    const laterEntry = readCommittedSession(directory, "later")
+    if (!laterEntry) throw new Error("later mapping missing")
+    commitRawSession(directory, durableKey, { ...laterEntry, resumeContextHash: "not-a-digest" })
+    await releaseStoreDatabase(directory)
     const errors = spyOn(console, "error").mockImplementation(() => {})
     try {
       expect(lookupSession(key, continuation, cwd).type).toBe("diverged")
@@ -202,7 +193,6 @@ describe("durable raw proof and execution reuse proof", () => {
       expect(newest.session.claudeSessionId).toBe("later-sdk")
     } finally {
       errors.mockRestore()
-      writeFileSync(path, stored)
     }
   })
 })

@@ -91,6 +91,11 @@ function formatResets(resets, now) {
   return count + ' (' + (parts.length === 1 ? 'expires ' : 'expire ') + parts.join(', ') + ')';
 }
 
+var LOGIN_SOURCE = {
+  observed: ' (when Meridian found it)',
+  token: ' (the sign-in its access token states)'
+};
+
 var CHATGPT_TOKEN_STATUS = {
   expired: '\\u2717 Access token expired',
   refused: '\\u2717 Token refused by chatgpt.com',
@@ -112,6 +117,28 @@ function ownerName(owner) {
   return owner.name + (owner.account ? ' \\u00b7 account ' + owner.account : '');
 }
 
+// What Meridian recorded about the login, right under Status: a recorded
+// logout replaces the stored deadlines, which no longer describe a login that
+// can serve; otherwise the deadlines, then when the login happened.
+function loginFacts(p, now) {
+  if (p.firstUnauthedAt) {
+    var seat = isChatGptProfile(p);
+    var why = p.unauthedReason === 'refresh_rejected'
+      ? (seat ? ' \\u2014 the sign-in could not be renewed' : ' \\u2014 Anthropic refused to renew the login')
+      : p.unauthedReason === 'credentials_cleared'
+        ? (seat ? ' \\u2014 the seat has no usable sign-in' : ' \\u2014 the stored login was wiped')
+        : '';
+    return [{ label: 'Logged out', value: expirySpan(now - p.firstUnauthedAt) + ' ago', tone: 'err',
+      title: 'Since ' + new Date(p.firstUnauthedAt).toLocaleString() + why }];
+  }
+  var facts = expiryFacts(p, now);
+  if (p.authObtainedAt) {
+    facts.push({ label: 'Logged in', value: expirySpan(now - p.authObtainedAt) + ' ago', tone: '',
+      title: new Date(p.authObtainedAt).toLocaleString() + (LOGIN_SOURCE[p.authObtainedVia] || '') });
+  }
+  return facts;
+}
+
 function profileFacts(p) {
   var facts = [];
   var chatgpt = isChatGptProfile(p);
@@ -125,7 +152,12 @@ function profileFacts(p) {
     tone: p.loggedIn ? 'ok' : 'err',
     cached: authStale && p.authProvenance !== 'never'
   });
-  facts = facts.concat(expiryFacts(p, Date.now()));
+  if (chatgpt && !p.loggedIn && typeof p.renewalRetryAt === 'number') {
+    var retryIn = p.renewalRetryAt - Date.now();
+    facts.push({ label: 'Next renewal', value: retryIn > 0 ? 'in ' + expirySpan(retryIn) : 'now', tone: '',
+      title: 'chatgpt.com refused the access token; Meridian renews it on its own at ' + new Date(p.renewalRetryAt).toLocaleString() });
+  }
+  facts = facts.concat(loginFacts(p, Date.now()));
   if (p.email) facts.push({ label: 'Email', value: p.email, tone: '', cached: authStale });
   if (p.organizationName) facts.push({ label: 'Organization', value: p.organizationName, tone: '' });
   if (p.accountType) facts.push({ label: 'Account', value: p.accountType, tone: '' });
@@ -198,6 +230,11 @@ function profileAccessHelp(p) {
   }
   var owner = p.owner || {};
   if (owner.name === 'meridian') {
+    if (p.tokenState === 'refused' && typeof p.renewalRetryAt === 'number') {
+      var retryIn = p.renewalRetryAt - Date.now();
+      var renewing = 'chatgpt.com refused this seat\\u2019s access token. Meridian renews it on its own, next ' + (retryIn > 0 ? 'in ' + expirySpan(retryIn) : 'now') + '.';
+      return { pill: 'renewing', reason: renewing, summary: renewing + ' Sign it in again only if a renewal is refused.' };
+    }
     var owned = 'Meridian holds this seat\\u2019s login and cannot renew it.';
     if (owner.webSignIn) {
       return { pill: 'needs login', reason: owned, summary: owned + ' Sign it in again with Sign in again on its card.' };
@@ -312,9 +349,9 @@ function codexCreditsPace(credits, quota, now) {
   if (serving) return { text: 'est. out in ' + mark + lasts + ' at current pace', title: title, approximate: approximate };
   var policy = quota && quota.creditsPolicy;
   var start = policy === 'never' ? 'not spent (policy never)'
-    : policy === 'reserve' ? 'starts after every seat\\u2019s plan limits'
-    : 'starts after plan limits';
-  return { text: start + '; would last ~' + lasts + ' at current pace', title: title, approximate: approximate };
+    : policy === 'reserve' ? 'after all seats\\u2019 plan limits'
+    : 'after plan limits';
+  return { text: start + '; ' + (policy === 'never' ? 'would last' : 'lasts') + ' ~' + lasts + ' at current pace', title: title, approximate: approximate };
 }
 
 // Which vendor is refusing a profile, and what the page calls it.

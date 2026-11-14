@@ -78,8 +78,10 @@ describe("shared site header", () => {
     expect(profileBarJs).toContain("/profiles/list")
   })
 
-  test("header shows a build chip fed by /health's build block", () => {
+  test("header shows the running version and an update badge, fed by /health's build block", () => {
     expect(profileBarHtml).toContain("mhBuild")
+    expect(profileBarHtml).toContain("mhProv")
+    expect(profileBarHtml).toContain("mhUpdate")
     expect(profileBarJs).toContain("renderBuild")
     expect(profileBarJs).toContain("updateAvailable")
   })
@@ -120,6 +122,20 @@ describe("shared site header", () => {
     // Pieces without a safe URL render as spans, never as href-less anchors.
     expect(profileBarJs).toContain("document.createElement(part.href ? 'a' : 'span')")
     expect(profileBarHtml).toContain('id="mhUpdate"')
+  })
+
+  test("header css is brace-balanced, so no rule swallows the ones below it", () => {
+    // An unclosed rule nests every rule after it and CSS drops them all,
+    // which neither review nor a screenshot of what still renders catches.
+    let depth = 0
+    let lowest = 0
+    for (const ch of profileBarCss) {
+      if (ch === "{") depth++
+      else if (ch === "}") depth--
+      lowest = Math.min(lowest, depth)
+    }
+    expect(lowest).toBe(0)
+    expect(depth).toBe(0)
   })
 
   test("drift is polled only for local builds, never overlapping, and bypasses the cache", () => {
@@ -277,6 +293,16 @@ describe("landing page layout", () => {
     expect(header.slice(0, header.indexOf("}"))).toContain("flex-wrap: wrap")
   })
 
+  test("the intro's address chips wrap on a phone instead of scrolling it sideways", () => {
+    // Measured at 320px on meridian-gpt.desktop.ts.nowaker.net: the chip
+    // holding the instance's own address was 348px wide in a 272px column.
+    const phone = landingHtml.indexOf("@media (max-width: 720px) {\n    .intro code {")
+    expect(phone).toBeGreaterThanOrEqual(0)
+    const rule = landingHtml.slice(phone, landingHtml.indexOf("}", phone))
+    expect(rule).toContain("white-space: normal")
+    expect(rule).toContain("overflow-wrap: anywhere")
+  })
+
   test("accounts can be re-sorted for viewing without touching the saved order", () => {
     // The page carries a copy of the comparator, so the modes it offers are
     // interpolated from the tested module rather than retyped.
@@ -387,6 +413,14 @@ describe("profiles page layout", () => {
     const narrow = profilePageHtml.slice(profilePageHtml.indexOf("@media (max-width: 480px)"))
     expect(narrow.slice(0, narrow.indexOf("}"))).toContain("grid-template-columns: minmax(0, 1fr)")
   })
+
+  test("the sign-in, remove and search panels wrap a long name or query", () => {
+    // Measured at 320px: "Create <long name>" widened the page to 564px and a
+    // long unmatched query to 902px.
+    expect(rule(".login-panel-title")).toContain("overflow-wrap: anywhere")
+    expect(rule(".remove-confirm-text")).toContain("overflow-wrap: anywhere")
+    expect(rule(".profile-no-match")).toContain("overflow-wrap: anywhere")
+  })
 })
 
 describe("design-system conformance (DESIGN.md)", () => {
@@ -482,7 +516,7 @@ describe("home page spacing on a phone", () => {
   test("the page edge is a third and a card's padding half of the desktop values", () => {
     expect(landingHtml).toContain(".container { max-width: 960px; margin: 0 auto; padding: 28px 24px; }")
     expect(landingHtml).toMatch(/\.profile-card \{[^}]*padding: 18px 20px;/)
-    expect(landingHtml).toMatch(/@media \(max-width: 720px\) \{\s*\.container \{ padding-left: 8px; padding-right: 8px; \}\s*\.profile-card \{ padding: 9px 10px; \}\s*\}/)
+    expect(landingHtml).toMatch(/@media \(max-width: 720px\) \{\s*\.container, :root\[data-layout="wide"\] \.container \{ padding-left: 8px; padding-right: 8px; \}\s*\.profile-card \{ padding: 9px 10px; \}\s*\}/)
   })
 })
 
@@ -588,8 +622,8 @@ describe("header active-profile chip", () => {
       },
       removeAttribute: () => undefined,
       setAttribute: () => undefined,
-      replaceChildren: () => undefined,
       addEventListener: () => undefined,
+      replaceChildren: () => undefined,
       contains: () => false,
       querySelector: () => stubElement(),
     }

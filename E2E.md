@@ -687,6 +687,48 @@ joins are recorded. This is a deterministic fingerprint file-cap failure, **not
 an actual loaded-Linux-host timeout reproduction**. Stock Node controls also
 cover the aggregate Git budget, TERM resistance, detached/stale launcher facts
 and failed status. [Source mappings, sanitized proof and limits](docs/maintenance/evidence/1330-source-build-identity.md).
+## Transcript retention
+
+```sh
+bun scripts/e2e-transcript-retention.mjs
+MERIDIAN_TRANSCRIPT_RETENTION_DAYS=0 bun scripts/e2e-transcript-retention.mjs --expect-kept
+```
+
+Needs no credentials, network or running proxy. The harness drives the
+installed Claude Code CLI through the Agent SDK with the options
+`buildQueryOptions` produces, against a disposable config directory holding one
+transcript last touched 40 days ago and one fresh one. The child never receives
+a message, so nothing reaches the model; it idles while Claude Code's
+background housekeeping runs. The first run asserts the sweep deletes the old
+transcript, keeps the fresh one and loads no settings file, then that resuming
+the deleted session is refused in a way `classifyResumeRefusal` reads as
+`unresumable`, the cue for Meridian's fresh-session replay. With retention off
+the child receives exactly the settings Meridian sent before this setting
+existed, and `--expect-kept` asserts nothing is deleted.
+
+On Linux, where Claude Code keeps its OAuth login in `.credentials.json`, the
+first run then drives the idle sweep (`transcriptSweep.ts`) through the real
+CLI against four synthetic config roots, each with a synthetic login, a
+40-day-old transcript and a `.last-cleanup` two days old. A dead login and a
+valid one must be cleaned; an expired one, which Claude Code would try to
+refresh, must be skipped. The expired root is then swept with the token check
+overridden, to show the refusing proxy alone holds. Every login file must keep
+its inode, mtime and content hash.
+
+**Verified 2026-10-03:** Linux, Claude Code 2.1.284, Agent SDK 0.2.141: with
+the default 30 days the old transcript was deleted, the fresh one kept, and the
+resume classified `unresumable`; with `0` both transcripts were kept. Idle
+sweep: dead and valid logins were cleaned (0 and 6 connections refused), the
+expired one was skipped, and with the token check overridden it was cleaned
+with 6 connections refused; no login file changed.
+
+Before the gate existed, the same idle process was probed behind a logging
+proxy. With an expired or nearly expired login it tried to refresh at
+platform.claude.com 12 times. With a valid login it made 13 attempts to fetch
+the profile, remote settings and policy limits from api.anthropic.com. A dead
+login made no connection at all. Under `strace -f` with the refusing proxy, all
+25 `connect()` calls of the process tree went to the proxy and none bypassed
+it.
 
 ## Startup warning under Bun (E87)
 
@@ -1319,6 +1361,26 @@ Gemini 3.8 Flash low, macOS arm64, Node 22.22.3).
 Focused tests cover withheld delivery, broken/truncated streams,
 oversize cancellation, caller abort, and HTTP/nonstreaming pass-through.
 
+## Authoritative profile login state
+
+```sh
+bun scripts/e2e-profile-login-state.mjs --real-cli
+E2E_PORT=42147 bun scripts/e2e-profile-login-state.mjs --serve
+```
+
+The headless fixture uses real child processes, credential stores and HTTP
+routes. It verifies that an explicit CLI logout and recorded refresh rejection
+outrank local credential presence, for both Claude and ChatGPT, that activation
+returns `409` with `code: "needs_login"`, and that a new login restores activation.
+`--real-cli` separately verifies the installed Claude CLI's negative answer
+against an owned empty directory. No customer credential or active pointer is
+modified; inference and external HTTP calls are blocked. `--serve` retains the
+negative fixtures for checking `/` and `/profiles` in a browser. Stop with ^C.
+
+The incident investigation found that a quota-read 429 is not a logout signal.
+The fixture measures the local reconciliation read; it does not enable another
+upstream probe or change inactive-profile polling cadence.
+
 ## Quick Start
 
 ```bash
@@ -1864,7 +1926,7 @@ cat /tmp/proxy-e2e.log | strings | grep "\[PROXY\]" | tail -5
 **Cleanup.** Each test section is independent. Kill the proxy and clear the session store between sections if you need isolation:
 ```bash
 kill $(lsof -ti :3456) 2>/dev/null
-rm -f ~/.cache/meridian/sessions.json
+rm -f ~/.cache/meridian/sessions.db ~/.cache/meridian/sessions.db-wal ~/.cache/meridian/sessions.db-shm
 ```
 
 ---
@@ -2124,7 +2186,7 @@ curl -s http://127.0.0.1:3456/v1/messages \
 
 ## E8: Cross-Proxy Resume
 
-**Verifies:** Sessions survive proxy restart via the shared file store (`~/.cache/meridian/sessions.json`).
+**Verifies:** Sessions survive proxy restart via the shared session store (`~/.cache/meridian/sessions.db`).
 
 ```bash
 # Step 1: Create a session
@@ -2139,8 +2201,8 @@ curl -s http://127.0.0.1:3456/v1/messages \
     "messages": [{"role": "user", "content": "Remember: PHOENIX_42"}]
   }' > /dev/null
 
-# Verify stored in file
-cat ~/.cache/meridian/sessions.json | python3 -m json.tool | grep -A3 "e2e-persist"
+# Verify stored in the session store
+sqlite3 ~/.cache/meridian/sessions.db "SELECT key, entry FROM sessions WHERE key LIKE '%e2e-persist%'"
 
 # Step 2: Kill and restart proxy (in-memory caches wiped)
 kill $(lsof -ti :3456); sleep 2
@@ -2589,12 +2651,12 @@ ANTHROPIC_API_KEY=should-be-stripped ANTHROPIC_BASE_URL=http://should-be-strippe
 
 ## E21: Session Store Pruning
 
-**Verifies:** The file-based session store (`~/.cache/meridian/sessions.json`) evicts the oldest entries when the count exceeds `CLAUDE_PROXY_MAX_STORED_SESSIONS`.
+**Verifies:** The session store (`~/.cache/meridian/sessions.db`) evicts the oldest entries when the count exceeds `CLAUDE_PROXY_MAX_STORED_SESSIONS`.
 
 **Requires proxy restart with env var:**
 ```bash
 kill $(lsof -ti :3456) 2>/dev/null; sleep 1
-rm -f ~/.cache/meridian/sessions.json
+rm -f ~/.cache/meridian/sessions.db ~/.cache/meridian/sessions.db-wal ~/.cache/meridian/sessions.db-shm
 CLAUDE_PROXY_PORT=3456 CLAUDE_PROXY_MAX_STORED_SESSIONS=3 bun run ./bin/cli.ts > /tmp/proxy-e2e.log 2>&1 &
 # Wait for ready...
 ```
@@ -2611,15 +2673,11 @@ for i in 1 2 3 4 5; do
 done
 
 # Verify the store is bounded
-cat ~/.cache/meridian/sessions.json | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-print(f'Entries: {len(d)} (should be <= 3)')
-"
+sqlite3 ~/.cache/meridian/sessions.db "SELECT 'Entries: ' || count(*) || ' (should be <= 3)' FROM sessions"
 ```
 
 **Pass criteria:**
-- File store contains at most 3 entries
+- The session store holds at most 3 sessions
 - Oldest sessions (lowest `lastUsedAt`) were evicted
 
 **After testing, restart proxy in normal mode (no cap).**
@@ -3029,7 +3087,7 @@ echo "$CLAUDE_SESSION_ID"
 # 2. Query usage immediately (proves fingerprint-backed sessions are discoverable)
 curl -s http://127.0.0.1:3456/v1/sessions/$CLAUDE_SESSION_ID/context-usage | python3 -m json.tool
 
-# 3. Restart the proxy WITHOUT deleting ~/.cache/meridian/sessions.json
+# 3. Restart the proxy WITHOUT deleting ~/.cache/meridian/sessions.db
 kill $(lsof -ti :3456) 2>/dev/null
 sleep 2
 CLAUDE_PROXY_PORT=3456 bun run ./bin/cli.ts > /tmp/proxy-e2e.log 2>&1 &

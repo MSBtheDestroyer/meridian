@@ -14,7 +14,6 @@ import { WINDOW_LABELS } from "./profileUsage"
 import { domPatchJs } from "./domPatch"
 import { profileCardStatusCss, profileCardStatusJs } from "./profileCardStatus"
 
-
 /**
  * Every text field on this page names a profile, filters the list or takes a
  * pasted sign-in address; none is a login form. A field beside a "Sign in"
@@ -37,11 +36,12 @@ export const profilePageHtml = `<!DOCTYPE html>
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
          color: var(--text); padding: 0; line-height: 1.5; }
   .container { max-width: 800px; margin: 0 auto; padding: 24px; }
-  h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
-  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  /* Page title as on /providers, section headings as on /settings: the
+     uppercase micro-label read as a caption beside those pages' headings. */
+  h1 { font-size: 28px; font-weight: 600; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 14px; margin-bottom: 24px; }
   .section { margin-bottom: 32px; }
-  .section-title { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase;
-                   letter-spacing: 0.5px; margin-bottom: 12px; }
+  .section-title { font-size: 20px; font-weight: 600; color: var(--text); margin-bottom: 12px; }
 
   .profile-search { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
   .profile-search[hidden] { display: none; }
@@ -53,7 +53,7 @@ export const profilePageHtml = `<!DOCTYPE html>
   .profile-search input::placeholder { color: var(--muted); }
   .profile-search input:focus { outline: none; border-color: var(--accent); }
   .profile-search-count { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .profile-no-match { padding: 32px; }
+  .profile-no-match { padding: 32px; overflow-wrap: anywhere; }
   .profile-no-match[hidden] { display: none; }
   .link-btn {
     background: none; border: none; padding: 0; font: inherit; color: var(--accent); cursor: pointer;
@@ -71,6 +71,10 @@ export const profilePageHtml = `<!DOCTYPE html>
      (profileProviders.ts): each provider's active account, and the button
      that switches to one, are in that provider's brand. */
   .profile-card.active { border-color: var(--brand, var(--accent)); box-shadow: 0 0 0 1px var(--brand, var(--accent)); }
+  /* The same mark / gives an account that cannot serve requests. The red
+     border replaces an active card's brand border, and its brand ring stays
+     outside the red, so the two still tell apart. */
+  .profile-card.needs-login { border-color: var(--red); }
   #content .provider-group-head { margin-bottom: 10px; }
   #content .provider-group-head:not([hidden]) ~ .provider-group-head { margin-top: 24px; }
   /* Wide layout: the stack becomes a grid of larger cards, two to four to a
@@ -92,13 +96,6 @@ export const profilePageHtml = `<!DOCTYPE html>
   @media (prefers-reduced-motion: reduce) {
     .profile-card.anchor-flash { animation: none; }
   }
-  /* The name links to its own card. */
-  a.profile-name { color: inherit; text-decoration: none; }
-  a.profile-name:hover { color: var(--accent); }
-  /* The same mark / gives an account that cannot serve requests. The red
-     border replaces an active card's brand border, and its brand ring stays
-     outside the red, so the two still tell apart. */
-  .profile-card.needs-login { border-color: var(--red); }
   /* The header row carries the reorder handle, the name, every badge the
      card can earn - active, the type, out of a limit - and the actions. On a
      phone they do not fit on one line, and a row that cannot wrap pushed the
@@ -112,7 +109,8 @@ export const profilePageHtml = `<!DOCTYPE html>
   ${profileProvidersCss}
   ${profileLoginStatesCss}
   ${profileCardStatusCss}
-  .profile-name { font-size: 16px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+  .profile-name { font-size: 16px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; color: inherit; text-decoration: none; }
+  a.profile-name:hover { color: var(--accent); }
   .profile-card-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
   .icon-btn {
     background: var(--bg); color: var(--muted); border: 1px solid var(--border);
@@ -155,6 +153,9 @@ export const profilePageHtml = `<!DOCTYPE html>
     background: rgba(248,81,73,0.08); border: 1px solid rgba(248,81,73,0.3); color: var(--text);
     overflow-wrap: anywhere; }
   .spent-note .spent-why { color: var(--muted); }
+  /* A reserve is a choice, not a failure: the spent note's shape in yellow. */
+  .spent-note.reserve-note { background: rgba(210,153,34,0.08); border-color: rgba(210,153,34,0.3); }
+  .reserve-note strong { color: var(--yellow); }
   /* minmax(0, 1fr), not 1fr: a bare fr track is at least as wide as its
      longest unbreakable value, so an email address widened the grid past
      the card instead of wrapping. */
@@ -221,7 +222,7 @@ export const profilePageHtml = `<!DOCTYPE html>
     margin-top: 12px; padding: 14px 16px; background: var(--surface2);
     border: 1px solid var(--border); border-radius: 8px;
   }
-  .login-panel-title { font-size: 12px; font-weight: 600; margin-bottom: 8px; }
+  .login-panel-title { font-size: 12px; font-weight: 600; margin-bottom: 8px; overflow-wrap: anywhere; }
   .login-note {
     font-size: 12px; color: var(--muted); margin-bottom: 8px; padding: 8px 10px;
     background: rgba(210,153,34,0.1); border: 1px solid rgba(210,153,34,0.3); border-radius: 6px;
@@ -262,6 +263,12 @@ export const profilePageHtml = `<!DOCTYPE html>
     background: var(--bg); padding: 1px 5px; border-radius: 4px; color: var(--accent2);
   }
   .add-note { font-size: 11px; color: var(--muted); margin-top: 8px; }
+  /* Deliberately lighter than .profile-card: it now sits above the account
+     list, where a card's weight would read as the page's headline. */
+  .add-card {
+    padding: 14px 16px; background: var(--surface2);
+    border: 1px solid var(--border); border-radius: 8px;
+  }
 
   .mono { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px; }
   .copy-cmd {
@@ -305,6 +312,11 @@ export const profilePageHtml = `<!DOCTYPE html>
     margin-bottom: 4px;
   }
   .usage-fill { height: 100%; transition: width 0.4s ease; background: var(--green); }
+  /* The reserve cap stands above and below the 4px track, so the track stops clipping. */
+  .usage-bar.reserved { position: relative; overflow: visible; }
+  .usage-bar.reserved .usage-fill { border-radius: 2px; }
+  .reserve-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px;
+    background: var(--yellow); border-radius: 1px; box-shadow: 0 0 0 1px var(--bg); }
   .usage-card.status-warn .usage-fill,
   .usage-card.status-warn .usage-pct { color: var(--yellow); }
   .usage-card.status-warn .usage-fill { background: var(--yellow); }
@@ -345,6 +357,12 @@ export const profilePageHtml = `<!DOCTYPE html>
 <h1>Profiles</h1>
 <div class="subtitle" id="profiles-subtitle">Manage Claude account profiles</div>
 
+<!-- Outside #content on purpose: render() rebuilds that element wholesale on
+     every poll, which would destroy a half-typed name or a pasted code. -->
+<div class="section">
+  <h2 class="section-title">Add a profile</h2>
+  <div class="add-card"><div id="add-slot"></div></div>
+</div>
 
 <!-- The heading and search box sit outside #content, which render() rebuilds
      on every poll: a box inside it would lose its text every ten seconds. -->
@@ -366,13 +384,6 @@ export const profilePageHtml = `<!DOCTYPE html>
   <div class="provider-none login-none" id="profiles-login-none" hidden>${LOGIN_STATES_NONE_SHOWN_HTML}</div>
 </div>
 ${reorderLiveRegionHtml}
-
-<!-- Outside #content on purpose: render() rebuilds that element wholesale on
-     every poll, which would destroy a half-typed name or a pasted code. -->
-<div class="section">
-  <div class="section-title">Add a profile</div>
-  <div class="profile-card"><div id="add-slot"></div></div>
-</div>
 
 <div class="section" style="margin-top:32px">
   <h2 class="section-title">Setup Guide</h2>
@@ -553,14 +564,17 @@ var updatePollTimer = null;
 // innerHTML, which would blank the input mid-keystroke.
 var editingProfile = null;
 var renameError = null;
-// A ChatGPT seat being removed: its confirm panel is open, and the poll waits.
+// Profile awaiting a remove confirmation, and the error from the last rejected
+// attempt. The poll is suspended while one is pending for the same reason a
+// rename suspends it: a redraw mid-decision would take the confirmation away
+// and leave the click that follows landing on whatever moved into its place.
 var removingProfile = null;
 var removeError = null;
 
 var ICON_PENCIL = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zm1.414 1.06a.25.25 0 00-.354 0L10.811 3.75l1.439 1.44 1.263-1.263a.25.25 0 000-.354l-1.086-1.086zM11.189 6.25L9.75 4.81l-6.286 6.287a.25.25 0 00-.064.108l-.558 1.953 1.953-.558a.249.249 0 00.108-.064l6.286-6.286z"/></svg>';
-var ICON_TRASH = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M11 1.75V3h2.25a.75.75 0 010 1.5H2.75a.75.75 0 010-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75zM6.5 1.75V3h3V1.75a.25.25 0 00-.25-.25h-2.5a.25.25 0 00-.25.25z"/><path d="M4.997 6.178a.75.75 0 10-1.494.144L4.462 16.5h7.076l.959-10.178a.75.75 0 00-1.494-.144l-.888 9.322H5.885l-.888-9.322z"/></svg>';
 var ICON_CHECK = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/></svg>';
 var ICON_X = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M3.72 3.72a.75.75 0 011.06 0L8 6.94l3.22-3.22a.75.75 0 111.06 1.06L9.06 8l3.22 3.22a.75.75 0 11-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 01-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 010-1.06z"/></svg>';
+var ICON_TRASH = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M11 1.75V3h2.25a.75.75 0 010 1.5H2.75a.75.75 0 010-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75zM6.5 1.75V3h3V1.75a.25.25 0 00-.25-.25h-2.5a.25.25 0 00-.25.25z"/><path d="M4.997 6.178a.75.75 0 10-1.494.144L4.462 16.5h7.076l.959-10.178a.75.75 0 00-1.494-.144l-.888 9.322H5.885l-.888-9.322z"/></svg>';
 
 function focusRenameInput() {
   var el = document.getElementById('rename-input');
@@ -634,7 +648,7 @@ function cancelRemove() {
 async function commitRemove(id) {
   var data;
   try {
-    var res = await fetch('/profiles/chatgpt/remove', {
+    var res = await fetch('/profiles/remove', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ profile: id })
@@ -977,6 +991,29 @@ function renderSpentNote(spent, p) {
     + '</div>';
 }
 
+function reservePct(value) { return String(Math.round(value * 10) / 10); }
+
+function reserveTip(bounds) {
+  return bounds.floor === bounds.ceiling
+    ? 'Usage reserve: capped at ' + reservePct(bounds.ceiling) + '%'
+    : 'Usage reserve: ' + reservePct(bounds.allowance) + '% allowed now, paced from '
+      + reservePct(bounds.floor) + '% to ' + reservePct(bounds.ceiling) + '%';
+}
+
+function reserveBounds(reserve, type) {
+  var bounds = reserve && reserve.windows ? reserve.windows[type] : null;
+  return bounds && typeof bounds.allowance === 'number' ? bounds : null;
+}
+
+function renderReserveNote(reserve) {
+  if (!reserve || !reserve.held) return '';
+  var opens = reserve.opensAt != null && reserve.opensAt > Date.now() ? formatResetCountdown(reserve.opensAt) : '';
+  return '<div class="spent-note reserve-note">'
+    + '<strong>Held back by its usage reserve</strong>: ' + esc(reserve.reason || 'over its allowance') + '.'
+    + (opens ? ' Opens ' + esc(opens) + '.' : '')
+    + '</div>';
+}
+
 function renderUsageSection(profileQuota, p) {
   // No quota data for this profile yet (cold start or fetch failed) — hide
   // entirely so we don't render an empty box.
@@ -1047,12 +1084,16 @@ function renderUsageSection(profileQuota, p) {
     var label = labelForWindow(w.type);
     var reset = formatResetCountdown(w.resetsAt);
     var tip = label + ' — ' + pctRound + '%' + (reset ? ' (resets ' + reset + ')' : '');
+    var bounds = reserveBounds(profileQuota.reserve, w.type);
+    if (bounds) tip += ' · ' + reserveTip(bounds);
     return '<div class="usage-card status-' + esc(status) + '" title="' + esc(tip) + '">'
       + '<div class="usage-row">'
       +   '<span class="usage-label">' + esc(label) + '</span>'
       +   '<span class="usage-pct">' + pctRound + '%' + usageTag + '</span>'
       + '</div>'
-      + '<div class="usage-bar"><div class="usage-fill" style="width:' + (pct * 100).toFixed(1) + '%"></div></div>'
+      + '<div class="usage-bar' + (bounds ? ' reserved' : '') + '"><div class="usage-fill" style="width:' + (pct * 100).toFixed(1) + '%"></div>'
+      +   (bounds ? '<div class="reserve-marker" style="left:' + Math.max(0, Math.min(100, bounds.allowance)).toFixed(1) + '%" title="' + attr(reserveTip(bounds)) + '"></div>' : '')
+      + '</div>'
       + (reset ? '<div class="usage-reset">' + esc(reset) + '</div>' : '')
     + '</div>';
   }).join('');
@@ -1089,6 +1130,7 @@ function renderUsageSection(profileQuota, p) {
   return '<div class="usage-section">'
     + '<div class="usage-section-title">Usage' + asOf + '</div>'
     + staleNote
+    + renderReserveNote(profileQuota.reserve)
     + (cards ? '<div class="usage-grid">' + cards + '</div>' : '')
     + extraBlock
     + '</div>';
@@ -1170,17 +1212,17 @@ function render(data, quotaData) {
       html += meridianProviders.badgeHtml(slot.provider, "profile-badge");
       // A seat's type is its provider's name, which the badge before it says.
       if ((p.type || "claude-max") !== slot.provider) html += "<span class=\\"profile-badge badge-type\\">" + esc(p.type || "claude-max") + "</span>";
-      // A seat's pill says what to do in the words of whoever holds its login.
-      if (needsLogin && isChatGptProfile(p)) {
+      // The pill / shows, in the words of whoever holds the login.
+      if (needsLogin) {
         var access = profileAccessHelp(p);
         html += '<span class="profile-badge badge-needs-login" title="' + esc(access.summary) + '">' + esc(access.pill) + '</span>';
-      } else if (needsLogin) html += "<span class=\\"profile-badge badge-needs-login\\" title=\\"Cannot serve requests. Log in again below.\\">needs login</span>";
+      }
       html += meridianCardStatus.duplicateBadgeHtml(p, 'profile-badge');
       html += renderSpentBadge((quotaById[p.id] || {}).spent);
       if ((quotaById[p.id] || {}).servingOnCredits) html += '<span class="profile-badge badge-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
       html += "<span class=\\"profile-card-actions\\">";
       html += "<button class=\\"icon-btn\\" title=\\"Rename profile\\" onclick=\\"startRename(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_PENCIL + "</button>";
-      if (isChatGptProfile(p)) html += "<button class=\\"icon-btn danger\\" title=\\"Remove seat\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
+      html += "<button class=\\"icon-btn danger\\" title=\\"Remove profile\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
       html += "</span>";
     }
     html += '</div>';
@@ -2125,7 +2167,17 @@ function renderChatGptDevicePanel(data, o) {
     + '</div>';
 }
 
-function renderChatGptRedirectPanel(authorizeUrl, loopback, o) {
+// One line per event hook told about the redirect listener: a relay on another
+// machine says there whether it now forwards that machine's 127.0.0.1:1455.
+function renderChatGptAnnouncements(announcements) {
+  if (!announcements || !announcements.length) return '';
+  return announcements.map(function (a) {
+    var verdict = a.ok === true ? '' : a.ok === false ? 'failed: ' : 'still running: ';
+    return '<div class="login-note">' + esc(a.target) + ': ' + esc(verdict + (a.detail || '')) + '</div>';
+  }).join('');
+}
+
+function renderChatGptRedirectPanel(authorizeUrl, loopback, o, announcements) {
   return '<div class="login-panel">'
     + '<div class="login-panel-title">' + esc(o.title) + '</div>'
     + (o.note ? '<div class="login-note">' + esc(o.note) + '</div>' : '')
@@ -2136,6 +2188,7 @@ function renderChatGptRedirectPanel(authorizeUrl, loopback, o) {
     +   '<li>Sign in with ' + esc(o.account) + '.</li>'
     +   (loopback ? '<li>On this machine the tab then ends on a Meridian page saying the seat is connected, and this panel finishes by itself.</li>' : '')
     + '</ol>'
+    + renderChatGptAnnouncements(announcements)
     + '<label class="paste-label" for="' + o.inputId + '">' + (loopback ? 'Signed in from another machine? ' : '')
     +   'Paste the whole address the sign-in tab ended on. It starts with http://127.0.0.1:1455 and that page does not load \\u2014 that is expected.</label>'
     + '<div class="login-row">'
@@ -2193,7 +2246,7 @@ async function startChatGptRedirect(note) {
   setAddFormLocked(true);
   activeChatGptConnect = { connectId: data.connectId, name: name };
   var flow = addFlow();
-  flow.innerHTML = renderChatGptRedirectPanel(data.authorizeUrl, data.loopback, CHATGPT_ADD_PANEL);
+  flow.innerHTML = renderChatGptRedirectPanel(data.authorizeUrl, data.loopback, CHATGPT_ADD_PANEL, data.announcements);
   var input = flow.querySelector('.login-input');
   if (input) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitChatGptConnect(); });
   window.open(data.authorizeUrl, '_blank', 'noopener');
@@ -2333,7 +2386,7 @@ async function startChatGptReloginRedirect(id, note) {
   activeChatGptRelogin = { profile: id, connectId: reply.data.connectId };
   var slot = loginSlot(id);
   if (slot) {
-    slot.innerHTML = renderChatGptRedirectPanel(reply.data.authorizeUrl, reply.data.loopback, chatGptReloginPanel(id, note));
+    slot.innerHTML = renderChatGptRedirectPanel(reply.data.authorizeUrl, reply.data.loopback, chatGptReloginPanel(id, note), reply.data.announcements);
     var input = slot.querySelector('.login-input');
     if (input) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitChatGptRelogin(); });
   }

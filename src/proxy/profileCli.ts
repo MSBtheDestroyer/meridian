@@ -11,18 +11,19 @@
 
 import { execFileSync, spawnSync } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
-import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs"
+import { mkdirSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { configPath } from "../configDir"
+import { envBool } from "../env"
 import { claudeLog } from "../logger"
-import { authFieldPaths, describeAuthFields } from "./authDiscovery" 
+import { authFieldPaths, describeAuthFields } from "./authDiscovery"
 import { resolveClaudeExecutableSync } from "./models"
 import { fetchOAuthPlanFields, type OAuthPlanFields } from "./oauthPlan"
 import type { ProfileConfig } from "./profiles"
-import { envBool } from "../env"
+import { applyProfileRemove } from "./profileRemove"
 import { findChatGptSeat, listChatGptSeats, printChatGptSeats, removeChatGptSeat, renameChatGptSeat, signInChatGptSeat, switchChatGptSeat, type SeatCliContext } from "./chatgpt/seatCli"
-
+export { dirsToRemoveOnProfileRemove } from "./profileRemove"
 import {
   applyProfileRename,
   defaultProfilesConfigFile,
@@ -34,6 +35,7 @@ import {
 import { getSetting, setSetting } from "../settings"
 import { publishProfileConfig, readProfileConfigForUpdate, withProfileConfigLock, withProfileConfigLockSync } from "./profileConfigStore"
 import { createPlatformCredentialStore, type CredentialsFile } from "./tokenRefresh"
+import { noteAuthLogin } from "./authLifecycle"
 
 const OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
 export const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
@@ -79,9 +81,9 @@ export function isValidProfileId(id: string): boolean {
   return Boolean(id) && !/[^a-zA-Z0-9_-]/.test(id)
 }
 
-/** Yellow text — plain when stdout is piped, where escape codes are noise. */
-function yellow(text: string): string {
-  return process.stdout.isTTY ? `\x1b[33m${text}\x1b[0m` : text
+/** Red text — plain when stdout is piped, where escape codes are noise. */
+function red(text: string): string {
+  return process.stdout.isTTY ? `\x1b[31m${text}\x1b[0m` : text
 }
 
 /**
@@ -221,14 +223,10 @@ export function parseAuthorizationCodeInput(input: string): ParsedAuthorizationC
 }
 
 function loadProfileConfig(): ProfileConfig[] {
-  const file = profilesConfigFile()
-  if (!existsSync(file)) return []
-  try {
-    return JSON.parse(readFileSync(file, "utf-8"))
-  } catch (err) {
-    console.warn(`[meridian] Failed to read ${file}: ${err instanceof Error ? err.message : err}`)
-    return []
-  }
+  // Resolved per call, never frozen into a module const: MERIDIAN_CONFIG_DIR
+  // relocates this file, and the rename planner has to read the same one this
+  // process is writing.
+  return loadProfileConfigFrom(profilesConfigFile())
 }
 
 /**
@@ -322,6 +320,13 @@ export function buildLoginCredentials(
       ...plan,
     },
   }
+}
+
+/** A `claude auth login` that just succeeded wrote the credential itself, so it is read back. */
+async function recordCliLogin(configDir: string | undefined): Promise<void> {
+  const store = createPlatformCredentialStore(configDir ? { claudeConfigDir: configDir } : undefined)
+  const credentials = await store.read().catch(() => null)
+  noteAuthLogin(store.refreshKey, { refreshTokenExpiresAt: credentials?.claudeAiOauth?.refreshTokenExpiresAt })
 }
 
 export type OAuthExchangeFailureReason =
@@ -431,6 +436,9 @@ export async function exchangeAuthorizationCodeForCredentials(params: OAuthExcha
     payload: describeAuthFields(credentials.claudeAiOauth),
   })
   const written = await store.write(credentials)
+  if (written) {
+    noteAuthLogin(store.refreshKey, { refreshTokenExpiresAt: credentials.claudeAiOauth.refreshTokenExpiresAt })
+  }
   return written ? { ok: true } : { ok: false, reason: "write_failed" }
 }
 
@@ -654,6 +662,7 @@ export async function profileAdd(id: string, options: AuthLoginOptions = {}): Pr
     process.exit(1)
   }
 
+  if (!options.headless) await recordCliLogin(configDir)
   console.log()
   console.log(`\x1b[32m✓ Profile "${id}" created — logged in as ${auth.email} (${auth.subscriptionType || "unknown"})\x1b[0m`)
 
@@ -705,11 +714,11 @@ type ProfileListDeps = {
   authStatus: typeof getAuthStatus
 }
 
-export function profileList(deps: ProfileListDeps = {
+export async function profileList(deps: ProfileListDeps = {
   loadProfiles: loadProfileConfig,
   resolveExecutable: resolveClaudeExecutableSync,
   authStatus: getAuthStatus,
-}): void {
+}): Promise<void> {
   const profiles = deps.loadProfiles()
   const seats = listChatGptSeats(seatContext())
   if (profiles.length === 0) {
@@ -726,14 +735,15 @@ export function profileList(deps: ProfileListDeps = {
     ? deps.resolveExecutable()
     : null
   for (const p of profiles) {
+    let status: string
     if (p.oauthToken || p.type === "oauth-token") {
-      console.log(`  ${p.id.padEnd(20)} \x1b[32m✓ OAuth token\x1b[0m`)
-      continue
+      status = "\x1b[32m✓ OAuth token\x1b[0m"
+    } else {
+      const auth = deps.authStatus(p.claudeConfigDir ?? "", resolvedForAuth)
+      status = auth.loggedIn
+        ? `\x1b[32m✓ ${auth.email} (${auth.subscriptionType || "unknown"})\x1b[0m`
+        : "\x1b[31m✗ not logged in\x1b[0m"
     }
-    const auth = deps.authStatus(p.claudeConfigDir ?? "", resolvedForAuth)
-    const status = auth.loggedIn
-      ? `\x1b[32m✓ ${auth.email} (${auth.subscriptionType || "unknown"})\x1b[0m`
-      : "\x1b[31m✗ not logged in\x1b[0m"
     console.log(`  ${p.id.padEnd(20)} ${status}`)
     if (p.aliases && p.aliases.length > 0) {
       console.log(`  ${"".padEnd(20)} \x1b[90malso answers to: ${p.aliases.join(", ")}\x1b[0m`)
@@ -759,65 +769,36 @@ async function chatGptSignInOrExit(id: string, options: AuthLoginOptions): Promi
   if (!await signInChatGptSeat(id, { headless: options.headless }, seatContext())) process.exit(1)
 }
 
-/**
- * Pure: resolve which on-disk directories should be removed when this profile
- * is deleted. Browser-login profiles drop their explicit `claudeConfigDir`
- * (provided it lives under `profilesDir`); oauth-token profiles drop the
- * pinned isolation dir at `profilesDir/<id>` (created by the SDK during use,
- * not stored on the profile itself).
- *
- * Caller is responsible for the actual `rmSync` — this returns paths only.
- */
-export function dirsToRemoveOnProfileRemove(profile: ProfileConfig, profilesDir: string): string[] {
-  const dirs: string[] = []
-  if (profile.claudeConfigDir?.startsWith(profilesDir)) {
-    dirs.push(profile.claudeConfigDir)
-  }
-  if (profile.oauthToken || profile.type === "oauth-token") {
-    const isolationDir = join(profilesDir, profile.id)
-    if (!dirs.includes(isolationDir)) dirs.push(isolationDir)
-  }
-  return dirs
-}
-
 export async function profileRemove(id: string): Promise<void> {
   if (chatGptSeatNamed(id)) {
     if (!await removeChatGptSeat(id, seatContext())) process.exit(1)
     return
   }
-  try { withProfileConfigLockSync(profilesConfigFile(), () => profileRemoveLocked(id)) }
-  catch (error) {
-    console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
+  if (envBool("CREDENTIALS_READONLY")) {
+    console.error("\x1b[31m✗ MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials.\x1b[0m")
+    console.error("  Remove the profile from the instance that owns them.")
     process.exit(1)
   }
-}
 
-function profileRemoveLocked(id: string): void {
-  const profiles = readProfileConfigForUpdate(profilesConfigFile())
-  const idx = profiles.findIndex(p => p.id === id)
-  if (idx === -1) {
-    throw new Error(`Profile "${id}" not found.`)
+  const result = applyProfileRemove(id)
+  if (!result.ok) {
+    console.error(`\x1b[31m✗ ${result.error}\x1b[0m`)
+    if (result.hint) console.error(`  ${result.hint}`)
+    process.exit(1)
   }
 
-  const removed = profiles[idx]
-  if (!removed) {
-    throw new Error(`Profile "${id}" not found.`)
-  }
-  const dirsToRemove = dirsToRemoveOnProfileRemove(removed, configPath("profiles"))
-  profiles.splice(idx, 1)
-  saveProfileConfig(profiles)
-
-  for (const dir of dirsToRemove) {
-    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
-  }
+  if (getSetting("activeProfile") === id) setSetting("activeProfile", "")
 
   console.log(`\x1b[32m✓ Profile "${id}" removed.\x1b[0m`)
-  if (profiles.length > 0) {
-    printEnvHint(profiles)
+  for (const orphan of result.dirsOrphaned) {
+    console.error(`\x1b[33m⚠ Left behind ${orphan.dir}: ${orphan.reason}\x1b[0m`)
+  }
+  if (result.profiles.length > 0) {
+    printEnvHint(result.profiles)
   }
 }
 
-export function profileRename(from: string, to: string): void {
+export async function profileRename(from: string, to: string): Promise<void> {
   if (chatGptSeatNamed(from)) {
     if (!renameChatGptSeat(from, to, seatContext())) process.exit(1)
     return
@@ -853,7 +834,7 @@ export async function profileSwitch(id: string): Promise<void> {
   try {
     const res = await fetch(`http://${host}:${port}/profiles/active`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...(process.env.MERIDIAN_API_KEY ? { "x-api-key": process.env.MERIDIAN_API_KEY } : {}) },
       body: JSON.stringify({ profile: id }),
       signal: AbortSignal.timeout(5000),
     })
@@ -914,7 +895,7 @@ export async function profileLogin(id: string, options: AuthLoginOptions = {}): 
   }
 
   if (plan.action === "create") {
-    console.log(yellow(`⚠ Profile "${id}" does not exist yet — adding it first.`))
+    console.log(red(`⚠ Profile "${id}" does not exist yet — adding it first.`))
     console.log()
     await profileAdd(id, options)
     return
@@ -956,6 +937,7 @@ export async function profileLogin(id: string, options: AuthLoginOptions = {}): 
 
   const auth = getAuthStatus(profile.claudeConfigDir ?? "")
   if (auth.loggedIn) {
+    if (!options.headless) await recordCliLogin(profile.claudeConfigDir)
     console.log(`\x1b[32m✓ Profile "${id}" authenticated as ${auth.email}\x1b[0m`)
   }
 }

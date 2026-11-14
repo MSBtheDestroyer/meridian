@@ -6,10 +6,19 @@
  * profile's does.
  */
 import { getSetting, saveSettings, setSetting } from "../../settings"
+import { mergeRoutingExcludedProfiles, parseRoutingExcludedProfiles } from "../routingExclusions"
 import { CHATGPT_CREDITS_INHERIT, getChatGptFeatures, updateChatGptFeatures } from "./features"
 import { chatGptRemovalSettings, type ChatGptProfile, type ChatGptRenamePlan } from "./profiles"
 import { createChatGptProfileSurface } from "./profileSurface"
 import type { ChatGptCredentialSource } from "./source"
+
+/** Routing exclusions as configured: the operator's and the supervisor's, merged. */
+export function configuredRoutingExclusions(): string[] {
+  return mergeRoutingExcludedProfiles(
+    parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles")),
+    parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")),
+  )
+}
 
 /**
  * The profile surface as settings and the store describe it, with no usage
@@ -25,6 +34,8 @@ export function storedChatGptSurface(source: ChatGptCredentialSource, reserved: 
     names: () => getSetting("chatGptProfileNames"),
     aliases: () => getSetting("chatGptProfileAliases"),
     activeSeat: () => getSetting("chatGptActiveSeat"),
+    excluded: configuredRoutingExclusions,
+    held: () => parseRoutingExcludedProfiles(getSetting("routingHeldProfiles")),
     order: () => getSetting("profileOrder"),
     spent: () => undefined,
     freeSeatOrder: () => getChatGptFeatures().freeSeatOrder,
@@ -49,7 +60,10 @@ export function applyChatGptRemoval(
     chatGptProfileNames: getSetting("chatGptProfileNames"),
     chatGptProfileAliases: getSetting("chatGptProfileAliases"),
     profileOrder: getSetting("profileOrder"),
+    routingExcludedProfiles: getSetting("routingExcludedProfiles"),
+    routingManagedExcludedProfiles: getSetting("routingManagedExcludedProfiles"),
   }))
   if (getChatGptFeatures().seatCreditsPolicy[seat.seat]) updateChatGptFeatures({ seatCreditsPolicy: { [seat.seat]: CHATGPT_CREDITS_INHERIT } })
+  if (getChatGptFeatures().seatRenewalHours[seat.seat]) updateChatGptFeatures({ seatRenewalHours: { [seat.seat]: null } })
   if (pointer.moves) setSetting("chatGptActiveSeat", pointer.to)
 }

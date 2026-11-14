@@ -70,6 +70,10 @@ export const themeCss = `
     --chatgpt:        #74aa9c;
     --chatgpt-bright: #9ec3ba;
     --chatgpt-rgb:    116,170,156;
+    /* Text on a solid brand fill. Black clears 4.5:1 on every brand and
+       tint (lowest: --claude, 4.97:1); white would be 4.23:1 there and
+       2.63:1 on --chatgpt, and --bg 4.48:1 on --claude. */
+    --on-brand:       #000000;
   }
   /* Banner backsplash — the brand look: a gentle diagonal wash with soft
      blue (top-left) and violet (bottom-right) glows. Pages must not set
@@ -593,7 +597,11 @@ export const profileBarJs = `
     fetch('/health', { cache: 'no-store' }).then(function(r) { return r.json(); }).then(function(h) {
       if (generation !== healthGeneration) return;
       renderHost(h.hostname);
-      renderStatus(statusPillView(h));
+      var view = statusPillView(h);
+      // An instance serving ChatGPT names the backend that is failing in
+      // h.error; with nothing else to add, the status details show it.
+      if (!view.title && h.error) view = { tone: view.tone, text: view.text, title: view.text + ': ' + h.error, alert: view.alert };
+      renderStatus(view);
       renderBuild(h.build);
       if (h.backend === 'antigravity') {
         ['nav-telemetry','nav-profiles','nav-settings','nav-plugins'].forEach(function(id) { document.getElementById(id).hidden = true; });

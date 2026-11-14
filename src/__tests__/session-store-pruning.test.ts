@@ -10,7 +10,6 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { storeSharedSession, lookupSharedSession, clearSharedSessions, setSessionStoreDir } from "../proxy/sessionStore"
-import { setupStoreBackend, teardownStoreBackend } from "./fixtures/bookkeeping-store-backend"
 
 describe("Session store count-based pruning", () => {
   let tmpDir: string
@@ -26,13 +25,11 @@ describe("Session store count-based pruning", () => {
     dateSpy = spyOn(Date, "now").mockImplementation(() => now++)
     tmpDir = mkdtempSync(join(tmpdir(), "session-pruning-test-"))
     setSessionStoreDir(tmpDir)
-    setupStoreBackend(tmpDir)
     process.env.CLAUDE_PROXY_MAX_STORED_SESSIONS = "5"
     await clearSharedSessions()
   })
 
   afterEach(() => {
-    teardownStoreBackend()
     dateSpy.mockRestore()
     setSessionStoreDir(null)
     rmSync(tmpDir, { recursive: true, force: true })

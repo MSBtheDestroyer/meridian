@@ -277,10 +277,11 @@ function pricingForRequest(metric: RequestTokens, pricing: ModelPricing): ModelP
  * tier (contextTiers); overrides and other rates remain flat.
  */
 export function estimateRequestCostUsd(metric: RequestTokens, pricing: ModelPricing): number {
+  pricing = pricingForRequest(metric, pricing)
   const input = metric.inputTokens ?? 0
   const cacheRead = metric.cacheReadInputTokens ?? 0
   const cacheWrite = metric.cacheCreationInputTokens ?? 0
-  const rates = ratesForPrompt(pricingForRequest(metric, pricing), input + cacheRead + cacheWrite)
+  const rates = ratesForPrompt(pricing, input + cacheRead + cacheWrite)
   return (
     (input / 1e6) * rates.inputPerMTok +
     ((metric.outputTokens ?? 0) / 1e6) * rates.outputPerMTok +

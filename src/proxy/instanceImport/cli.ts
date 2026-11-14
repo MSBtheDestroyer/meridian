@@ -11,8 +11,8 @@ export const INSTANCE_IMPORT_USAGE = `Move one Meridian instance's ChatGPT seats
   meridian instance-import --from <config dir> --to <config dir> [--apply]
 
 Reads the source's ChatGPT store, settings (seat names, former names, the
-active seat, ChatGPT features), price overrides and telemetry, and adds
-them to the destination's. Without --apply it prints
+active seat, ChatGPT features), login records, price overrides and
+telemetry, and adds them to the destination's. Without --apply it prints
 what it would do and writes nothing.
 
 Every seat keeps its profile name and former names, so its requests and
