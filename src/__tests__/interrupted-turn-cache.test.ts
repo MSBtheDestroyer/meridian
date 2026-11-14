@@ -4,7 +4,7 @@
  * record binds to the exact write, and one request takes it.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, realpathSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -18,6 +18,7 @@ import {
 import { computeLineageHash } from "../proxy/session/lineage"
 import { interruptedTurnOf, type InterruptedTurn } from "../proxy/session/interruptedTurn"
 import { lookupSharedSessionResult, setSessionStoreDir, storeSharedSession } from "../proxy/sessionStore"
+import { commitRawSession, readCommittedSession, releaseStoreDatabase } from "./storeDatabaseHelpers"
 
 type Message = { role: string; content: any }
 
@@ -77,7 +78,11 @@ describe("markSessionInterrupted", () => {
   it("drops the in-memory copy that still carries the proof", async () => {
     await publishAndMark()
     // A store read failure falls back to memory; that copy must not resume.
-    writeFileSync(join(directory, "sessions.json"), "{ not json")
+    // The fork's store is sessions.db: an unreadable entry makes the read fail.
+    const entry = readCommittedSession(directory, KEY)
+    if (!entry) throw new Error("fixture mapping missing")
+    commitRawSession(directory, KEY, { ...entry, resumeContextHash: "not-a-digest" })
+    await releaseStoreDatabase(directory)
     const lineage = lookupSession(KEY, NEXT)
     expect(lineage.type).toBe("diverged")
   })

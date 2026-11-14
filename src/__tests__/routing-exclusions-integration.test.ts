@@ -6,6 +6,7 @@ import { assistantMessage, withMockSdkSessionId } from "./helpers"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
+import { installModelsMock } from "./modelsMock"
 
 type QueryCall = {
   readonly oauthToken?: string
@@ -54,13 +55,10 @@ installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
-// mock.module is process-global and runs during the load phase, so a partial
-// module here becomes every other file's models module for the whole run.
-// Spread the real one and override only what must not reach the host: the auth
-// probe and the `claude` executable lookup.
-const actualModels = await import("../proxy/models")
-mock.module("../proxy/models", () => ({
-  ...actualModels,
+// Through the shared models dispatcher: a mock.module of ../proxy/models here
+// would replace it for every later file in the run. The auth probe must not
+// reach the host.
+installModelsMock(() => ({
   getClaudeAuthStatusAsync: async () => ({ loggedIn: true, subscriptionType: "max" }),
 }))
 

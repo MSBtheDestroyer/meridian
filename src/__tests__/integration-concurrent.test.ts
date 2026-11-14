@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test"
 import { AsyncLocalStorage } from "node:async_hooks"
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk"
@@ -110,7 +110,9 @@ type OwnedResource = {
 }
 function readOwnedResources(): OwnedResource[] {
   expect(getSessionStoreDir()).toBe(sessionDirectory)
-  // The fork keeps the transcript lifecycle journal in sessions.db.
+  // The fork keeps the transcript lifecycle journal in sessions.db, which the
+  // first request creates.
+  if (!existsSync(join(sessionDirectory, "sessions.db"))) return []
   const resources = Object.values(committedLifecycleResources(sessionDirectory)) as OwnedResource[]
   for (const resource of resources) {
     expect(resource.locator.configDir).toBe(claudeDirectory)
