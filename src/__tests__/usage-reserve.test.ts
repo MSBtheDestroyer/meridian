@@ -4,7 +4,6 @@
  */
 import { describe, expect, it } from "bun:test"
 import {
-  allHeldMessage,
   describeUsageReserveHold,
   newestClaudeWindows,
   parseUsageReserves,
@@ -152,10 +151,5 @@ describe("what a card and a client are told", () => {
     expect(response.status).toBe(429)
     expect(response.headers.get("retry-after")).toBe("90")
     expect(await response.json()).toEqual({ type: "error", error: { type: "rate_limit_error", message: "held", retry_after: 90 } })
-  })
-
-  it("names every held profile in the refusal", () => {
-    const hold = usageReserveHold(at(0, null, 0.95, 0.4), FLAT_WEEK, NOW)!
-    expect(allHeldMessage(new Map([["of-n-p20-gpt", hold]]))).toContain("of-n-p20-gpt (weekly at 95%, capped at 95%)")
   })
 })

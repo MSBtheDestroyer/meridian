@@ -190,12 +190,10 @@ import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
 import { filterEligibleProfileIds, mergeRoutingExcludedProfiles, parseRoutingExcludedProfiles } from "./routingExclusions"
 import { canonicalRoutingExcludedProfileIds, evaluateRoutingProfileAccess, noEligibleProfilesResponse, profileExcludedResponse, profileHeldResponse, replacementForExcludedActive } from "./routingExclusionRuntime"
 import {
-  allHeldMessage,
   describeUsageReserveHold,
   newestClaudeWindows,
   parseUsageReserves,
   readUsageReserves,
-  soonestOpening,
   USAGE_RESERVE_READING_MAX_AGE_MS,
   usageReserveHold,
   usageReserveResponse,
@@ -239,7 +237,16 @@ import {
   type WeeklyUsageReading,
 } from "./routing"
 import { diagnoseLimit, type LimitDiagnosis } from "./limitDetection"
-import { SpentStore, FailoverEventLog } from "./profileHealth"
+import {
+  SpentStore,
+  FailoverEventLog,
+  earliestOpening,
+  noRoutableAccountError,
+  noRoutableSummary,
+  poolEventProfiles,
+  poolEventResetAt,
+  type NoRoutableProfile,
+} from "./profileHealth"
 import {
   retryAfterSeconds,
   retryAfterHeaders,
@@ -813,6 +820,8 @@ type PriorityDispatchOptions = {
   readonly routing?: RoutingMode
   /** The requested model's tier: a per-model weekly bench skips a profile only for this family. */
   readonly modelFamily: ClaudeModelFamily
+  /** Why each profile cannot take this request, read once every candidate has refused. */
+  readonly unroutableProfiles: () => NoRoutableProfile[]
   readonly turnWatchdogSignal?: AbortSignal
   readonly requestAbortLink?: RequestAbortLink
   readonly publicationTurn?: {
@@ -2046,6 +2055,100 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return diagnosis
   }
 
+  /**
+   * Why each Claude profile cannot take a request that no account could take.
+   * A profile with nothing against it is left out: it was outside this
+   * request's candidates (a retained route), not unavailable.
+   */
+  function unroutableProfiles(input: {
+    modelFamily: ClaudeModelFamily
+    reserveHold: (id: string) => UsageReserveState | null
+    weeklyHolds?: ReadonlyMap<string, WeeklyReserveHold>
+    extraUsageOff?: (id: string) => boolean
+  }): NoRoutableProfile[] {
+    const excluded = new Set(routingExcludedProfileIds())
+    const held = new Set(routingHeldProfileIds())
+    const now = Date.now()
+    const benchedUntil = new Map(priorityExhaustion.snapshot().map(e => [e.id, e.until]))
+    const modelBenchedUntil = new Map(priorityExhaustion.modelSnapshot()
+      .filter(e => e.modelFamily === input.modelFamily)
+      .map(e => [e.id, e.until]))
+    return getEffectiveProfiles(finalConfig.profiles).flatMap(({ id }): NoRoutableProfile[] => {
+      if (excluded.has(id)) return [{ id, reason: "excluded", resetsAt: null }]
+      if (held.has(id)) return [{ id, reason: "held", resetsAt: null }]
+      const reserve = input.reserveHold(id)
+      if (reserve) return [{ id, reason: "reserve_held", resetsAt: reserve.opensAt }]
+      const weekly = input.weeklyHolds?.get(id)
+      if (weekly) return [{ id, reason: "weekly_held", resetsAt: weekly.until ?? null }]
+      const spentUntil = benchedUntil.get(id)
+      if (spentUntil !== undefined) return [{ id, reason: "spent", resetsAt: spentUntil }]
+      const modelUntil = modelBenchedUntil.get(id)
+      if (modelUntil !== undefined) return [{ id, reason: "model_benched", resetsAt: modelUntil }]
+      if (input.extraUsageOff?.(id)) return [{ id, reason: "extra_usage_off", resetsAt: earliestPlanReset([id], now) }]
+      return []
+    })
+  }
+
+  /**
+   * Open or carry the pool incident for a request no Claude account could
+   * take, and build the error the client gets for it - the same `error`
+   * object whether it travels as a 429 body or an SSE error frame.
+   */
+  function noRoutableAccount(input: {
+    requestId: string
+    sessionKey: string | null
+    routing: RoutingMode
+    lead: string
+    reason: string
+    lastTried: string | null
+    profiles: NoRoutableProfile[]
+  }): { error: Record<string, unknown>; retryAfter: number | null } {
+    const spent = input.lastTried ? spentProfiles.get(input.lastTried) : undefined
+    const event = failoverEvents.poolExhausted({
+      profile: input.lastTried ?? input.profiles[0]?.id ?? "",
+      servedBy: null,
+      reason: input.reason,
+      routing: input.routing,
+      sessionKey: input.sessionKey,
+      internalHop: false,
+      until: spent?.until ?? null,
+      limit: spent?.diagnosis ?? null,
+      requestId: input.requestId,
+      profiles: poolEventProfiles(input.profiles),
+      resetAt: poolEventResetAt(input.profiles),
+    })
+    claudeLog("routing.no_routable_account", {
+      incidentId: event.incidentId,
+      profiles: input.profiles.map(p => `${p.id}:${p.reason}`),
+    })
+    const retryAfter = retryAfterSeconds({ status: 429, resetAtMs: earliestOpening(input.profiles) })
+    return {
+      error: {
+        ...noRoutableAccountError({
+          summary: noRoutableSummary(input.lead, input.profiles),
+          incidentId: event.incidentId,
+          requestId: input.requestId,
+          profiles: input.profiles,
+        }),
+        ...retryAfterBodyFields(retryAfter),
+      },
+      retryAfter,
+    }
+  }
+
+  /** A Claude account answered work: the pool has capacity again, so an open incident closes. */
+  function noteClaudeServed(profileId: string, requestId: string, routing: RoutingMode | undefined): void {
+    const recovered = failoverEvents.served({ profile: profileId, requestId, routing: routing ?? "active" })
+    if (recovered) claudeLog("routing.pool_recovered", { incidentId: recovered.incidentId, profile: profileId })
+  }
+
+  function noRoutableAccountResponse(refusal: { error: Record<string, unknown>; retryAfter: number | null }): Response {
+    return new Response(JSON.stringify({ type: "error", error: refusal.error }), {
+      status: 429,
+      headers: { "content-type": "application/json", ...retryAfterHeaders(refusal.retryAfter) },
+    })
+  }
+
   /** Tier 2: the authoritative per-account reset from Anthropic's usage
    *  endpoint. Deliberately fire-and-forget — the failover path has already
    *  burned one failed request and must not also wait on a network call.
@@ -2306,6 +2409,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       previous: string | null
       previousReason: string
       earliestPoolReset: number | null
+      quotaRefused: boolean
       sharedQuota: Set<string>
     },
   ): Promise<Response> {
@@ -2336,7 +2440,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         }
         let lastInner: Response | null = null
         try {
-          let { lastError, previous, previousReason, earliestPoolReset } = start
+          let { lastError, previous, previousReason, earliestPoolReset, quotaRefused } = start
           for (let attempt = start.attempt; attempt < options.candidateIds.length; attempt++) {
             const candidate = options.candidateIds[attempt]!
             const handed = attempt === start.attempt
@@ -2362,6 +2466,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               lastError = verdict.errorPayload
               previous = candidate
               previousReason = reason
+              quotaRefused ||= isQuotaRefusal(reason)
               if (exposure.committed) {
                 // The SDK may already have emitted content, structured
                 // output, or a tool side effect. Never replay that attempt on
@@ -2413,35 +2518,29 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             }
             return
           }
-          if (previous && !isCancelled()) {
-            failoverEvents.append({
-              kind: "pool_exhausted",
-              profile: previous,
-              servedBy: null,
-              reason: "rate_limit_error",
-              routing: options.routing ?? "priority",
-              sessionKey: options.sessionKey,
-              internalHop: false,
-              until: spentProfiles.get(previous)?.until ?? null,
-              limit: spentProfiles.get(previous)?.diagnosis ?? null,
-            })
-          }
+          const refusal = previous && !isCancelled()
+            ? noRoutableAccount({
+                requestId: options.requestMeta.requestId,
+                sessionKey: options.sessionKey,
+                routing: options.routing ?? "priority",
+                lead: "every candidate refused",
+                reason: "rate_limit_error",
+                lastTried: previous,
+                profiles: options.unroutableProfiles(),
+              })
+            : null
           // Every candidate ended before exposure: release the exact durable
-          // claim, then surface the LAST tried profile's error once — headers
-          // are already out, so the terminal verdict travels in the stream.
-          // Quota waits name the pool's earliest opening, just as on JSON.
+          // claim, then surface the verdict once — headers are already out,
+          // so it travels in the stream. A pool a quota refusal spoke for is
+          // the no-routable-account error, with exactly the fields of the
+          // JSON body; one only billing refusals ran out keeps the last tried
+          // profile's own error, since waiting will not reopen it.
           if (!isCancelled() && !(await settle("release"))) {
             await enqueue(unavailableFrame())
             return
           }
           if (!isCancelled() && lastError !== null) {
-            if (isQuotaRefusal(previousReason) && typeof lastError === "object") {
-              const envelope = (lastError as { error?: unknown }).error
-              if (envelope !== null && typeof envelope === "object") {
-                Object.assign(envelope, retryAfterBodyFields(retryAfterSeconds({ status: 429, resetAtMs: earliestPoolReset })))
-              }
-            }
-            await enqueue(errorFrame(lastError))
+            await enqueue(errorFrame(refusal && quotaRefused ? { type: "error", error: refusal.error } : lastError))
           }
         } catch (error) {
           failedUnexpectedly = true
@@ -2547,6 +2646,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // frees up, not the last one tried. Tracked across the loop so the caller's
     // Retry-After names the pool's earliest opening (#901).
     let earliestPoolReset: number | null = null
+    let quotaRefused = false
     // Profiles a refusal in THIS request already spoke for: one account under
     // another name, so asking it again only repeats the answer.
     const sharedQuota = new Set<string>()
@@ -2558,7 +2658,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // tried inside the stream.
       if (options.wantsStream && isEventStream(inner)) {
         return streamPriorityDispatch(options, attemptOwnerToken, settleAttempt, {
-          attempt, inner, exposure, lastError, previous, previousReason, earliestPoolReset, sharedQuota,
+          attempt, inner, exposure, lastError, previous, previousReason, earliestPoolReset, quotaRefused, sharedQuota,
         })
       }
       const sniffed = await sniffAccountFailure(inner)
@@ -2605,6 +2705,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       lastStatus = inner.status
       previous = candidate
       previousReason = reason
+      quotaRefused ||= isQuotaRefusal(reason)
       if (exposure.committed) {
         // The SDK may already have emitted content, structured output, or a
         // tool side effect even though a non-stream handler ultimately returned
@@ -2614,24 +2715,24 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         return sniffed.response
       }
     }
-    if (previous) {
-      failoverEvents.append({
-        kind: "pool_exhausted",
-        profile: previous,
-        servedBy: null,
-        reason: "rate_limit_error",
-        routing: options.routing ?? "priority",
-        sessionKey: options.sessionKey,
-        internalHop: false,
-        until: spentProfiles.get(previous)?.until ?? null,
-        limit: spentProfiles.get(previous)?.diagnosis ?? null,
-      })
-    }
+    const refusal = previous
+      ? noRoutableAccount({
+          requestId: options.requestMeta.requestId,
+          sessionKey: options.sessionKey,
+          routing: options.routing ?? "priority",
+          lead: "every candidate refused",
+          reason: "rate_limit_error",
+          lastTried: previous,
+          profiles: options.unroutableProfiles(),
+        })
+      : null
     // Every candidate ended before exposure. Release the exact durable claim
     // before the client can retry; failure stays fail-closed and never advances
     // to another account or returns a retryable account-shaped response.
     if (!(await settleAttempt("release"))) return unavailableAttemptResponse()
-    // Surface the LAST tried profile's error (owner decision).
+    if (refusal && quotaRefused) return noRoutableAccountResponse(refusal)
+    // Only billing refusals ran the pool out: surface the LAST tried profile's
+    // error (owner decision), whose status is not one a client retries.
     // The wait belongs to the POOL, not to the last account tried: the caller
     // can proceed as soon as ANY candidate frees up. `earliestPoolReset` is a
     // real observed boundary when a quota refusal supplied one and the
@@ -3155,6 +3256,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             const benched = (id: string) => priorityExhaustion.isExhausted(id, modelFamily)
             const unavailable = (id: string) => benched(id) || weeklyHolds.has(id) || heldBy(id) !== null
             const extraUsagePolicy = getClaudeExtraUsagePolicy(process.env.MERIDIAN_CLAUDE_EXTRA_USAGE ?? getSetting("claudeExtraUsage"))
+            const extraUsageOff = (id: string) => extraUsagePolicy === "never" && profileDrawsExtraUsage(id)
+            const describeUnroutable = () => unroutableProfiles({ modelFamily, reserveHold: heldBy, weeklyHolds, extraUsageOff })
             const extraUsage = orderForExtraUsage(
               allReserveHeld ? eligibleOrder : routable,
               extraUsagePolicy,
@@ -3302,27 +3405,20 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   error: { type: "overloaded_error", message: "Durable priority routing state is unavailable" },
                 }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
               }
+              const refuseUnsent = (lead: string, reason: string): Response => noRoutableAccountResponse(noRoutableAccount({
+                requestId: requestMeta.requestId,
+                sessionKey,
+                routing: routingMode,
+                lead,
+                reason,
+                lastTried: null,
+                profiles: describeUnroutable(),
+              }))
               if (allReserveHeld && retainOnlyProfile === undefined) {
-                const reopenings = [...weeklyHolds.values()]
-                  .map(h => h.until)
-                  .filter((t): t is number => typeof t === "number")
-                const retryAfter = retryAfterSeconds({
-                  status: 429,
-                  resetAtMs: reopenings.length > 0 ? Math.min(...reopenings) : null,
-                })
-                return c.json({
-                  type: "error",
-                  error: { type: "rate_limit_error", message: "Every profile is holding its weekly reserve" },
-                  ...retryAfterBodyFields(retryAfter),
-                }, 429, retryAfterHeaders(retryAfter))
+                return refuseUnsent("every profile is holding its weekly reserve", "weekly_held")
               }
               if (extraUsage.refused && retainOnlyProfile === undefined) {
-                const retryAfter = retryAfterSeconds({ status: 429, resetAtMs: earliestPlanReset(eligibleOrder, Date.now()) })
-                return c.json({
-                  type: "error",
-                  error: { type: "rate_limit_error", message: "Every profile's plan usage is spent and Extra Usage is off for this instance" },
-                  ...retryAfterBodyFields(retryAfter),
-                }, 429, retryAfterHeaders(retryAfter))
+                return refuseUnsent("every profile's plan usage is spent and Extra Usage is off for this instance", "extra_usage_off")
               }
               let candidates: string[]
               if (routingMode === ACTIVE_PRIORITY) {
@@ -3366,7 +3462,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 claudeLog("routing.usage_reserve_refused", { held: [...holds.keys()], retained: retainOnlyProfile ?? null })
                 return retainedHold && retainOnlyProfile !== undefined
                   ? usageReserveResponse(`${heldMessage(retainOnlyProfile, retainedHold)}.`, retainedHold.opensAt, Date.now())
-                  : usageReserveResponse(allHeldMessage(holds), soonestOpening([...holds.values()]), Date.now())
+                  : refuseUnsent("every eligible profile is held back by its usage reserve", "reserve_held")
               }
               if (serving.length < candidates.length) {
                 claudeLog("routing.usage_reserve", { held: candidates.filter(id => !serving.includes(id)) })
@@ -3387,6 +3483,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 durableRoute,
                 routing: routingMode,
                 modelFamily,
+                unroutableProfiles: describeUnroutable,
               })
             }
           }
@@ -3442,7 +3539,15 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             const next = unheld.find(id => !priorityExhaustion.isExhausted(id, modelFamily)) ?? unheld[0]
             if (next === undefined) {
               claudeLog("routing.usage_reserve_refused", { held: [...holds.keys()], pinned: false })
-              return usageReserveResponse(allHeldMessage(holds), soonestOpening([...holds.values()]), now)
+              return noRoutableAccountResponse(noRoutableAccount({
+                requestId: requestMeta.requestId,
+                sessionKey: null,
+                routing: routingMode,
+                lead: "every eligible profile is held back by its usage reserve",
+                reason: "reserve_held",
+                lastTried: null,
+                profiles: unroutableProfiles({ modelFamily, reserveHold: id => holds.get(id) ?? null }),
+              }))
             }
             claudeLog("routing.usage_reserve", { from: profile.id, to: next })
             profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, next, stickyOptions)
@@ -6314,6 +6419,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             isResume,
             passthrough
           )
+          if (!warmProfileId) noteClaudeServed(profile.id, requestMeta.requestId, attributedRoutingMode)
           telemetryStore.record({
             requestId: requestMeta.requestId,
             timestamp: Date.now(),
@@ -8530,6 +8636,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   isResume,
                   passthrough
                 )
+                if (!warmProfileId) noteClaudeServed(profile.id, requestMeta.requestId, attributedRoutingMode)
                 telemetryStore.record({
                   requestId: requestMeta.requestId,
                   timestamp: Date.now(),
@@ -9077,6 +9184,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 if (lastUsage) logUsage(requestMeta.requestId, lastUsage)
                 const recoverTotalMs = Date.now() - requestStartAt
                 const recoverQueueWaitMs = totalQueueWaitMs(requestMeta)
+                if (!warmProfileId) noteClaudeServed(profile.id, requestMeta.requestId, attributedRoutingMode)
                 telemetryStore.record({
                   requestId: requestMeta.requestId,
                   timestamp: Date.now(),
@@ -9227,6 +9335,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 if (lastUsage) logUsage(requestMeta.requestId, lastUsage)
                 const cappedTotalMs = Date.now() - requestStartAt
                 const cappedQueueWaitMs = totalQueueWaitMs(requestMeta)
+                if (!warmProfileId) noteClaudeServed(profile.id, requestMeta.requestId, attributedRoutingMode)
                 telemetryStore.record({
                   requestId: requestMeta.requestId,
                   timestamp: Date.now(),

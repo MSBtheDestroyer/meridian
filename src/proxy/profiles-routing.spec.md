@@ -56,7 +56,7 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   unlisted profiles go last — a typo must never change routing.
 - **Priority keeps cache affinity.** An existing session stays on a healthy
   account (prompt cache is per account); each profile is tried at most once per
-  request; an exhausted pool surfaces the last-tried account's error; only new
+  request; an exhausted pool answers `no_routable_account` (below); only new
   conversations drain back to a recovered preferred account
   (`priorityFailback: next-user-turn` additionally allows an attested human turn
   to fail back).
@@ -108,6 +108,34 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   work keeps its route, as with the weekly reserve. Cache-keepalive beats
   skip such accounts under every mode. The three words match the ChatGPT
   Codex credits policy.
+- **A pool no Claude account can serve answers `no_routable_account`.** Under
+  pool routing, when every candidate refused before exposure with at least one
+  quota refusal among them, or when nothing is sent because every candidate is
+  held (usage reserve, weekly reserve, Extra Usage `never`), the client gets
+  `rate_limit_error` with `code: "no_routable_account"`, a message starting
+  `No routable Claude account: ` and ending `(incident <id>)`, `reset_at` (the
+  soonest profile reset, ISO, or null), `incident_id`, `request_id` and
+  `profiles[{id, reason, resets_at}]`: 429 with `Retry-After` before the
+  stream, the same `error` object in the SSE error frame after it. The
+  incident is the message's last token because client SDKs keep only `type`
+  and `message` of a stream error. `reason` is `excluded`, `held`,
+  `reserve_held`, `weekly_held`, `spent`, `model_benched` or
+  `extra_usage_off`, first match in that order; `logged_out` is reserved and
+  no skip path produces it, since an auth failure is not a failover error. A
+  profile with none of them (outside a retained route's single candidate) is
+  left out. Unpinned `active`/`sticky` work every eligible profile of which is
+  reserve-held gets the same error; an account's own refusal in those modes,
+  a retained route's own hold, and pins keep their own errors. A pool only
+  billing refusals ran out keeps the last-tried account's error and status:
+  waiting will not reopen it, so it is not a rate limit.
+- **One incident per outage.** The first `pool_exhausted` event on
+  `/profiles/events` since a Claude account last served work opens an
+  incident `inc_<epoch ms>_<seq>` (that event's own `at` and `seq`); every
+  later one carries it, with `requestId`, `profiles[{id, reason, resetsAt}]`
+  and `resetAt` (ISO) beside the existing fields, until the next Claude
+  request served by any account appends `pool_recovered` with the same
+  `incidentId` and closes it. Warm hops do not close it. In memory only, like
+  the event ring.
 - **Cooldowns are layered:** Anthropic's named reset first, then the profile's
   own observed window (5-hour or 7-day, capped per window), then a 10-minute
   default. An OAuth-usage refinement may only *extend* a cooldown, runs only at

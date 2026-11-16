@@ -3893,9 +3893,10 @@ describe("priority weekly reserve", () => {
     const retryAfter = Number(res.headers.get("retry-after"))
     expect(retryAfter).toBeGreaterThan(55 * 60)
     expect(retryAfter).toBeLessThanOrEqual(60 * 60)
-    const body = await res.json() as { error: { type: string }; retry_after?: number }
+    const body = await res.json() as { error: { type: string; code?: string; retry_after?: number } }
     expect(body.error.type).toBe("rate_limit_error")
-    expect(body.retry_after).toBe(retryAfter)
+    expect(body.error.code).toBe("no_routable_account")
+    expect(body.error.retry_after).toBe(retryAfter)
     expect(capturedEnvs).toHaveLength(0)
   }, 20_000)
 

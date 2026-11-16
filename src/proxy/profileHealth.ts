@@ -121,9 +121,37 @@ export class SpentStore {
  *                    exhausted account is visible even when nothing failed over.
  * `failover`       - a request was re-issued on another account and succeeded,
  *                    so the client never saw the refusal.
- * `pool_exhausted` - every candidate refused; the client got the error.
+ * `pool_exhausted` - no Claude account could take the request; the client got
+ *                    the error. Opens or carries the pool incident.
+ * `pool_recovered` - a Claude account served a request again; closes the
+ *                    incident the last `pool_exhausted` carried.
  */
-export type FailoverEventKind = "refused" | "failover" | "pool_exhausted"
+export type FailoverEventKind = "refused" | "failover" | "pool_exhausted" | "pool_recovered"
+
+/** Why a profile could not take a request nobody could take. */
+export type NoRoutableReason =
+  | "spent"
+  | "reserve_held"
+  | "weekly_held"
+  | "model_benched"
+  | "excluded"
+  | "held"
+  | "extra_usage_off"
+  | "logged_out"
+
+export interface NoRoutableProfile {
+  id: string
+  reason: NoRoutableReason
+  /** When this profile is expected to take work again (epoch ms), when known. */
+  resetsAt: number | null
+}
+
+/** A profile on a `pool_exhausted` event: the error body's entry, camelCase. */
+export interface PoolEventProfile {
+  id: string
+  reason: NoRoutableReason
+  resetsAt: string | null
+}
 
 export interface FailoverEvent {
   /** Monotonic, starts at 1, never reused. The `since` cursor. */
@@ -148,7 +176,17 @@ export interface FailoverEvent {
   limit: LimitDiagnosis | null
   /** Which provider's account this is; absent means Claude. */
   provider?: "chatgpt"
+  /** The pool incident, on `pool_exhausted` and `pool_recovered`. */
+  incidentId?: string
+  /** Meridian's id of the request that exhausted the pool, or that the pool served again. */
+  requestId?: string | null
+  /** Every profile that could not take the request and why, on `pool_exhausted`. */
+  profiles?: PoolEventProfile[]
+  /** ISO time of the pool's earliest opening, on `pool_exhausted`; null when none is known. */
+  resetAt?: string | null
 }
+
+export type PoolExhaustedEvent = FailoverEvent & { kind: "pool_exhausted"; incidentId: string }
 
 export interface FailoverEventPage {
   events: FailoverEvent[]
@@ -182,6 +220,7 @@ const DEFAULT_PAGE_LIMIT = 100
 export class FailoverEventLog {
   private readonly events: FailoverEvent[] = []
   private seq = 0
+  private openIncident: string | null = null
 
   constructor(
     private readonly capacity: number = DEFAULT_EVENT_CAPACITY,
@@ -193,6 +232,37 @@ export class FailoverEventLog {
     this.events.push(stored)
     if (this.events.length > this.capacity) this.events.splice(0, this.events.length - this.capacity)
     return stored
+  }
+
+  /**
+   * A Claude request no account could take. The first one since a request was
+   * last served opens an incident named for its own time and seq; every later
+   * one carries that id until `served` closes it.
+   */
+  poolExhausted(event: Omit<FailoverEvent, "seq" | "at" | "kind" | "incidentId">): PoolExhaustedEvent {
+    const at = this.now()
+    this.openIncident ??= `inc_${at}_${this.seq + 1}`
+    return this.append({ ...event, kind: "pool_exhausted", incidentId: this.openIncident, at }) as PoolExhaustedEvent
+  }
+
+  /** A Claude account served a request: closes the open incident, if any, with `pool_recovered`. */
+  served(served: { profile: string; requestId: string; routing: string }): FailoverEvent | null {
+    const incidentId = this.openIncident
+    if (incidentId === null) return null
+    this.openIncident = null
+    return this.append({
+      kind: "pool_recovered",
+      profile: served.profile,
+      servedBy: served.profile,
+      reason: "served",
+      routing: served.routing,
+      sessionKey: null,
+      internalHop: false,
+      until: null,
+      limit: null,
+      incidentId,
+      requestId: served.requestId,
+    })
   }
 
   /**
@@ -220,5 +290,53 @@ export class FailoverEventLog {
   clear(): void {
     this.events.length = 0
     this.seq = 0
+    this.openIncident = null
   }
+}
+
+export const NO_ROUTABLE_ACCOUNT_CODE = "no_routable_account"
+export const NO_ROUTABLE_ACCOUNT_PREFIX = "No routable Claude account: "
+
+const isoOrNull = (at: number | null): string | null => at === null ? null : new Date(at).toISOString()
+
+/** The pool's earliest opening: the soonest profile that names one. */
+export function earliestOpening(profiles: readonly NoRoutableProfile[]): number | null {
+  const times = profiles.map(p => p.resetsAt).filter((at): at is number => at !== null)
+  return times.length > 0 ? Math.min(...times) : null
+}
+
+export function poolEventProfiles(profiles: readonly NoRoutableProfile[]): PoolEventProfile[] {
+  return profiles.map(p => ({ id: p.id, reason: p.reason, resetsAt: isoOrNull(p.resetsAt) }))
+}
+
+export function poolEventResetAt(profiles: readonly NoRoutableProfile[]): string | null {
+  return isoOrNull(earliestOpening(profiles))
+}
+
+/**
+ * The `error` object of a request no Claude account could take, identical on
+ * the 429 body and the SSE error frame. The incident is also the message's
+ * last token, because a client SDK that keeps only `type` and `message` of a
+ * stream error still has to find it.
+ */
+export function noRoutableAccountError(input: {
+  summary: string
+  incidentId: string
+  requestId: string
+  profiles: readonly NoRoutableProfile[]
+}): Record<string, unknown> {
+  return {
+    type: "rate_limit_error",
+    code: NO_ROUTABLE_ACCOUNT_CODE,
+    message: `${NO_ROUTABLE_ACCOUNT_PREFIX}${input.summary} (incident ${input.incidentId})`,
+    reset_at: poolEventResetAt(input.profiles),
+    incident_id: input.incidentId,
+    request_id: input.requestId,
+    profiles: input.profiles.map(p => ({ id: p.id, reason: p.reason, resets_at: isoOrNull(p.resetsAt) })),
+  }
+}
+
+/** `every candidate refused (work spent, personal reserve_held)` */
+export function noRoutableSummary(lead: string, profiles: readonly NoRoutableProfile[]): string {
+  return profiles.length === 0 ? lead : `${lead} (${profiles.map(p => `${p.id} ${p.reason}`).join(", ")})`
 }
