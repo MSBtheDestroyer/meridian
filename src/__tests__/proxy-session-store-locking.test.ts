@@ -14,6 +14,7 @@ import {
 import { holdWriteLock, readCommittedSession, storeIntegrity } from "./storeDatabaseHelpers"
 
 const modulePath = join(import.meta.dir, "../proxy/sessionStore.ts")
+const storeDatabasePath = join(import.meta.dir, "../proxy/session/storeDatabase.ts")
 
 /** The error a promise rejects with. `expect(promise).rejects` cannot wait for
  *  a store write under bun test (see session/storeDatabase.ts). */
@@ -239,7 +240,7 @@ describe("Shared session store locking", () => {
   // A slow disk is imitated by delaying every fsync of a child process through
   // LD_PRELOAD, which needs Linux and a C compiler.
   const compiler = process.platform === "linux" ? Bun.which("cc") : null
-  it.skipIf(!compiler)("keeps serving the event loop while COMMIT waits for a slow fsync", async () => {
+  it.skipIf(!compiler)("commits without fsync, and keeps serving the event loop while a durable COMMIT waits for one", async () => {
     const shimSource = join(tmpDir, "slow-fsync.c")
     const shim = join(tmpDir, "slow-fsync.so")
     writeFileSync(shimSource, `
@@ -259,17 +260,26 @@ describe("Shared session store locking", () => {
       cmd: [process.execPath, "-e", `
         import { monitorEventLoopDelay } from "node:perf_hooks"
         import { storeSharedSession } from ${JSON.stringify(modulePath)}
+        import { openStoreDatabase } from ${JSON.stringify(storeDatabasePath)}
         await storeSharedSession("warm", "claude-warm")
+        let started = performance.now()
+        for (let i = 0; i < 3; i++) await storeSharedSession("slow-" + i, "claude-slow-" + i)
+        const ordinaryMs = performance.now() - started
+        const database = openStoreDatabase(process.env.MERIDIAN_SESSION_DIR, 10_000)
         const delay = monitorEventLoopDelay({ resolution: 1 })
         let ticks = 0
         const heartbeat = setInterval(() => { ticks++ }, 5)
         delay.enable()
-        const started = performance.now()
-        for (let i = 0; i < 3; i++) await storeSharedSession("slow-" + i, "claude-slow-" + i)
+        started = performance.now()
+        for (let i = 0; i < 3; i++) await database.transact({
+          lockWaitMs: 10_000,
+          durable: true,
+          build: () => ({ ops: [["UPDATE store_info SET imported_json_at = ? WHERE id = 1", [i + 1]]], result: undefined }),
+        })
         const writesMs = performance.now() - started
         delay.disable()
         clearInterval(heartbeat)
-        console.log(JSON.stringify({ writesMs, ticks, maxDelayMs: delay.max / 1e6 }))
+        console.log(JSON.stringify({ ordinaryMs, writesMs, ticks, maxDelayMs: delay.max / 1e6 }))
       `],
       env: { ...process.env, MERIDIAN_SESSION_DIR: storeDir, LD_PRELOAD: shim, SLOW_FSYNC_MS: "250" },
       stdout: "pipe",
@@ -282,8 +292,10 @@ describe("Shared session store locking", () => {
     ])
     expect(stderr).toBe("")
     expect(exitCode).toBe(0)
-    const measured = JSON.parse(stdout) as { writesMs: number; ticks: number; maxDelayMs: number }
-    // Every write's commit waited for the delayed fsync, and the loop kept running.
+    const measured = JSON.parse(stdout) as { ordinaryMs: number; writesMs: number; ticks: number; maxDelayMs: number }
+    // No ordinary commit waited for the delayed fsync. Every durable one did,
+    // and the loop kept running.
+    expect(measured.ordinaryMs).toBeLessThan(250)
     expect(measured.writesMs).toBeGreaterThanOrEqual(3 * 250)
     expect(measured.ticks).toBeGreaterThanOrEqual(Math.floor(measured.writesMs / 5 / 2))
     expect(measured.maxDelayMs).toBeLessThan(100)

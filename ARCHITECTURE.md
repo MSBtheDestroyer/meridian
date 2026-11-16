@@ -713,11 +713,13 @@ E2E tests (`E2E.md`) should be run before releases or after major refactors.
 
 Publication leases use the existing unarmed active-lease representation with `purpose: "publication"`. Older collectors also retain them while the owner process is alive; exact process-incarnation death permits recovery. They do not count as exclusive SDK writers, and abandoning publication never removes an actual writer lease. Published transcripts are retained by their durable mappings and become collectible after eviction.
 
+Files that only matter while the process that wrote them lives are not fsynced: the `session-gc.json.lock` candidate, turn locks (`session/crossProcessTurnCoordinator.ts`), SDK process gates and deletion gates. Every process reads them through the page cache, so a process crash loses nothing; an OS crash or power loss can leave one without its data, and then its writer is dead too. Stale recovery reclaims a lock whose owner it cannot parse once the lock predates the current boot (`predatesBoot` in `session/processIncarnation.ts`). Recovery claims stay fsynced, since an unreadable claim would block recovery after a reboot as well. The `sessions.db` writer commits with `synchronous=NORMAL`: in WAL mode a power loss can roll the store back to an earlier commit, never a torn one, while a process crash loses nothing and every compare-and-swap still sees every commit. The GC deletion claim is the one commit synced to disk (`durable` in `session/storeDatabase.ts`), so a rollback cannot restore a mapping to a transcript that was already deleted.
+
 An SDK writer lease is released once its writer has been joined. If the lifecycle lock is busy at that point, the next GC sweep, including the shutdown sweep, retries the release; the completed turn does not fail. On win32 an executor's death does not prove its descendants gone, so a writer lease left by a crashed proxy is recovered only after the host reboots.
 
 `session/lifecycleLockQueue.ts` admits lifecycle transactions in a per-lock-path
 FIFO with at most 256 waiting callers. Local waiting does not consume the
-two-second external-lock acquisition budget; only the head creates a durable
+two-second external-lock acquisition budget; only the head creates a lock
 candidate. A holder stalled for 60 seconds rejects queued/new callers without
 unlocking or abandoning its transaction. A stall deadline that runs more than a
 second late was delayed by a blocked event loop, which delayed the holder too, so
