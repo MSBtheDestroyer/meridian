@@ -216,8 +216,30 @@ describe("profile surface routing", () => {
     expect(s.activate("user-c__ws-cccccc")).toMatchObject({ ok: true })
   })
 
-  it("ignores a pin that names no ChatGPT seat", () => {
-    expect(surface().route("kwiat-dh-p", "work").kind).toBe("pool")
+  it("serves work pinned to a held seat, refuses its warm, and keeps the pool off it", () => {
+    const s = createChatGptProfileSurface({
+      source, observed: () => new Map(), usage: () => null, reserved: () => new Set(), names: () => undefined,
+      activeSeat: () => "user-b__ws-bbbbbb", held: () => ["b-bbbbbb"], spent: () => undefined,
+    })
+    expect(s.route("b-bbbbbb", "work")).toEqual({ kind: "pinned", seat: "user-b__ws-bbbbbb" })
+    expect(s.route("b-bbbbbb", "warm")).toMatchObject({ kind: "refuse", reason: "held" })
+    const unpinned = s.route(undefined, "work")
+    expect(unpinned.kind === "pool" && [...unpinned.excluded]).toEqual(["user-b__ws-bbbbbb"])
+    expect(s.activeProfileId()).toBe("a-aaaaaa")
+    expect(s.activate("b-bbbbbb")).toMatchObject({ ok: false, status: 409 })
+  })
+
+  it("ignores a pin that names a Claude profile", () => {
+    const s = createChatGptProfileSurface({
+      source, observed: () => new Map(), usage: () => null, reserved: () => new Set(["kwiat-dh-p"]), names: () => undefined,
+      activeSeat: () => undefined, spent: () => undefined,
+    })
+    expect(s.route("kwiat-dh-p", "work").kind).toBe("pool")
+  })
+
+  it("names a pin that matches no profile at all instead of serving it from the pool", () => {
+    expect(surface().route("no-such-seat", "work")).toEqual({ kind: "unknown", id: "no-such-seat" })
+    expect(surface().route("  ", "work").kind).toBe("pool")
   })
 
   it("warms with the smallest request the backend accepts", () => {

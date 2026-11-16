@@ -65,6 +65,7 @@ import {
 import {
   captureProcessIncarnation,
   parseProcessIncarnation,
+  predatesBoot,
   processIncarnationIsDead,
   processIncarnationPredatesBoot,
   processIncarnationProbeBudgetMs,
@@ -89,6 +90,18 @@ const DEFAULT_UNARMED_LEASE_TTL_MS = 11 * 60_000
 const DEFAULT_RETRY_BASE_MS = 5_000
 const DEFAULT_RETRY_MAX_MS = 60 * 60_000
 const DEFAULT_DELETE_TIMEOUT_MS = 30_000
+// Deletions started together. Each one costs three lifecycle transactions
+// (claim, executor handshake, verdict); under request load the lifecycle lock
+// is saturated and every transaction waits in its FIFO, so one deletion at a
+// time fell below the rate resumes create superseded forks. A batch shares one
+// claim and one verdict transaction and runs its children side by side.
+const DELETION_BATCH_SIZE = 8
+// How long a deletion child waits for its gate beyond its own budget. The
+// parent opens the gate only after its executor handshake commits, and that
+// handshake queues in the lifecycle FIFO, whose holder may stall for two 60s
+// windows before waiters are rejected. The parent kills the child on every
+// failure path, so the wait cannot outlive a failed handshake.
+const DELETION_GATE_ADMISSION_MS = 150_000
 // "Nothing to delete" travels as an exit code because child output is clipped,
 // and a Node crash report can bury the verdict. 75 is the gate timeout.
 const SESSION_GC_NOT_FOUND_EXIT_CODE = 69
@@ -169,8 +182,12 @@ export interface SessionLifecycleOptions {
   deletionTimeoutMs?: number
   /** Refresh durable mapping pins before each destructive claim. */
   pinProvider?: () => readonly TranscriptLocator[]
-  /** Bound one complete sweep, including all child deletions. */
+  /** Stop claiming new deletions after this long. A claimed deletion keeps its whole budget. */
   runTimeoutMs?: number
+  /** Checked before each claim: true stops the run after the batch already claimed. */
+  shouldStop?: () => boolean
+  /** Called after every sweep with the transcript backlog it left behind. */
+  onBacklog?: (backlog: GcBacklog) => void
   /** Test seam. Overrides the resolved @anthropic-ai/claude-agent-sdk module the
    * deletion child imports, so the fenced-delete path can run against a stub. */
   sdkModuleUrl?: string
@@ -193,6 +210,19 @@ export interface GcResult {
   notFound: number
   failed: number
   deferred: number
+}
+
+/** The transcript backlog as a sweep left it. */
+export interface GcBacklog {
+  /** Prepared, retired and deleting transcripts. */
+  pending: number
+  maxPending: number
+  /** Unpinned, unleased live transcripts: superseded, waiting for a pending slot. */
+  awaitingRetirement: number
+  /** Retired transcripts a sweep could claim right now. */
+  dueForDeletion: number
+  /** Retirement is held back by a full pending budget. */
+  saturated: boolean
 }
 
 /** Stable ownership key. The separator prevents ambiguous concatenation. */
@@ -685,13 +715,9 @@ async function reconcileUnderLock(
       if (pruneDeadActiveLeases(resource, now, unarmedLeaseTtlMs)) changed = true
     }
     let pending = pendingResourceCount(sidecar)
-    const maxPending = option(options.maxPending, DEFAULT_MAX_PENDING, "maxPending")
-    // Passive retirement must leave room for one active preallocation. Without
-    // that headroom, a profile switch can unpin enough live transcripts to fill
-    // the backlog and block every fresh request until the quarantine expires.
-    // A one-slot configuration cannot reserve capacity without disabling
-    // passive cleanup entirely, so preserve its existing behavior.
-    const passiveRetirementLimit = maxPending > 1 ? maxPending - 1 : maxPending
+    const retirementLimit = passiveRetirementLimit(
+      option(options.maxPending, DEFAULT_MAX_PENDING, "maxPending"),
+    )
 
     // A deletion claim is recoverable only after the exact persisted executor
     // is provably dead. Before the executor handshake, authoritative death of
@@ -756,7 +782,7 @@ async function reconcileUnderLock(
         resource.nextAttemptAt = now + retiredGraceMs(options)
         result.preparedRetired++
         changed = true
-      } else if (resource.state === "live" && pending < passiveRetirementLimit) {
+      } else if (resource.state === "live" && pending < retirementLimit) {
         resource.state = "retired"
         resource.updatedAt = now
         resource.nextAttemptAt = now + retiredGraceMs(options)
@@ -825,6 +851,13 @@ export async function releaseSupersededProfileCopies(
 /**
  * Delete a bounded batch of unpinned retired transcripts through the supported
  * SDK API, after retrying deferred lease releases that would otherwise fence them.
+ *
+ * Claims are taken in batches of DELETION_BATCH_SIZE: one transaction claims a
+ * batch, its children run side by side, and one transaction records their
+ * verdicts. The run deadline only stops the next claim. A deletion already
+ * claimed gets its whole budget, because truncating it to the run's remainder
+ * doomed the last claim of nearly every sweep on a loaded host: its child gave
+ * up waiting for a gate the parent's queued handshake had not opened yet.
  */
 export async function runGc(
   pins: readonly TranscriptLocator[],
@@ -834,72 +867,92 @@ export async function runGc(
   await reconcile(pins, options)
   let currentPins = indexPins(pins)
   const limit = option(options.maxDeletesPerRun, DEFAULT_MAX_DELETES, "maxDeletesPerRun")
+  const deletionTimeout = option(options.deletionTimeoutMs, DEFAULT_DELETE_TIMEOUT_MS, "deletionTimeoutMs")
   const result: GcResult = { deleted: 0, notFound: 0, failed: 0, deferred: 0 }
   const runTimeoutMs = option(options.runTimeoutMs, DEFAULT_DELETE_TIMEOUT_MS, "runTimeoutMs")
   const deadline = Date.now() + runTimeoutMs
+  let claimed = 0
+  let deletionStillRunning = false
 
-  for (let index = 0; index < limit; index++) {
-    if (Date.now() >= deadline) break
+  while (claimed < limit && !deletionStillRunning && Date.now() < deadline && !options.shouldStop?.()) {
     const refreshedPins = options.pinProvider?.()
     if (refreshedPins) {
       currentPins = indexPins(refreshedPins)
     }
-    const candidate = await claimDeletion(currentPins, options)
-    if (!candidate) break
+    const batch = await claimDeletions(currentPins, Math.min(DELETION_BATCH_SIZE, limit - claimed), options)
+    if (batch.length === 0) break
+    claimed += batch.length
 
-    let failure: unknown
-    let notFound = false
-    let deletionStillRunning = false
-    try {
-      const remainingMs = Math.max(1, deadline - Date.now())
-      const deletionTimeout = Math.min(
-        option(options.deletionTimeoutMs, DEFAULT_DELETE_TIMEOUT_MS, "deletionTimeoutMs"),
-        remainingMs,
-      )
-      if (options.deleter) {
-        await awaitCustomDeleter(options.deleter(candidate.locator), deletionTimeout)
-      } else {
-        await deleteWithSdkChild(
-          candidate.locator,
-          candidate.deletionToken!,
-          deletionTimeout,
-          (executor, processGroupId) => attachDeletionExecutor(
-            candidate.key,
-            candidate.deletionToken!,
-            executor,
-            processGroupId,
-            options,
-          ),
-          options,
-        )
+    const outcomes = await Promise.all(batch.map((candidate) => deleteClaimed(candidate, deletionTimeout, options)))
+    const verdicts: DeletionVerdict[] = []
+    for (const [index, outcome] of outcomes.entries()) {
+      if (outcome === "still-running") {
+        // The SDK has no deletion fencing token. Keep the resource permanently
+        // deleting until an operator proves the old deleter is gone; retrying
+        // could let an old physical delete race a newly pinned generation.
+        result.deferred++
+        deletionStillRunning = true
+        continue
       }
-    } catch (error) {
-      if (error instanceof DeletionStillRunningError) deletionStillRunning = true
-      else if (isNotFoundError(error, candidate.locator.sessionId)) notFound = true
-      else failure = error
+      verdicts.push({ candidate: batch[index]!, outcome })
     }
-
-    if (deletionStillRunning) {
-      // The SDK has no deletion fencing token. Keep the resource permanently
-      // deleting until an operator proves the old deleter is gone; retrying
-      // could let an old physical delete race a newly pinned generation.
-      result.deferred++
-      break
+    await finishDeletions(verdicts, options)
+    for (const { outcome } of verdicts) {
+      if (outcome === "deleted") result.deleted++
+      else if (outcome === "not-found") result.notFound++
+      else result.failed++
     }
-    await finishDeletion(candidate.key, candidate.deletionToken!, failure, options)
-    if (failure) result.failed++
-    else if (notFound) result.notFound++
-    else result.deleted++
   }
 
-  result.deferred += await countDeferred(currentPins, options)
+  const backlog = await readBacklog(currentPins, options)
+  result.deferred += backlog.deferred
+  options.onBacklog?.(backlog.report)
   return result
 }
 
-async function claimDeletion(
-  pins: PinIndex,
+type DeletionOutcome = "deleted" | "not-found" | "still-running" | { failure: unknown }
+
+interface DeletionVerdict {
+  candidate: TranscriptResource
+  outcome: Exclude<DeletionOutcome, "still-running">
+}
+
+async function deleteClaimed(
+  candidate: TranscriptResource,
+  timeoutMs: number,
   options: SessionLifecycleOptions,
-): Promise<TranscriptResource | undefined> {
+): Promise<DeletionOutcome> {
+  try {
+    if (options.deleter) {
+      await awaitCustomDeleter(options.deleter(candidate.locator), timeoutMs)
+    } else {
+      await deleteWithSdkChild(
+        candidate.locator,
+        candidate.deletionToken!,
+        timeoutMs,
+        (executor, processGroupId) => attachDeletionExecutor(
+          candidate.key,
+          candidate.deletionToken!,
+          executor,
+          processGroupId,
+          options,
+        ),
+        options,
+      )
+    }
+    return "deleted"
+  } catch (error) {
+    if (error instanceof DeletionStillRunningError) return "still-running"
+    if (isNotFoundError(error, candidate.locator.sessionId)) return "not-found"
+    return { failure: error }
+  }
+}
+
+async function claimDeletions(
+  pins: PinIndex,
+  count: number,
+  options: SessionLifecycleOptions,
+): Promise<TranscriptResource[]> {
   return withSidecarLock(options, async (paths) => {
     const sidecar = await readSidecar(paths)
     const refreshedPins = options.pinProvider?.()
@@ -910,28 +963,37 @@ async function claimDeletion(
     for (const resource of Object.values(sidecar.resources)) {
       if (pruneDeadActiveLeases(resource, now, unarmedLeaseTtlMs)) leasesChanged = true
     }
-    const candidate = Object.values(sidecar.resources)
-      .filter((resource) =>
-        resource.state === "retired"
-        && !resourceIsPinned(resource, finalPins)
-        && !hasActiveTranscriptLease(resource)
-        && (resource.nextAttemptAt ?? 0) <= now)
-      .sort((left, right) => left.updatedAt - right.updatedAt || left.key.localeCompare(right.key))[0]
-    if (!candidate) {
+    const candidates = Object.values(sidecar.resources)
+      .filter((resource) => resourceIsDue(resource, finalPins, now))
+      .sort((left, right) => left.updatedAt - right.updatedAt || left.key.localeCompare(right.key))
+      .slice(0, count)
+    if (candidates.length === 0) {
       if (leasesChanged) await writeSidecar(paths, sidecar)
-      return undefined
+      return []
     }
     const deletionOwner = captureProcessIncarnation()
     if (!deletionOwner) throw new SessionLifecycleError("cannot capture deletion owner process incarnation")
-    candidate.state = "deleting"
-    candidate.updatedAt = now
-    candidate.deletionToken = randomUUID()
-    candidate.deletionOwner = deletionOwner
-    delete candidate.deletionExecutor
-    delete candidate.deletionProcessGroupId
-    await writeSidecar(paths, sidecar)
-    return structuredClone(candidate)
+    for (const candidate of candidates) {
+      candidate.state = "deleting"
+      candidate.updatedAt = now
+      candidate.deletionToken = randomUUID()
+      candidate.deletionOwner = deletionOwner
+      delete candidate.deletionExecutor
+      delete candidate.deletionProcessGroupId
+    }
+    // Every deletion starts after this commit. Durable, so a power loss cannot
+    // bring back a mapping to a transcript already deleted: syncing it syncs
+    // the retirement before it.
+    await writeSidecar(paths, sidecar, true)
+    return structuredClone(candidates)
   })
+}
+
+function resourceIsDue(resource: TranscriptResource, pins: PinIndex, now: number): boolean {
+  return resource.state === "retired"
+    && !resourceIsPinned(resource, pins)
+    && !hasActiveTranscriptLease(resource)
+    && (resource.nextAttemptAt ?? 0) <= now
 }
 
 async function attachDeletionExecutor(
@@ -954,51 +1016,79 @@ async function attachDeletionExecutor(
   })
 }
 
-async function finishDeletion(
-  key: string,
-  deletionToken: string,
-  failure: unknown,
+/** Record a batch's verdicts in one transaction. A lost lease fails the sweep after the rest are recorded. */
+async function finishDeletions(
+  verdicts: readonly DeletionVerdict[],
   options: SessionLifecycleOptions,
 ): Promise<void> {
+  if (verdicts.length === 0) return
   await withSidecarLock(options, async (paths) => {
     const sidecar = await readSidecar(paths)
-    const resource = sidecar.resources[key]
-    if (!resource || resource.state !== "deleting" || resource.deletionToken !== deletionToken) {
-      throw new SessionLifecycleError(`deletion lease for ${key} was lost`)
-    }
     const now = nowMs(options)
-    resource.updatedAt = now
-    delete resource.deletionToken
-    delete resource.deletionOwner
-    delete resource.deletionExecutor
-    delete resource.deletionProcessGroupId
-    if (!failure) {
-      resource.state = "deleted"
-      delete resource.nextAttemptAt
-      delete resource.lastError
-    } else {
-      resource.state = "retired"
-      resource.attempts++
-      resource.lastError = errorMessage(failure).slice(0, 1_000)
-      const base = option(options.retryBaseMs, DEFAULT_RETRY_BASE_MS, "retryBaseMs")
-      const maximum = option(options.retryMaxMs, DEFAULT_RETRY_MAX_MS, "retryMaxMs")
-      const delay = Math.min(maximum, base * (2 ** Math.min(resource.attempts - 1, 20)))
-      resource.nextAttemptAt = now + delay
+    const lost: string[] = []
+    for (const { candidate, outcome } of verdicts) {
+      const resource = sidecar.resources[candidate.key]
+      if (!resource || resource.state !== "deleting" || resource.deletionToken !== candidate.deletionToken) {
+        lost.push(candidate.key)
+        continue
+      }
+      resource.updatedAt = now
+      delete resource.deletionToken
+      delete resource.deletionOwner
+      delete resource.deletionExecutor
+      delete resource.deletionProcessGroupId
+      if (typeof outcome === "string") {
+        resource.state = "deleted"
+        delete resource.nextAttemptAt
+        delete resource.lastError
+      } else {
+        resource.state = "retired"
+        resource.attempts++
+        resource.lastError = errorMessage(outcome.failure).slice(0, 1_000)
+        const base = option(options.retryBaseMs, DEFAULT_RETRY_BASE_MS, "retryBaseMs")
+        const maximum = option(options.retryMaxMs, DEFAULT_RETRY_MAX_MS, "retryMaxMs")
+        const delay = Math.min(maximum, base * (2 ** Math.min(resource.attempts - 1, 20)))
+        resource.nextAttemptAt = now + delay
+      }
     }
-    pruneTombstones(sidecar, options)
-    await writeSidecar(paths, sidecar)
+    if (lost.length < verdicts.length) {
+      pruneTombstones(sidecar, options)
+      await writeSidecar(paths, sidecar)
+    }
+    if (lost.length > 0) {
+      throw new SessionLifecycleError(`deletion lease for ${lost.join(", ")} was lost`)
+    }
   })
 }
 
-async function countDeferred(
+async function readBacklog(
   pins: PinIndex,
   options: SessionLifecycleOptions,
-): Promise<number> {
+): Promise<{ deferred: number; report: GcBacklog }> {
   return withSidecarLock(options, async (paths) => {
     const sidecar = await readSidecar(paths)
-    return Object.values(sidecar.resources).filter((resource) =>
-      (resource.state === "retired" || resource.state === "deleting")
-      && !resourceIsPinned(resource, pins)).length
+    const now = nowMs(options)
+    const maxPending = option(options.maxPending, DEFAULT_MAX_PENDING, "maxPending")
+    let deferred = 0
+    let awaitingRetirement = 0
+    let dueForDeletion = 0
+    for (const resource of Object.values(sidecar.resources)) {
+      const pinned = resourceIsPinned(resource, pins)
+      if ((resource.state === "retired" || resource.state === "deleting") && !pinned) deferred++
+      if (resource.state === "live" && !pinned && !hasActiveTranscriptLease(resource)) awaitingRetirement++
+      if (resourceIsDue(resource, pins, now)) dueForDeletion++
+    }
+    const pending = pendingResourceCount(sidecar)
+    return {
+      deferred,
+      report: {
+        pending,
+        maxPending,
+        awaitingRetirement,
+        dueForDeletion,
+        saturated: awaitingRetirement > 0 && pending >= passiveRetirementLimit(maxPending),
+      },
+    }
   })
 }
 
@@ -1161,7 +1251,7 @@ try {
       // budget. Without that allowance the child can exit 75 before the gate
       // ever appears, turning every deletion into a retryable failure on a
       // loaded Windows host.
-      MERIDIAN_GC_GATE_TIMEOUT_MS: String(timeoutMs + processIncarnationProbeBudgetMs()),
+      MERIDIAN_GC_GATE_TIMEOUT_MS: String(timeoutMs + processIncarnationProbeBudgetMs() + DELETION_GATE_ADMISSION_MS),
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
@@ -1199,10 +1289,10 @@ try {
     const executor = captureProcessIncarnation(processGroupId)
     if (!executor) throw new Error("cannot capture session deletion executor incarnation")
     await attachExecutor(executor, processGroupId)
+    // Not fsynced: only the live child polls for it, and an OS crash ends it.
     const gateHandle = await open(gatePath, "wx", 0o600)
     try {
       await gateHandle.writeFile("go\n", "utf8")
-      await gateHandle.sync()
     } finally {
       await gateHandle.close()
     }
@@ -1288,17 +1378,15 @@ interface SidecarLockCandidate {
   discard: () => Promise<void>
 }
 
-/** Initialise one lock candidate for a whole acquisition, not one per attempt.
+/** Initialise one lock candidate for a whole acquisition, not one per attempt:
+ *  each attempt is then one link, a metadata operation.
  *
- *  The fsync itself is load-bearing: a crash that leaves the lock linked to an
- *  unwritten inode is unrecoverable, because stale-lock recovery only retires a
- *  lock whose owner it can parse and prove dead. Paying it per attempt is what
- *  does not follow. An fsync costs ~100ms on a busy filesystem, so a 2s budget
- *  bought ~13 attempts rather than the ~80 a 25ms retry interval implies, and
- *  each one wrote into the very directory the holder must fsync to publish the
- *  sidecar, so waiters taxed the holder they were waiting for. One initialised
- *  inode, re-linked, keeps the durability and drops the cost to a rename-class
- *  metadata operation.
+ *  It is not fsynced. The lock only matters while its holder lives, and every
+ *  process reads it through the page cache, so a process crash loses nothing.
+ *  An OS crash or power loss can leave the lock linked to an unwritten inode,
+ *  whose owner nobody can parse; stale recovery reclaims such a lock once it
+ *  predates the current boot (lifecycleLockIsAbandoned). The fsync used to
+ *  cost ~250ms of journal wait on a loaded filesystem, several times a second.
  */
 export async function createInitializedSidecarLockCandidate(
   path: string,
@@ -1316,7 +1404,6 @@ export async function createInitializedSidecarLockCandidate(
   try {
     handle = await open(staging, "wx", 0o600)
     await handle.writeFile(contents, "utf8")
-    await handle.sync()
     await handle.close()
     handle = undefined
   } catch (error) {
@@ -1431,9 +1518,11 @@ function parseCanonicalLifecycleLockOwner(contents: string): CanonicalLifecycleL
   }
 }
 
-function canonicalLifecycleLockOwnerIsDead(contents: string): boolean {
+/** Whether no running process can hold this lock: its owner is proven dead,
+ *  or, when no owner is readable, the lock was written before this boot. */
+function lifecycleLockIsAbandoned(contents: string, mtimeMs: number): boolean {
   const owner = parseCanonicalLifecycleLockOwner(contents)
-  return owner ? processIncarnationIsDead(owner.incarnation) : false
+  return owner ? processIncarnationIsDead(owner.incarnation) : predatesBoot(mtimeMs)
 }
 
 interface LifecycleRecoveryClaimSnapshot {
@@ -1473,6 +1562,8 @@ async function publishLifecycleRecoveryClaim(
   let published = false
   try {
     await mkdir(candidate, { mode: 0o700 })
+    // Fsynced, unlike the lock: an unreadable claim blocks every later
+    // recovery of this generation, after a reboot too. Claims are rare.
     handle = await open(join(candidate, "owner.json"), "wx", 0o600)
     await handle.writeFile(JSON.stringify(owner), "utf8")
     await handle.sync()
@@ -1597,7 +1688,7 @@ async function recoverStaleLock(lockPath: string, staleMs: number): Promise<void
   }
   if (
     Date.now() - info.mtimeMs <= staleMs
-    || !canonicalLifecycleLockOwnerIsDead(contents)
+    || !lifecycleLockIsAbandoned(contents, info.mtimeMs)
   ) return
 
   const generation = contents
@@ -1632,7 +1723,7 @@ async function recoverStaleLock(lockPath: string, staleMs: number): Promise<void
     }
     if (
       Date.now() - currentInfo.mtimeMs <= staleMs
-      || !canonicalLifecycleLockOwnerIsDead(currentContents)
+      || !lifecycleLockIsAbandoned(currentContents, currentInfo.mtimeMs)
     ) return
 
     const quarantine = `${lockPath}.stale-${process.pid}-${randomUUID()}`
@@ -1817,6 +1908,7 @@ async function commitLifecycleRows(
   database: StoreDatabase,
   next: LifecycleRows,
   extraOps: readonly WriteOp[] = [],
+  durable = false,
 ): Promise<boolean> {
   const commitToken = randomUUID()
   const { committed, result } = await database.transact<{
@@ -1825,6 +1917,7 @@ async function commitLifecycleRows(
     advanced: ReadonlyMap<string, number>
   } | undefined>({
     lockWaitMs: getStoreLockWaitMs(),
+    durable,
     build: () => {
       const base = freshLifecycleCache(database)
       const seq = base.seq + 1
@@ -1937,9 +2030,10 @@ async function readSidecar(paths: SidecarPaths): Promise<SessionGcSidecar> {
   return draftSidecar(freshLifecycleCache(database))
 }
 
-/** Commit the rows of `sidecar` that changed. Durable once it returns. */
-async function writeSidecar(paths: SidecarPaths, sidecar: SessionGcSidecar): Promise<void> {
-  await commitLifecycleRows(lifecycleDatabase(dirname(paths.sidecar)), lifecycleRowsOf(sidecar))
+/** Commit the rows of `sidecar` that changed. Once it returns the commit
+ *  survives a process crash, and with `durable` a power loss too. */
+async function writeSidecar(paths: SidecarPaths, sidecar: SessionGcSidecar, durable = false): Promise<void> {
+  await commitLifecycleRows(lifecycleDatabase(dirname(paths.sidecar)), lifecycleRowsOf(sidecar), [], durable)
 }
 
 /**
@@ -2191,6 +2285,17 @@ function pruneDeadActiveLeases(resource: TranscriptResource, now: number, unarme
   }
   if (Object.keys(resource.activeLeases).length === 0) delete resource.activeLeases
   return changed
+}
+
+/**
+ * Passive retirement must leave room for one active preallocation. Without
+ * that headroom, a profile switch can unpin enough live transcripts to fill
+ * the backlog and block every fresh request until the quarantine expires.
+ * A one-slot configuration cannot reserve capacity without disabling
+ * passive cleanup entirely, so preserve its existing behavior.
+ */
+function passiveRetirementLimit(maxPending: number): number {
+  return maxPending > 1 ? maxPending - 1 : maxPending
 }
 
 function pendingResourceCount(sidecar: SessionGcSidecar): number {

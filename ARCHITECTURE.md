@@ -457,7 +457,9 @@ changes while a SQLite runtime is owned are rejected.
 control/provider operations and their finalizers before releasing its owner.
 `ProxyInstance.close()` bounds the wait after HTTP drain: an unjoined cleanup
 rejects instead of reporting success, while the original cleanup retains SQL
-and ChatGPT ownership until those operations join. Repeated calls return the
+ownership until those operations join. ChatGPT ownership is released once
+admitted work has joined, beside GC and backend close (`joinShutdownCleanup`),
+so a slow GC sweep cannot keep the writer lease past the deadline. The deadline is `MERIDIAN_SHUTDOWN_CLEANUP_DEADLINE_MS` (10 s): GC, backend close and ChatGPT release do fsyncs and join child processes, which on a loaded host routinely took longer than the former 2 s and made every restart exit 1. Cleanup still running after 2 s is logged with each step's time (`ShutdownProgress`), and a missed deadline names the step that held it. Repeated calls return the
 same promise. `session/deletionCleanup.ts` separately owns GC from admission,
 including gaps between transactions and native child creation. Its per-proxy
 async context keeps sibling shutdown independent; its directory ledger retains
@@ -711,11 +713,13 @@ E2E tests (`E2E.md`) should be run before releases or after major refactors.
 
 Publication leases use the existing unarmed active-lease representation with `purpose: "publication"`. Older collectors also retain them while the owner process is alive; exact process-incarnation death permits recovery. They do not count as exclusive SDK writers, and abandoning publication never removes an actual writer lease. Published transcripts are retained by their durable mappings and become collectible after eviction.
 
+Files that only matter while the process that wrote them lives are not fsynced: the `session-gc.json.lock` candidate, turn locks (`session/crossProcessTurnCoordinator.ts`), SDK process gates and deletion gates. Every process reads them through the page cache, so a process crash loses nothing; an OS crash or power loss can leave one without its data, and then its writer is dead too. Stale recovery reclaims a lock whose owner it cannot parse once the lock predates the current boot (`predatesBoot` in `session/processIncarnation.ts`). Recovery claims stay fsynced, since an unreadable claim would block recovery after a reboot as well. The `sessions.db` writer commits with `synchronous=NORMAL`: in WAL mode a power loss can roll the store back to an earlier commit, never a torn one, while a process crash loses nothing and every compare-and-swap still sees every commit. The GC deletion claim is the one commit synced to disk (`durable` in `session/storeDatabase.ts`), so a rollback cannot restore a mapping to a transcript that was already deleted.
+
 An SDK writer lease is released once its writer has been joined. If the lifecycle lock is busy at that point, the next GC sweep, including the shutdown sweep, retries the release; the completed turn does not fail. On win32 an executor's death does not prove its descendants gone, so a writer lease left by a crashed proxy is recovered only after the host reboots.
 
 `session/lifecycleLockQueue.ts` admits lifecycle transactions in a per-lock-path
 FIFO with at most 256 waiting callers. Local waiting does not consume the
-two-second external-lock acquisition budget; only the head creates a durable
+two-second external-lock acquisition budget; only the head creates a lock
 candidate. A holder stalled for 60 seconds rejects queued/new callers without
 unlocking or abandoning its transaction. A stall deadline that runs more than a
 second late was delayed by a blocked event loop, which delayed the holder too, so
@@ -731,6 +735,17 @@ Request admission signals remove queued work and cancel external acquisition,
 but a running durable callback always finishes before returning ownership.
 Cleanup never receives the canceled admission signal. Publication callbacks
 remain synchronous; same-context recursive acquisition is rejected explicitly.
+
+## Transcript deletion throughput
+
+Every resumed request writes a new SDK fork, so a busy instance supersedes about one transcript per request. A superseded transcript is retired into the pending budget (`maxPending`), waits its grace period there and is then deleted; superseded transcripts that find the budget full stay live until a slot frees. Deletion therefore has to outpace fork creation in two ways:
+
+- **Pending capacity.** A retired transcript holds its slot through the grace period, so the budget caps throughput at `maxPending` per grace period. The server default is 2048 (about 11,000 per hour at the default grace); 256 capped it at about 1,400 per hour and less once deletion lagged.
+- **Lock cost.** Each deletion takes three lifecycle transactions: claim, executor handshake and verdict. Under request load the lifecycle lock is saturated and each transaction waits in its FIFO, so deleting one transcript at a time ran at a few hundred per hour. `runGc` claims up to 8 transcripts in one transaction, runs their children side by side, each with its own token, executor and process group, and records their verdicts in one transaction.
+
+The run deadline stops new claims only. A claimed deletion keeps its whole budget, and its child waits for its gate past that budget long enough for a handshake queued behind two stalled-holder windows. Truncating the budget to the run's remainder made the last claim of nearly every sweep fail with exit 75 on a loaded host. While transcripts are still due and runs make progress, the server starts the next run at once, for up to 5 minutes per sweep. Once shutdown starts, a run claims nothing new and returns after the batch it already claimed, so the shutdown sweep fits its join deadline; a claimed deletion it leaves running stays fenced and is recovered by the next process.
+
+Each sweep reports its backlog (`GcBacklog`: pending, budget, superseded transcripts awaiting retirement, transcripts due for deletion). When superseded transcripts wait for a full budget the backlog is saturated: the server logs `session GC backlog saturated` at most every 10 minutes, and healthy `/health` carries the latest backlog as `sessionGc`. Saturation never changes the health status: deletion lagging is not a reason to stop routing requests.
 
 ## Session store write cost
 

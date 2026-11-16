@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
-import { hostname, uptime } from "node:os"
+import { hostname } from "node:os"
 import { basename, dirname, join } from "node:path"
 import {
   chmod,
@@ -29,7 +29,9 @@ import {
 } from "./recoveryClaim"
 import {
   captureProcessIncarnation,
+  currentBootTimeMs,
   parseProcessIncarnation,
+  predatesBoot,
   processIncarnationIsDead,
   type ProcessIncarnation,
 } from "./processIncarnation"
@@ -39,10 +41,6 @@ const DEFAULT_ACQUIRE_TIMEOUT_MS = 30_000
 const DEFAULT_STALE_AFTER_MS = 30_000
 const DEFAULT_RETRY_DELAY_MS = 25
 const DEFAULT_OWNERLESS_GRACE_MS = 10 * 60_000
-// os.uptime() is reported in whole seconds on some platforms, so the derived
-// boot instant can land up to a second late. Only activity clearly before it
-// counts as belonging to an earlier boot.
-const BOOT_CLOCK_TOLERANCE_MS = 5_000
 
 export interface CrossProcessTurnCoordinatorOptions {
   /** Maximum time an acquire may wait. Acquires always have a finite bound. */
@@ -226,10 +224,6 @@ async function newestOwnerlessActivity(lockPath: string): Promise<number | undef
   return newest
 }
 
-function currentBootTimeMs(): number {
-  return Date.now() - uptime() * 1000
-}
-
 function sameIdentity(left: LockSnapshot, right: LockSnapshot): boolean {
   return left.dev === right.dev && left.ino === right.ino
 }
@@ -251,8 +245,9 @@ type OwnerlessVerdict = "pre-boot" | "grace-expired"
  * belong to a live process.
  *
  * This protocol publishes a lock by renaming a fully written directory, so a
- * live holder's owner.json is always readable. An unreadable one is what a
- * crash leaves when the file's size reached the disk and its data did not.
+ * live holder's owner.json is always readable. An unreadable one is what an
+ * OS crash or power loss leaves when the file's size reached the disk and its
+ * data did not, which nothing prevents: lock files are not fsynced.
  * Activity from before the current boot cannot belong to a running process.
  * Activity during this boot might be an older writer paused between creating
  * the directory and writing its owner, so it gets a long grace period, and
@@ -265,7 +260,7 @@ function ownerlessVerdict(
   now: number,
 ): OwnerlessVerdict | undefined {
   const lastActivity = Math.max(snapshot.mtimeMs, snapshot.heartbeatMtimeMs ?? 0)
-  if (lastActivity < policy.bootTimeMs() - BOOT_CLOCK_TOLERANCE_MS) return "pre-boot"
+  if (predatesBoot(lastActivity, policy.bootTimeMs())) return "pre-boot"
   if (now - lastActivity > policy.ownerlessGraceMs) return "grace-expired"
   return undefined
 }
@@ -319,6 +314,8 @@ async function tryPublishRecoveryClaim(
   let published = false
   try {
     await mkdir(candidate, { mode: 0o700 })
+    // Fsynced, unlike the lock: an unreadable claim blocks every later
+    // recovery of this generation, after a reboot too. Claims are rare.
     handle = await open(join(candidate, OWNER_FILE), "wx", 0o600)
     await handle.writeFile(JSON.stringify(owner), "utf8")
     await handle.sync()
@@ -555,19 +552,18 @@ export class CrossProcessTurnCoordinator {
     let published = false
     try {
       await mkdir(candidate, { mode: 0o700 })
-      // Flush the owner record and both directory entries before the lock
-      // counts as held. Otherwise a crash can leave owner.json with its size
-      // but not its data, and nobody can tell whose lock it was.
+      // Not fsynced: a turn lock only matters while its holder lives, and
+      // every process reads it through the page cache, so a process crash
+      // loses nothing. Only an OS crash can leave owner.json without its
+      // data, and then the lock predates the boot (ownerlessVerdict).
       handle = await open(join(candidate, OWNER_FILE), "wx", 0o600)
       await handle.writeFile(JSON.stringify(owner), "utf8")
-      await handle.sync()
       await handle.close()
       handle = undefined
       await writeFile(join(candidate, heartbeatName(owner.token)), "", {
         flag: "wx",
         mode: 0o600,
       })
-      await syncDirectoryDurably(candidate)
       // Renaming a fully initialized, non-empty directory publishes one lock
       // generation atomically. A competing initialized directory cannot be
       // replaced by rename on supported filesystems (EEXIST/ENOTEMPTY).
@@ -578,17 +574,7 @@ export class CrossProcessTurnCoordinator {
         if (await directoryRenameWasBlocked(error, lockPath)) return undefined
         throw error
       }
-
-      const lease = this.createLease(lockPath, owner, Date.now() - arrivedAt)
-      try {
-        await syncDirectoryDurably(this.root)
-      } catch (error) {
-        // A published lock that is never released wedges its session for as
-        // long as this process lives, so give it back before failing.
-        await lease.release().catch(() => undefined)
-        throw error
-      }
-      return lease
+      return this.createLease(lockPath, owner, Date.now() - arrivedAt)
     } finally {
       await handle?.close().catch(() => undefined)
       if (!published) await rm(candidate, { recursive: true, force: true }).catch(() => undefined)

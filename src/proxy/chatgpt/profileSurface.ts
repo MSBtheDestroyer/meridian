@@ -85,6 +85,11 @@ export interface ChatGptProfileSurfaceDeps {
   activeSeat: () => string | undefined
   /** Seats kept out of work: profile ids, seat ids, or Claude ids (ignored here). None when absent. */
   excluded?: () => readonly string[]
+  /**
+   * Seats held out of rotation: no unpinned work and no warm reaches them,
+   * but a turn pinned to one is served there. None when absent.
+   */
+  held?: () => readonly string[]
   /** The saved profile order (`profileOrder`), Claude ids included; ChatGPT failover follows it after the active seat. */
   order?: () => readonly string[] | undefined
   spent: (profileId: string) => SpentRecord | undefined
@@ -120,7 +125,7 @@ function seatSignIn(
 
 export type ChatGptActivation =
   | { ok: true; profile: ChatGptProfile }
-  | { ok: false; status: 400 | 409; error: string; code?: "needs_login" }
+  | { ok: false; status: 400 | 409; error: string; code?: "needs_login" | "held" }
 
 export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
   const planTypes = (): Map<string, string | null> => new Map(
@@ -164,15 +169,27 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
     return seats.length > 0 ? seats : undefined
   }
 
-  const excludedSeats = (list: readonly ChatGptProfile[]): Set<string> => {
+  const seatsNamed = (list: readonly ChatGptProfile[], ids: readonly string[]): Set<string> => {
     const seats = new Set<string>()
-    for (const profile of list) if (loginFor(profile).state === "needs_login") seats.add(profile.seat)
-    for (const id of deps.excluded?.() ?? []) {
+    for (const id of ids) {
       const profile = findChatGptProfile(list, id)
       if (profile) seats.add(profile.seat)
     }
     return seats
   }
+
+  /** Seats no work may be pinned to: logged out, or excluded from work. */
+  const refusedSeats = (list: readonly ChatGptProfile[]): Set<string> => {
+    const seats = seatsNamed(list, deps.excluded?.() ?? [])
+    for (const profile of list) if (loginFor(profile).state === "needs_login") seats.add(profile.seat)
+    return seats
+  }
+
+  const heldSeats = (list: readonly ChatGptProfile[]): Set<string> => seatsNamed(list, deps.held?.() ?? [])
+
+  /** Seats unpinned work never reaches: the refused ones and the held ones. */
+  const excludedSeats = (list: readonly ChatGptProfile[]): Set<string> =>
+    new Set([...refusedSeats(list), ...heldSeats(list)])
 
   /**
    * The pointer while it names a seat that may take work; otherwise the
@@ -233,6 +250,9 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
       if (loginFor(profile).state === "needs_login") {
         return { ok: false, status: 409, code: "needs_login", error: `Profile "${profile.id}" needs a login before it can be activated` }
       }
+      if (heldSeats(list).has(profile.seat)) {
+        return { ok: false, status: 409, code: "held", error: `Profile "${profile.id}" is held out of rotation` }
+      }
       if (excludedSeats(list).has(profile.seat)) {
         return { ok: false, status: 409, error: `Profile "${profile.id}" is excluded from work routing` }
       }
@@ -242,16 +262,26 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
     /**
      * Where one turn may go. `pin` is the request's own profile header and is
      * obeyed only when it names a ChatGPT seat - on an instance serving both
-     * providers it may name a Claude profile, which says nothing here. A warm
-     * may use an excluded seat, as a Claude warm may; work may not.
+     * providers it may name a Claude profile, which says nothing here. A pin
+     * naming neither is `unknown`: the client asked for one account, and the
+     * pool would serve it from another. A warm may use an excluded seat, as a
+     * Claude warm may; work may not. A held seat is the reverse: work pinned
+     * to it is served, a warm is refused.
      */
     route(pin: string | undefined, purpose: "work" | "warm") {
       const list = profiles()
       const excluded = excludedSeats(list)
       const pinned = findChatGptProfile(list, pin)
+      const named = pin?.trim()
+      if (!pinned && named && !deps.reserved().has(named)) {
+        return { kind: "unknown" as const, id: named }
+      }
       if (pinned) {
-        if (purpose === "work" && excluded.has(pinned.seat)) {
-          return { kind: "refuse" as const, profile: pinned }
+        if (purpose === "work" && refusedSeats(list).has(pinned.seat)) {
+          return { kind: "refuse" as const, profile: pinned, reason: "excluded" as const }
+        }
+        if (purpose === "warm" && heldSeats(list).has(pinned.seat)) {
+          return { kind: "refuse" as const, profile: pinned, reason: "held" as const }
         }
         return { kind: "pinned" as const, seat: pinned.seat }
       }
@@ -355,6 +385,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           daysUntilRenewal: null,
           renewalRequiredSoon: false,
           accessTokenExpiresAt: profile.accessTokenExpiresAt,
+          renewalRetryAt: profile.renewalRetryAt,
           authObtainedAt: signIn.at,
           authObtainedVia: signIn.via,
           lastRefreshAt: lifecycle?.lastRefreshAt ?? null,

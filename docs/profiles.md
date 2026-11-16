@@ -185,6 +185,8 @@ A ChatGPT seat reports the same fields. OpenAI states no login deadline, so `ref
 
 Meridian renews each seat in its own store on the eighth day of its ten-day access token, whether or not work is sent to it, one seat per minute at most (`[chatgpt] renewing account … ahead of expiry`). A request renews only the seat it is routed to, so without this a seat no work goes to runs out and reads as logged out though nothing refused it. A failed exchange leaves its seat needing a sign-in, so after OpenAI fails one, renewing ahead of expiry pauses for six hours. While a renewal is out, the seat is listed as it was before it: it reads as needing a sign-in only once the exchange fails, or when a stamp is left by one that never finished.
 
+chatgpt.com sometimes refuses a seat's access token while its refresh token is still good. Meridian then renews the seat on its own within a minute (`[chatgpt] renewing account …: chatgpt.com refused its access token`), and the card shows "Next renewal" instead of asking for a sign-in. When the renewed token is refused too, it renews again 5 minutes later, then 30 minutes, 2 hours, and every 6 hours after that, for as long as OpenAI accepts the refresh token. The seat needs a sign-in only once OpenAI refuses the refresh itself, or a renewal's result cannot be established; a refresh token that may already have been spent is never sent again. `GET /profiles/list` reports the next attempt as `renewalRetryAt`.
+
 When OpenAI refuses a renewal, the log line, the logged-out event and the `cause` field of `POST /profiles/chatgpt/refresh` name which refusal it was: `refresh token expired`, `refresh token already used` (another program renewed the same login first) or `refresh token revoked`. A failure on OpenAI's side records `HTTP <status>` instead.
 
 A seat can be given its own renewal interval in hours, from 1 to 240, with `PATCH /settings/api/chatgpt` and `{"seatRenewalHours": {"<profile>": 24}}`; `null` removes it. That seat is then renewed that long after its access token was issued, and never later than a request would renew it. `GET /settings/api/chatgpt` lists each seat's `renewalHours`, and the log line names the interval. It exists to measure whether renewing more often changes how long a sign-in lasts; every other seat keeps the default.
@@ -200,6 +202,8 @@ meridian profile switch work
 # Per-request header (any agent)
 curl -H "x-meridian-profile: work" ...
 ```
+
+A request with the header runs on that account or fails; it is never failed over to another one. A header naming a profile this Meridian does not have is answered `400` with error type `unknown_profile` rather than served from another account.
 
 You can also switch profiles from the web UI — click an account card on the home page (`http://127.0.0.1:3456/`) or use the Profiles page at `/profiles`. The site header on every page shows which profile is active.
 
@@ -239,6 +243,17 @@ MERIDIAN_ROUTING=priority MERIDIAN_PROFILE_ORDER=work,personal meridian
 - When **every** account is exhausted, the last-tried account's error is surfaced unchanged, with its own status — a pool that ran out of billing is not reported as a rate limit.
 - An explicit `x-meridian-profile` header always bypasses the pool (per-session pinning keeps working).
 - Failovers are logged (`profile.failover` in the diagnostic stream; `profile=<id>(priority)` in request lines).
+
+### Held profiles
+
+A profile can be held out of rotation, for example to measure what one job spends on an account nothing else touches. `routingHeldProfiles` in `PUT /settings/api/routing` (a supervisor writes the whole list; `GET` returns it) names Claude profiles or ChatGPT seats that:
+
+- take no unpinned work, are skipped by priority failover, and are moved off when they are the active profile;
+- are never warmed: `POST /profiles/<id>/warm` on one answers `409` with `profile_held`;
+- cannot be made active (`POST /profiles/active` answers `409` with `profile_held`);
+- still serve every request pinned to them with `x-meridian-profile`.
+
+Unlike `routingExcludedProfiles`, which refuses pinned work and still allows warms, a hold refuses warms and still allows pinned work.
 
 ### Profile commands
 
