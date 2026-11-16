@@ -22,6 +22,15 @@
  * statement it has not cached. For the same reason nothing but the write queue
  * touches the writer while an `exec()` may be in flight.
  *
+ * The writer commits with synchronous=NORMAL: in WAL mode a commit then
+ * waits for no fsync, and the WAL is synced at each checkpoint. Every process
+ * reads the WAL through the page cache, so a process crash loses no commit and
+ * every compare-and-swap sees every commit. An OS crash or power loss rolls the
+ * database back to an earlier commit, never a torn one, and leaves no process
+ * holding a generation it observed. A commit that an irreversible act outside
+ * the database relies on sets `durable` and is synced with every commit before
+ * it (the deletion claim, sessionLifecycle.ts claimDeletions).
+ *
  * Nothing in this process may open and close a file descriptor on the
  * database file itself while SQLite has it open: POSIX drops every lock a
  * process holds on a file when any of its descriptors on that file is closed.
@@ -145,6 +154,9 @@ export interface WriteTransaction<T> {
    * of. No ops means nothing to commit: the transaction is rolled back.
    */
   build: () => { ops: readonly WriteOp[]; result: T }
+  /** Sync this commit, and every commit before it, to disk before returning,
+   *  so a power loss cannot undo it. */
+  durable?: boolean
   /** Consulted when COMMIT reports an error: whether it landed anyway, which
    *  SQLite allows when the checkpoint that follows a commit fails. */
   landedDespiteError?: () => boolean
@@ -192,9 +204,9 @@ export class StoreDatabase {
     try {
       this.reader.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(lockWaitMs))}`)
       // The reader writes nothing but the schema of a new database, and that
-      // needs no fsync of its own: the writer's first FULL commit syncs the
-      // whole WAL. It never checkpoints, since an unsynced checkpoint could
-      // corrupt the database on power loss.
+      // needs no fsync of its own: the writer's next checkpoint or durable
+      // commit syncs the whole WAL. It never checkpoints, since an unsynced
+      // checkpoint could corrupt the database on power loss.
       this.reader.exec("PRAGMA synchronous = OFF")
       this.reader.exec("PRAGMA wal_autocheckpoint = 0")
       const mode = this.get<{ journal_mode: string }>("PRAGMA journal_mode = WAL")?.journal_mode
@@ -288,6 +300,16 @@ export class StoreDatabase {
   /** One IMMEDIATE transaction, run at once. Only from inside an enqueued task. */
   async transactNow<T>(transaction: WriteTransaction<T>): Promise<WriteOutcome<T>> {
     await this.prepareWriter(transaction.lockWaitMs)
+    if (!transaction.durable) return this.commitNow(transaction)
+    await this.writer.exec("PRAGMA synchronous = FULL")
+    try {
+      return await this.commitNow(transaction)
+    } finally {
+      await this.writer.exec("PRAGMA synchronous = NORMAL")
+    }
+  }
+
+  private async commitNow<T>(transaction: WriteTransaction<T>): Promise<WriteOutcome<T>> {
     try {
       await this.writer.exec("BEGIN IMMEDIATE")
     } catch (error) {
@@ -327,7 +349,7 @@ export class StoreDatabase {
 
   private async prepareWriter(lockWaitMs: number): Promise<void> {
     this.writerReady ??= (async () => {
-      await this.writer.exec("PRAGMA synchronous = FULL")
+      await this.writer.exec("PRAGMA synchronous = NORMAL")
       // Keep a one-off large transaction (the import) from leaving a WAL of
       // its size on disk for good. Steady state stays near the 1000-page
       // autocheckpoint, about 4 MB.
