@@ -440,9 +440,10 @@ describe("work routing exclusions", () => {
     // When
     const response = await app.fetch(anthropicRequest())
 
-    // Then
-    expect(response.status).toBe(503)
-    expect(await responseErrorType(response)).toBe("no_eligible_profiles")
+    // Then: the managed list took the last account, so it is a capacity wait.
+    expect(response.status).toBe(429)
+    const body = await response.json() as { error?: { code?: string } }
+    expect(body.error?.code).toBe("no_routable_account")
     expect(queryCalls).toHaveLength(0)
   })
 

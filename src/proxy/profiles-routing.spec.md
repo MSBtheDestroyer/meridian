@@ -124,8 +124,18 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   no skip path produces it, since an auth failure is not a failover error. A
   profile with none of them (outside a retained route's single candidate) is
   left out. Unpinned `active`/`sticky` work every eligible profile of which is
-  reserve-held gets the same error; an account's own refusal in those modes,
-  a retained route's own hold, and pins keep their own errors. A pool only
+  reserve-held gets the same error, and so does unpinned work in any mode
+  whose pool is empty while at least one profile is out only because the
+  supervisor's `routingManagedExcludedProfiles` names it: the supervisor
+  allows no account, which is a capacity wait. `excluded` and `held` entries
+  carry the profile's known usage reset (a refused window it is spent on,
+  from SDK events or the cached usage snapshot) or null. A pool the user's
+  own `routingExcludedProfiles` (with held profiles) empties alone stays 503
+  `no_eligible_profiles`, a configuration error. `GET /settings/api/routing`
+  lists `managed-exclusion-no-routable` in `capabilities` so a supervisor can
+  tell this build from one that answers 503. An account's own refusal in
+  `active`/`sticky`, a retained route's own hold, and pins keep their own
+  errors. A pool only
   billing refusals ran out keeps the last-tried account's error and status:
   waiting will not reopen it, so it is not a rate limit.
 - **One incident per outage.** The first `pool_exhausted` event on

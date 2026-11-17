@@ -1268,6 +1268,19 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     ...new Set([...routingExcludedProfileIdsFor(profiles), ...routingHeldProfileIdsFor(profiles)]),
   ]
   const routingUnavailableProfileIds = () => routingUnavailableProfileIdsFor(getEffectiveProfiles(finalConfig.profiles))
+  /**
+   * Whether some profile is out of work routing only because the supervisor's
+   * managed list names it. Such a pool has no account the supervisor will let
+   * it use, which is a capacity wait; a pool the user's own list empties is a
+   * configuration error.
+   */
+  const someOutOnlyByManagedExclusion = (): boolean => {
+    const profiles = getEffectiveProfiles(finalConfig.profiles)
+    const manual = new Set(canonicalRoutingExcludedProfileIds(profiles, parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles"))))
+    const held = new Set(routingHeldProfileIdsFor(profiles))
+    return canonicalRoutingExcludedProfileIds(profiles, parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")))
+      .some(id => !manual.has(id) && !held.has(id) && profiles.some(p => p.id === id))
+  }
 
   // profiles.ts has no clear of its own: `resetActiveProfile` drops the
   // in-memory pointer but leaves settings.json naming a profile that may have
@@ -2010,6 +2023,16 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     if (namedReset !== null) return namedReset
     return findCooldownReset(profileCooldownWindows(profileId), now)
   }
+
+  /** `observedResetAtMs`, else the reset of a spent window in the cached usage snapshot. */
+  function knownUsageReset(profileId: string, now: number): number | null {
+    const cached = (peekOAuthUsage(profileId)?.windows ?? []).map(w => ({
+      type: w.type,
+      resetsAt: w.resetsAt,
+      exhausted: (w.utilization ?? 0) >= 1,
+    }))
+    return observedResetAtMs(profileId, now) ?? findCooldownReset(cached, now)
+  }
    /**
    * Record that an account refused, and publish it.
    *
@@ -2074,8 +2097,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       .filter(e => e.modelFamily === input.modelFamily)
       .map(e => [e.id, e.until]))
     return getEffectiveProfiles(finalConfig.profiles).flatMap(({ id }): NoRoutableProfile[] => {
-      if (excluded.has(id)) return [{ id, reason: "excluded", resetsAt: null }]
-      if (held.has(id)) return [{ id, reason: "held", resetsAt: null }]
+      if (excluded.has(id)) return [{ id, reason: "excluded", resetsAt: knownUsageReset(id, now) }]
+      if (held.has(id)) return [{ id, reason: "held", resetsAt: knownUsageReset(id, now) }]
       const reserve = input.reserveHold(id)
       if (reserve) return [{ id, reason: "reserve_held", resetsAt: reserve.opensAt }]
       const weekly = input.weeklyHolds?.get(id)
@@ -3217,8 +3240,23 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             return profileExcludedResponse(routingAccess.access.profileId)
           case "explicit_held":
             return profileHeldResponse(routingAccess.access.profileId)
-          case "no_eligible_profiles":
-            return noEligibleProfilesResponse()
+          case "no_eligible_profiles": {
+            if (!someOutOnlyByManagedExclusion()) return noEligibleProfilesResponse()
+            claudeLog("routing.managed_exclusion_refused", { routing: routingMode })
+            const reserves = usageReserves()
+            return noRoutableAccountResponse(noRoutableAccount({
+              requestId: requestMeta.requestId,
+              sessionKey: null,
+              routing: routingMode,
+              lead: "every profile is excluded from work routing",
+              reason: "excluded",
+              lastTried: null,
+              profiles: unroutableProfiles({
+                modelFamily: claudeModelFamily(typeof body.model === "string" ? body.model : "sonnet"),
+                reserveHold: id => claudeReserveHold(id, reserves),
+              }),
+            }))
+          }
           case "allowed":
             break
           default: {
@@ -10604,6 +10642,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       routingManagedExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")),
       routingHeldProfiles: configuredRoutingHeldProfileIds(),
       usageReserves: usageReserves(),
+      // What a supervisor may rely on this build doing; read rather than
+      // guessed from a version, which forks share.
+      capabilities: ["managed-exclusion-no-routable"],
       profiles: profileIds,
       saved: {
         routing: getSetting("routing") ?? null,

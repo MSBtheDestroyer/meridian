@@ -141,6 +141,8 @@ beforeEach(async () => {
   resetActiveProfile()
   rateLimitStore.clear()
   setSetting("usageReserves", {})
+  setSetting("routingExcludedProfiles", [])
+  setSetting("routingManagedExcludedProfiles", [])
   __setFetchOAuthUsageOverride(async () => null)
   for (const key of ENV_KEYS) savedEnv[key] = process.env[key]
   process.env.MERIDIAN_ROUTING = "active+priority"
@@ -155,6 +157,8 @@ afterEach(() => {
     else process.env[k] = v
   }
   setSetting("usageReserves", {})
+  setSetting("routingExcludedProfiles", [])
+  setSetting("routingManagedExcludedProfiles", [])
   __setFetchOAuthUsageOverride(null)
   rateLimitStore.clear()
   resetActiveProfile()
@@ -299,6 +303,52 @@ describe("the pool incident on /profiles/events", () => {
     const later = await errorOf(await post(app, { content: "later exhaustion" }))
     expect(later.incident_id).not.toBe(first.incident_id!)
   }, 60_000)
+})
+
+describe("no_routable_account when the supervisor's exclusions empty the pool", () => {
+  for (const routing of ["active", "active+priority"]) {
+    it(`answers 429 instead of no_eligible_profiles under ${routing}, naming each profile excluded`, async () => {
+      process.env.MERIDIAN_ROUTING = routing
+      setSetting("routingExcludedProfiles", ["spare"])
+      setSetting("routingManagedExcludedProfiles", ["work", "personal"])
+      const resetsAt = Date.now() + 2 * 3_600_000
+      rateLimitStore.record("work", { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt })
+      const app = createTestApp()
+
+      const res = await post(app, { content: `managed exclusion ${routing}` })
+
+      expect(res.status).toBe(429)
+      expect(res.headers.get("retry-after")).not.toBeNull()
+      const error = await errorOf(res)
+      expectContractShape(error)
+      expect(error.profiles!.map(p => [p.id, p.reason]).sort()).toEqual([["personal", "excluded"], ["spare", "excluded"], ["work", "excluded"]])
+      // A profile's known usage reset, else null.
+      const work = error.profiles!.find(p => p.id === "work")!
+      expect(Date.parse(work.resets_at!)).toBe(resetsAt)
+      expect(error.profiles!.find(p => p.id === "personal")!.resets_at).toBeNull()
+      expect(error.reset_at).toBe(work.resets_at)
+      const exhausted = (await events(app)).filter(e => e.kind === "pool_exhausted")
+      expect(exhausted.map(e => e.incidentId)).toEqual([error.incident_id!])
+    })
+  }
+
+  it("keeps 503 no_eligible_profiles when the user's own exclusions alone empty the pool", async () => {
+    setSetting("routingExcludedProfiles", ["work", "personal", "spare"])
+    setSetting("routingManagedExcludedProfiles", ["work"])
+    const app = createTestApp()
+
+    const res = await post(app, { content: "manual exclusion only" })
+
+    expect(res.status).toBe(503)
+    expect((await errorOf(res)).type).toBe("no_eligible_profiles")
+    expect((await events(app)).map(e => e.kind)).not.toContain("pool_exhausted")
+  })
+
+  it("advertises the behaviour on GET /settings/api/routing", async () => {
+    const res = await createTestApp().fetch(new Request("http://localhost/settings/api/routing"))
+    const body = await res.json() as { capabilities?: string[] }
+    expect(body.capabilities).toContain("managed-exclusion-no-routable")
+  })
 })
 
 describe("plain active mode", () => {
