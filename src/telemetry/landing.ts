@@ -94,8 +94,6 @@ export const landingHtml = `<!DOCTYPE html>
   .profile-card.spend-fading:hover > *, .profile-card.spend-spent:hover > * { filter: none; opacity: 1; }
   .profile-card.active.spend-fading > .profile-head, .profile-card.active.spend-spent > .profile-head { filter: none; opacity: 1; }
   .profile-card.active.spend-fading > .card-strip, .profile-card.active.spend-spent > .card-strip { filter: none; opacity: 1; }
-  /* An active card that needs a login keeps its brand ring outside the red
-     border, so it still reads as the active one by more than hue. */
   .profile-card.needs-login { border-color: var(--red); }
   .profile-card.needs-login .prof-dot { background: var(--red); }
   .spend-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
@@ -138,6 +136,7 @@ export const landingHtml = `<!DOCTYPE html>
     letter-spacing: 0.5px; text-transform: uppercase; text-align: center; white-space: nowrap; overflow: hidden; pointer-events: none; }
   .card-strip.strip-hint { background: var(--brand-bright, var(--accent)); clip-path: inset(0 0 100% 0); transition: clip-path 0.15s; }
   .profile-card.switchable:hover > .strip-hint, .profile-card.switchable:focus-visible > .strip-hint { clip-path: inset(0); }
+  .profile-card.spend-fading:focus-visible > .strip-hint, .profile-card.spend-spent:focus-visible > .strip-hint { filter: none; opacity: 1; }
   @media (max-width: 720px) {
     .profile-card.active, .profile-card.switchable { padding-top: 18px; }
   }

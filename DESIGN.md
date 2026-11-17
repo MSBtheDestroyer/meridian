@@ -141,18 +141,17 @@ at its provider, so card CSS never names one.
   the provider.
 - **Active:** brand border + 1px brand ring and brand dot. There is one per
   provider. On `/` a 12px brand strip across its top edge reads "ACTIVE" and
-  is its only Active label; `/profiles` has no strip and shows an Active pill.
+  is its only Active label; `/profiles` has no strip and shows an active badge.
 - **Switchable on hover:** `-bright` border with a faint brand fill. On `/`
   the same 12px strip, in `-bright`, reads "CLICK TO ACTIVATE" while the card
   is hovered or focused.
 - **Strip text:** `--on-brand` (black), which clears 4.5:1 on every brand and
-  its `-bright` tint; white does not on either green.
+  its `-bright` tint; white does not on either brand.
 - **Spent or failing:** shown by dimming and the existing badges. The active
-  border is never recoloured or faded, and the active card's name row, with
-  its Active strip and spent badge, never dims. Only its figures do.
-- **Needs a login:** a dashed red border. Beside the Claude brand the red
-  differs in hue alone (ΔE2000 12, and 3.5 to a protanope), so the pattern is
-  what keeps it from reading as an active border.
+  border is never recoloured or faded, and the active card's Active strip and
+  name row, with its spent badge, never dim. Only its figures do.
+- **Needs a login:** a red border, the same for every provider, and a
+  needs-login badge. An active card keeps its brand ring outside the red.
 - **Controls stay blue:** buttons, links, focus rings, drag handles and drop
   targets.
 
@@ -242,10 +241,9 @@ account card on the home page (or the Profiles page). The header chip only
   optional muted detail line. Use instead of a grid of chunky cards.
 - **Pills:** radius 10–20px, tinted fill + tinted border of the same hue
   (e.g. the update chip: blue text on `rgba(88,166,255,0.12)` with
-  `rgba(88,166,255,0.35)` border; an account's Active pill does the same in
-  its provider's brand). Badges in a row carry no margin: the row's flex
-  gap alone spaces the name from the first badge and each badge from the
-  next. Status badges: green/muted/red variants.
+  `rgba(88,166,255,0.35)` border). Badges in a row carry no margin: the
+  row's flex gap alone spaces the name from the first badge and each badge
+  from the next. Status badges: green/muted/red variants.
 - **Usage bar:** 6–8px track in `--surface2`, radius 3–4px, fill colored
   by the utilization thresholds; percentage readout matches the fill color.
 - **Buttons:** `--surface2` fill, accent text + accent border; hover =

@@ -290,6 +290,8 @@ describe("brand colours", () => {
     expect(hint).toContain("background: var(--brand-bright, var(--accent));")
     expect(hint).toContain("clip-path: inset(0 0 100% 0);")
     expect(css).toContain(".profile-card.switchable:hover > .strip-hint, .profile-card.switchable:focus-visible > .strip-hint { clip-path: inset(0); }")
+    // Hover lifts a dimmed card's fade; keyboard focus lifts it from the hint, which it reveals.
+    expect(css).toContain(".profile-card.spend-fading:focus-visible > .strip-hint, .profile-card.spend-spent:focus-visible > .strip-hint { filter: none; opacity: 1; }")
     // The fade dims a card's children; the active strip is spared with the name row.
     expect(css).toContain(".profile-card.active.spend-fading > .card-strip, .profile-card.active.spend-spent > .card-strip { filter: none; opacity: 1; }")
     expect(css).not.toContain(".switch-hint")
@@ -621,6 +623,19 @@ describe("the profiles page draws the same groups", () => {
     expect(html).toContain('class="switch-btn switch-to"')
   })
 
+  test("the header badge names an account's allowance, with its plan and tier on hover, in place of the type", () => {
+    const { html } = rendered(new MemoryStorage(), [
+      claude("c1", { isActive: true, allowance: "20x", planLabel: "Claude Max 20x", rateLimitTier: "default_claude_max_20x" }),
+      claude("c2", { allowance: "5x", planLabel: "Claude Max 5x" }),
+      claude("c3"),
+      seat("g1", { isActive: true, allowance: "1x", planLabel: "ChatGPT Plus" }),
+    ])
+    expect(html).toContain('<span class="profile-badge provider-badge">Claude</span><span class="profile-badge badge-type" title="Claude Max 20x \u00b7 default_claude_max_20x">20x</span>')
+    expect(html).toContain('<span class="profile-badge provider-badge">Claude</span><span class="profile-badge badge-type" title="Claude Max 5x">5x</span>')
+    expect(html).toContain('<span class="profile-badge provider-badge">ChatGPT</span><span class="profile-badge badge-type" title="ChatGPT Plus">1x</span>')
+    expect(html.split('badge-type">claude-max<').length - 1).toBe(1)
+  })
+
   test("a chip and the search compose; the count covers only the providers on screen", () => {
     const storage = new MemoryStorage()
     const { page } = rendered(storage, mixed())
@@ -703,6 +718,19 @@ describe("the profiles page draws the same groups", () => {
     page.run("location.hash = '#g1'; jumpToProfileAnchor()")
     expect(page.run<boolean>("meridianProviders.isHidden('chatgpt')")).toBe(false)
     expect(storage.getItem(HIDDEN_PROVIDERS_KEY)).toBe("[]")
+  })
+
+  test("every card can be removed, each through its own provider's route", () => {
+    const { page, html } = rendered(new MemoryStorage(), mixed())
+    const removeButtons = [...html.matchAll(/title="(Remove [a-z]+)" onclick="startRemove\(&quot;([^&]+)&quot;\)"/g)].map(m => [m[2], m[1]])
+    expect(removeButtons).toEqual([["c1", "Remove profile"], ["c2", "Remove profile"], ["g1", "Remove seat"], ["g2", "Remove seat"]])
+
+    page.run("var removeRoutes = []; fetch = function (url, init) { removeRoutes.push([url, init.body]); return new Promise(function () {}); }")
+    page.run("commitRemove('c2'); commitRemove('g1')")
+    expect(page.run<string[][]>("removeRoutes")).toEqual([
+      ["/profiles/claude/remove", '{"profile":"c2"}'],
+      ["/profiles/chatgpt/remove", '{"profile":"g1"}'],
+    ])
   })
 })
 

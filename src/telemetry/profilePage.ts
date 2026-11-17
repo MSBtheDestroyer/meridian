@@ -442,7 +442,7 @@ ${reorderLiveRegionHtml}
       <code>meridian profile list</code> \u2014 show all profiles and auth status<br>
       <code>meridian profile login &lt;name&gt;</code> \u2014 re-authenticate an expired profile<br>
       <code>meridian profile rename &lt;old&gt; &lt;new&gt;</code> \u2014 rename a profile (or use the pencil above)<br>
-      <code>meridian profile remove &lt;name&gt;</code> \u2014 remove a profile
+      <code>meridian profile remove &lt;name&gt;</code> \u2014 remove a profile (or use the trash can above)
     </div>
     <p style="font-size:13px;color:var(--muted);margin-top:12px">
       Renaming keeps the old name working: requests still naming it are served by
@@ -568,10 +568,7 @@ var updatePollTimer = null;
 // innerHTML, which would blank the input mid-keystroke.
 var editingProfile = null;
 var renameError = null;
-// Profile awaiting a remove confirmation, and the error from the last rejected
-// attempt. The poll is suspended while one is pending for the same reason a
-// rename suspends it: a redraw mid-decision would take the confirmation away
-// and leave the click that follows landing on whatever moved into its place.
+// A profile or seat being removed: its confirm panel is open, and the poll waits.
 var removingProfile = null;
 var removeError = null;
 
@@ -650,9 +647,11 @@ function cancelRemove() {
 }
 
 async function commitRemove(id) {
+  var target = ((lastProfiles && lastProfiles.profiles) || []).find(function (p) { return p.id === id; });
+  var route = target && isChatGptProfile(target) ? '/profiles/chatgpt/remove' : '/profiles/claude/remove';
   var data;
   try {
-    var res = await fetch('/profiles/remove', {
+    var res = await fetch(route, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ profile: id })
@@ -1215,8 +1214,11 @@ function render(data, quotaData) {
       html += "<a class=\\"profile-name\\" href=\\"#" + esc(encodeURIComponent(p.id)) + "\\" title=\\"Link to this profile\\">" + esc(p.id) + "</a>";
       if (isActive) html += "<span class=\\"profile-badge badge-active\\">active</span>";
       html += meridianProviders.badgeHtml(slot.provider, "profile-badge");
-      // A seat's type is its provider's name, which the badge before it says.
-      if ((p.type || "claude-max") !== slot.provider) html += "<span class=\\"profile-badge badge-type\\">" + esc(p.type || "claude-max") + "</span>";
+      // The allowance (20x, 5x) tells accounts apart; the type does not, as
+      // every claude-max profile shares it. Without an allowance the type
+      // stays, except on a seat, whose type is the provider badge's name.
+      if (p.allowance) html += '<span class="profile-badge badge-type" title="' + attr([p.planLabel, p.rateLimitTier].filter(Boolean).join(' \u00b7 ')) + '">' + esc(p.allowance) + '</span>';
+      else if ((p.type || "claude-max") !== slot.provider) html += "<span class=\\"profile-badge badge-type\\">" + esc(p.type || "claude-max") + "</span>";
       // The pill / shows, in the words of whoever holds the login.
       if (needsLogin) {
         var access = profileAccessHelp(p);
@@ -1227,7 +1229,7 @@ function render(data, quotaData) {
       if ((quotaById[p.id] || {}).servingOnCredits) html += '<span class="profile-badge badge-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
       html += "<span class=\\"profile-card-actions\\">";
       html += "<button class=\\"icon-btn\\" title=\\"Rename profile\\" onclick=\\"startRename(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_PENCIL + "</button>";
-      html += "<button class=\\"icon-btn danger\\" title=\\"Remove profile\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
+      html += "<button class=\\"icon-btn danger\\" title=\\"" + (isChatGptProfile(p) ? "Remove seat" : "Remove profile") + "\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
       html += "</span>";
     }
     html += '</div>';
@@ -1248,7 +1250,9 @@ function render(data, quotaData) {
       html += '</div></div>';
     } else if (removingProfile === p.id) {
       html += '<div class="remove-confirm">';
-      html += '<div class="remove-confirm-text">Remove <strong>' + esc(p.id) + '</strong>? Its stored credentials are deleted with it, so putting it back means logging in again.</div>';
+      html += '<div class="remove-confirm-text">Remove <strong>' + esc(p.id) + '</strong>? ' + (isChatGptProfile(p)
+        ? 'Its stored credentials are deleted with it, so putting it back means logging in again.'
+        : 'Credentials Meridian stored for it are deleted with it; a login it shares with another profile or with your own Claude Code stays. Requests that name it with <code>x-meridian-profile</code> are refused afterwards.') + '</div>';
       if (removeError) html += '<div class="rename-error">' + esc(removeError) + '</div>';
       html += '<div class="remove-confirm-actions">';
       html += '<button class="confirm-btn danger" onclick="commitRemove(&quot;'+esc(p.id)+'&quot;)">Remove</button>';

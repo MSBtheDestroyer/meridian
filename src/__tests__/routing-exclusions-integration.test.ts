@@ -312,9 +312,9 @@ describe("profile mutation reconciliation", () => {
       setSetting("routingExcludedProfiles", ["personal"])
 
       // When
-      const response = await app.fetch(new Request("http://localhost/profiles/remove", {
+      const response = await app.fetch(new Request("http://localhost/profiles/claude/remove", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", origin: "http://localhost" },
         body: JSON.stringify({ profile: "work" }),
       }))
 

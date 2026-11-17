@@ -23,7 +23,7 @@ import { promisify } from "node:util"
 import { claudeLog } from "../logger"
 import { authLifecycleFor, noteRefreshRejected, noteRefreshSucceeded } from "./authLifecycle"
 import { isCredentialsReadOnly, refuseCredentialWrite } from "./credentialsMode"
-import { readPlanUpdate, resetPlanRecheck, runCredentialMaintenance } from "./planRecheck"
+import { planReadingDue, readPlanUpdate, resetPlanRecheck, runCredentialMaintenance } from "./planRecheck"
 
 const execFile = promisify(execFileCb)
 
@@ -366,14 +366,27 @@ export async function refreshOAuthToken(store?: CredentialStore): Promise<boolea
   return runCredentialMaintenance(s, { kind: "token", run: () => doRefresh(s) })
 }
 
+/**
+ * Re-read the plan of a credential whose access token is still valid, and
+ * write only the plan fields the reading carried. Runs in the same per-store
+ * slot as a token rotation, so a slow plan response can never write back
+ * tokens a concurrent rotation has already replaced.
+ */
 async function recheckStoredPlan(store: CredentialStore): Promise<boolean> {
   const credentials = await store.read()
   if (!credentials?.claudeAiOauth.accessToken) return false
   const update = await readPlanUpdate(credentials.claudeAiOauth, store)
   if (!update) return true
-  credentials.claudeAiOauth = { ...credentials.claudeAiOauth, ...update.fields, planCheckedAt: update.checkedAt }
-  if (update.fields.seatTier === null) delete credentials.claudeAiOauth.seatTier
-  if (!(await store.write(credentials))) return false
+  // The slot does not cover the CLI, a re-login or another instance, any of
+  // which may rotate the tokens during the lookup. Lay the plan over what is
+  // on disk now, and only while it is still the token the plan was read with:
+  // writing back the tokens read before the lookup could restore a spent
+  // refresh token.
+  const current = await store.read()
+  if (current?.claudeAiOauth.accessToken !== credentials.claudeAiOauth.accessToken) return true
+  current.claudeAiOauth = { ...current.claudeAiOauth, ...update.fields, planCheckedAt: update.checkedAt }
+  if (update.fields.seatTier === null) delete current.claudeAiOauth.seatTier
+  if (!(await store.write(current))) return false
   invalidateCredentialFacts(store.refreshKey)
   claudeLog("auth.plan_rechecked", { fields: update.fields, checkedAt: update.checkedAt })
   return true
@@ -465,6 +478,11 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
     ...(refreshTokenExpiresAt ? { refreshTokenExpiresAt } : {}),
   }
 
+  // A plan can change while the login stays the same (Pro to Max, a Team seat
+  // moved to another tier), so a reading expires instead of being taken once.
+  // A due reading rides along with the rotation's single write; a fresh
+  // reported field wins over the stored one, and a field the reading omitted
+  // keeps its stored value.
   const planUpdate = await readPlanUpdate(credentials.claudeAiOauth, store)
   if (planUpdate) credentials.claudeAiOauth = {
     ...credentials.claudeAiOauth, ...planUpdate.fields, planCheckedAt: planUpdate.checkedAt,
@@ -558,6 +576,10 @@ async function noteRefreshRefused(
  * expiresAt, refresh request failed). False is non-fatal — the caller
  * proceeds with whatever token is on disk and falls back to the reactive
  * refresh-on-401 path if Anthropic rejects it.
+ *
+ * `recheckPlan` is for the background maintenance loop only: a valid token
+ * then also gets its plan re-read when that reading is due. The request path
+ * leaves it off, so admitting a request never waits on the profile endpoint.
  */
 export async function ensureFreshToken(
   store?: CredentialStore,
@@ -569,7 +591,7 @@ export async function ensureFreshToken(
   const expiresAt = credentials?.claudeAiOauth?.expiresAt
   if (!expiresAt) return false
   if (expiresAt - Date.now() > bufferMs) {
-    if (recheckPlan && !isCredentialsReadOnly()) {
+    if (recheckPlan && !isCredentialsReadOnly() && planReadingDue(credentials.claudeAiOauth, s)) {
       await runCredentialMaintenance(s, { kind: "plan", run: () => recheckStoredPlan(s) })
     }
     return true
@@ -658,6 +680,8 @@ interface StoredCredentialFacts {
 
 const credentialFactsCache = new Map<string, { value: StoredCredentialFacts; at: number }>()
 const credentialFactsInflight = new Map<string, Promise<StoredCredentialFacts>>()
+// Bumped by every successful write, so a read that started before the write
+// cannot cache the value it saw once it finishes.
 const credentialFactsVersions = new Map<string, number>()
 let credentialFactsGeneration = 0
 
@@ -689,8 +713,6 @@ export function resetAuthRenewalCache(): void {
  */
 async function readCredentialFacts(s: CredentialStore): Promise<StoredCredentialFacts> {
   const key = s.refreshKey
-  const generation = credentialFactsGeneration
-  const version = key ? credentialFactsVersions.get(key) ?? 0 : 0
   if (key) {
     const cached = credentialFactsCache.get(key)
     if (cached && Date.now() - cached.at < CREDENTIAL_FACTS_TTL_MS) return cached.value
@@ -698,6 +720,8 @@ async function readCredentialFacts(s: CredentialStore): Promise<StoredCredential
     if (inflight) return inflight
   }
 
+  const generation = credentialFactsGeneration
+  const version = key ? credentialFactsVersions.get(key) ?? 0 : 0
   const read = (async (): Promise<StoredCredentialFacts> => {
     let credentials: CredentialsFile | null = null
     try {
