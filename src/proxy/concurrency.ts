@@ -116,12 +116,12 @@ export class AbortableSemaphore {
   }
 
   /**
-   * A lease if a slot is free and nobody is queued for one, otherwise
-   * undefined. It never joins the queue, so background work using it never
-   * sits ahead of a request that is waiting for a slot.
+   * Take a permit now or not at all, for background work that must never
+   * delay a client request: it never queues, never goes ahead of a waiter,
+   * and leaves `reserve` permits free for whoever arrives next.
    */
-  tryAcquire(): SemaphoreLease | undefined {
-    if (this.activeCount >= this.limit || this.waiters.length > 0) return undefined
+  tryAcquire(reserve = 0): SemaphoreLease | undefined {
+    if (this.waiters.length > 0 || this.activeCount + 1 + Math.max(0, reserve) > this.limit) return undefined
     this.activeCount++
     return this.createLease(Date.now())
   }

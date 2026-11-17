@@ -1,0 +1,369 @@
+/**
+ * The error a client gets when pool routing has no Claude account left for a
+ * request, through the HTTP layer with a mocked SDK.
+ *
+ * A client that can read it pauses the conversation instead of letting it die
+ * on a rate limit, and a supervisor polling `/profiles/events` opens one
+ * incident per outage rather than one per refused request. So the assertions
+ * are on the machine-read fields: the code, the incident that ties the error
+ * to its `pool_exhausted` events, and the per-profile reasons.
+ */
+import { describe, it, expect, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
+import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
+
+let failingDirs = new Set<string>()
+const SESSION_LIMIT = "Claude Code returned an error result: You've hit your session limit · resets 12:30am (America/Chicago)"
+
+installSdkMock(() => ({
+  query: (params: any) => {
+    const dir = params.options?.env?.CLAUDE_CONFIG_DIR ?? "default"
+    const sessionId = resolveMockSdkSessionId(params.options, "test-session")
+    return (async function* () {
+      if ([...failingDirs].some((f) => dir.includes(f))) throw new Error(SESSION_LIMIT)
+      yield { ...assistantMessage([{ type: "text", text: "ok from " + dir }]), session_id: sessionId }
+    })()
+  },
+  createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
+  tool: () => ({}),
+}), "no-routable-account.test.ts")
+
+installLoggerMock(() => ({
+  claudeLog: () => {},
+  withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
+}))
+
+installMcpToolsMock(() => ({
+  createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
+}))
+
+const { createProxyServer, clearSessionCache } = await import("../proxy/server")
+const { resetActiveProfile } = await import("../proxy/profiles")
+const { __setFetchOAuthUsageOverride } = await import("../proxy/oauthUsage")
+const { rateLimitStore } = await import("../proxy/rateLimitStore")
+const { setSetting } = await import("../settings")
+
+const ALL_DIRS = ["nr-work", "nr-personal", "nr-spare"]
+const PROFILES = [
+  { id: "work", claudeConfigDir: "/tmp/meridian-nr-work" },
+  { id: "personal", claudeConfigDir: "/tmp/meridian-nr-personal" },
+  { id: "spare", claudeConfigDir: "/tmp/meridian-nr-spare" },
+]
+const DAY = 24 * 3_600_000
+const PREFIX = "No routable Claude account: "
+const CONTRACT_FIELDS = ["type", "code", "message", "reset_at", "incident_id", "request_id", "profiles"]
+const REASONS = ["spent", "reserve_held", "weekly_held", "model_benched", "excluded", "held", "extra_usage_off", "logged_out"]
+const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
+
+type TestApp = { fetch: (r: Request) => Response | Promise<Response> }
+type ProfileEntry = { id: string; reason: string; resets_at: string | null }
+type NoRoutableError = {
+  type: string
+  code?: string
+  message: string
+  reset_at?: string | null
+  incident_id?: string
+  request_id?: string
+  profiles?: ProfileEntry[]
+}
+type PoolEvent = {
+  seq: number
+  kind: string
+  profile: string
+  servedBy: string | null
+  incidentId?: string
+  requestId?: string | null
+  sessionKey: string | null
+  resetAt?: string | null
+  profiles?: Array<{ id: string; reason: string; resetsAt: string | null }>
+}
+
+function createTestApp(): TestApp {
+  return createProxyServer({ port: 0, host: "127.0.0.1", profiles: PROFILES, defaultProfile: "work" }).app
+}
+
+function post(app: TestApp, opts: { stream?: boolean; content?: string } = {}) {
+  return Promise.resolve(app.fetch(new Request("http://localhost/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-5",
+      max_tokens: 128,
+      stream: opts.stream ?? false,
+      messages: [{ role: "user", content: opts.content ?? "hello" }],
+    }),
+  })))
+}
+
+async function errorOf(res: Response): Promise<NoRoutableError> {
+  return (await res.json() as { error: NoRoutableError }).error
+}
+
+async function events(app: TestApp): Promise<PoolEvent[]> {
+  const res = await app.fetch(new Request("http://localhost/profiles/events?since=0&limit=500"))
+  return (await res.json() as { events: PoolEvent[] }).events
+}
+
+/** The error frames of an SSE body, parsed. */
+function streamErrors(text: string): NoRoutableError[] {
+  return text.split("\n\n")
+    .filter(frame => frame.startsWith("event: error"))
+    .map(frame => (JSON.parse(frame.slice(frame.indexOf("data: ") + 6)) as { error: NoRoutableError }).error)
+}
+
+/** Every field the contract names, in the shape it names. */
+function expectContractShape(error: NoRoutableError): void {
+  for (const field of CONTRACT_FIELDS) expect(Object.keys(error)).toContain(field)
+  expect(error.type).toBe("rate_limit_error")
+  expect(error.code).toBe("no_routable_account")
+  expect(error.message.startsWith(PREFIX)).toBe(true)
+  expect(error.incident_id).toMatch(/^inc_\d+_\d+$/)
+  const token = error.message.match(/\(incident (inc_\d+_\d+)\)$/)
+  expect(token?.[1]).toBe(error.incident_id!)
+  expect(typeof error.request_id).toBe("string")
+  expect(error.request_id!.length).toBeGreaterThan(0)
+  if (error.reset_at !== null) expect(error.reset_at).toMatch(ISO)
+  for (const entry of error.profiles!) {
+    expect(Object.keys(entry).sort()).toEqual(["id", "reason", "resets_at"])
+    expect(REASONS).toContain(entry.reason)
+    if (entry.resets_at !== null) expect(entry.resets_at).toMatch(ISO)
+  }
+}
+
+const savedEnv: Record<string, string | undefined> = {}
+const ENV_KEYS = ["MERIDIAN_ROUTING", "MERIDIAN_PROFILE_ORDER", "MERIDIAN_WEEKLY_RESERVE", "MERIDIAN_CLAUDE_EXTRA_USAGE"]
+
+beforeEach(async () => {
+  failingDirs = new Set()
+  await clearSessionCache()
+  resetActiveProfile()
+  rateLimitStore.clear()
+  setSetting("usageReserves", {})
+  setSetting("routingExcludedProfiles", [])
+  setSetting("routingManagedExcludedProfiles", [])
+  __setFetchOAuthUsageOverride(async () => null)
+  for (const key of ENV_KEYS) savedEnv[key] = process.env[key]
+  process.env.MERIDIAN_ROUTING = "active+priority"
+  process.env.MERIDIAN_PROFILE_ORDER = "work,personal,spare"
+  delete process.env.MERIDIAN_WEEKLY_RESERVE
+  delete process.env.MERIDIAN_CLAUDE_EXTRA_USAGE
+})
+
+afterEach(() => {
+  for (const [k, v] of Object.entries(savedEnv)) {
+    if (v === undefined) delete process.env[k]
+    else process.env[k] = v
+  }
+  setSetting("usageReserves", {})
+  setSetting("routingExcludedProfiles", [])
+  setSetting("routingManagedExcludedProfiles", [])
+  __setFetchOAuthUsageOverride(null)
+  rateLimitStore.clear()
+  resetActiveProfile()
+})
+
+describe("no_routable_account before the stream starts", () => {
+  it("answers 429 with Retry-After and the contract's fields when every candidate refuses", async () => {
+    for (const dir of ALL_DIRS) failingDirs.add(dir)
+    const app = createTestApp()
+
+    const res = await post(app)
+
+    expect(res.status).toBe(429)
+    expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(0)
+    const error = await errorOf(res)
+    expectContractShape(error)
+    expect(error.profiles!.map(p => [p.id, p.reason]).sort()).toEqual([["personal", "spent"], ["spare", "spent"], ["work", "spent"]])
+    // The pool opens when its first account does, and every refused one names when.
+    expect(error.profiles!.every(p => p.resets_at !== null)).toBe(true)
+    const earliest = Math.min(...error.profiles!.map(p => Date.parse(p.resets_at!)))
+    expect(Date.parse(error.reset_at!)).toBe(earliest)
+  }, 40_000)
+})
+
+describe("no_routable_account inside the stream", () => {
+  it("carries exactly the pre-stream error object's fields in its one error frame", async () => {
+    for (const dir of ALL_DIRS) failingDirs.add(dir)
+    const app = createTestApp()
+
+    const res = await post(app, { stream: true, content: "streamed unique message" })
+
+    expect(res.status).toBe(200)
+    const frames = streamErrors(await res.text())
+    expect(frames).toHaveLength(1)
+    const error = frames[0]!
+    expectContractShape(error)
+    expect(error.profiles!.map(p => p.id).sort()).toEqual(["personal", "spare", "work"])
+
+    // Same object shape as the JSON body a non-streaming request gets.
+    const jsonError = await errorOf(await post(app, { content: "json unique message" }))
+    expect(Object.keys(error).sort()).toEqual(Object.keys(jsonError).sort())
+  }, 40_000)
+})
+
+describe("no_routable_account when every candidate is held back", () => {
+  const FLAT_WEEK_95 = { seven_day: { floor: 95, ceiling: 95 } }
+
+  function holdEveryProfile(): void {
+    setSetting("usageReserves", { work: FLAT_WEEK_95, personal: FLAT_WEEK_95, spare: FLAT_WEEK_95 })
+    for (const [id, days] of [["work", 3], ["personal", 2], ["spare", 4]] as const) {
+      rateLimitStore.record(id, { status: "allowed", rateLimitType: "seven_day", utilization: 0.97, resetsAt: Date.now() + days * DAY })
+    }
+  }
+
+  it("names every profile reserve_held and opens at the soonest reserve under pool routing", async () => {
+    holdEveryProfile()
+    const app = createTestApp()
+
+    const res = await post(app)
+
+    expect(res.status).toBe(429)
+    expect(res.headers.get("retry-after")).not.toBeNull()
+    const error = await errorOf(res)
+    expectContractShape(error)
+    expect(error.profiles!.map(p => [p.id, p.reason]).sort()).toEqual([["personal", "reserve_held"], ["spare", "reserve_held"], ["work", "reserve_held"]])
+    const personal = error.profiles!.find(p => p.id === "personal")!
+    expect(error.reset_at).toBe(personal.resets_at)
+  })
+
+  it("does the same for unpinned work in plain active mode", async () => {
+    process.env.MERIDIAN_ROUTING = "active"
+    holdEveryProfile()
+    const app = createTestApp()
+
+    const res = await post(app)
+
+    expect(res.status).toBe(429)
+    const error = await errorOf(res)
+    expectContractShape(error)
+    expect(error.profiles!.every(p => p.reason === "reserve_held")).toBe(true)
+  })
+
+  it("names weekly_held when every profile holds its weekly reserve", async () => {
+    process.env.MERIDIAN_WEEKLY_RESERVE = "work=10,personal=10,spare=10"
+    for (const id of ["work", "personal", "spare"]) {
+      rateLimitStore.record(id, { status: "allowed", rateLimitType: "seven_day", utilization: 0.95, resetsAt: Date.now() + 2 * DAY })
+    }
+    const app = createTestApp()
+
+    const error = await errorOf(await post(app))
+
+    expectContractShape(error)
+    expect(error.profiles!.every(p => p.reason === "weekly_held" && p.resets_at !== null)).toBe(true)
+  })
+
+  it("names extra_usage_off when every profile would draw Extra Usage and the policy is never", async () => {
+    process.env.MERIDIAN_CLAUDE_EXTRA_USAGE = "never"
+    for (const id of ["work", "personal", "spare"]) {
+      rateLimitStore.record(id, { status: "allowed", rateLimitType: "five_hour", utilization: 1, isUsingOverage: true, resetsAt: Date.now() + 3_600_000 })
+    }
+    const app = createTestApp()
+
+    const error = await errorOf(await post(app))
+
+    expectContractShape(error)
+    expect(error.profiles!.every(p => p.reason === "extra_usage_off")).toBe(true)
+  })
+})
+
+describe("the pool incident on /profiles/events", () => {
+  it("opens on the first exhaustion, carries through the next, and closes with pool_recovered when an account serves", async () => {
+    for (const dir of ALL_DIRS) failingDirs.add(dir)
+    const app = createTestApp()
+
+    const first = await errorOf(await post(app, { content: "first exhaustion" }))
+    const second = await errorOf(await post(app, { content: "second exhaustion" }))
+    expect(second.incident_id).toBe(first.incident_id!)
+    expect(second.request_id).not.toBe(first.request_id!)
+
+    const exhausted = (await events(app)).filter(e => e.kind === "pool_exhausted")
+    expect(exhausted).toHaveLength(2)
+    expect(exhausted.map(e => e.incidentId)).toEqual([first.incident_id!, first.incident_id!])
+    expect(exhausted.map(e => e.requestId)).toEqual([first.request_id!, second.request_id!])
+    // The id is the first exhaustion's own time and seq.
+    expect(first.incident_id).toBe(`inc_${(exhausted[0] as PoolEvent & { at: number }).at}_${exhausted[0]!.seq}`)
+    expect(exhausted[0]!.resetAt).toBe(first.reset_at!)
+    expect(exhausted[0]!.profiles).toEqual(first.profiles!.map(p => ({ id: p.id, reason: p.reason, resetsAt: p.resets_at })))
+
+    failingDirs.clear()
+    expect((await post(app, { content: "served again" })).status).toBe(200)
+    const recovered = (await events(app)).filter(e => e.kind === "pool_recovered")
+    expect(recovered).toHaveLength(1)
+    expect(recovered[0]!.incidentId).toBe(first.incident_id!)
+    expect(recovered[0]!.servedBy).toBe("work")
+
+    // Only the first served request closes it.
+    expect((await post(app, { content: "served once more" })).status).toBe(200)
+    expect((await events(app)).filter(e => e.kind === "pool_recovered")).toHaveLength(1)
+
+    // The next outage is a new incident.
+    for (const dir of ALL_DIRS) failingDirs.add(dir)
+    const later = await errorOf(await post(app, { content: "later exhaustion" }))
+    expect(later.incident_id).not.toBe(first.incident_id!)
+  }, 60_000)
+})
+
+describe("no_routable_account when the supervisor's exclusions empty the pool", () => {
+  for (const routing of ["active", "active+priority"]) {
+    it(`answers 429 instead of no_eligible_profiles under ${routing}, naming each profile excluded`, async () => {
+      process.env.MERIDIAN_ROUTING = routing
+      setSetting("routingExcludedProfiles", ["spare"])
+      setSetting("routingManagedExcludedProfiles", ["work", "personal"])
+      const resetsAt = Date.now() + 2 * 3_600_000
+      rateLimitStore.record("work", { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt })
+      const app = createTestApp()
+
+      const res = await post(app, { content: `managed exclusion ${routing}` })
+
+      expect(res.status).toBe(429)
+      expect(res.headers.get("retry-after")).not.toBeNull()
+      const error = await errorOf(res)
+      expectContractShape(error)
+      expect(error.profiles!.map(p => [p.id, p.reason]).sort()).toEqual([["personal", "excluded"], ["spare", "excluded"], ["work", "excluded"]])
+      // A profile's known usage reset, else null.
+      const work = error.profiles!.find(p => p.id === "work")!
+      expect(Date.parse(work.resets_at!)).toBe(resetsAt)
+      expect(error.profiles!.find(p => p.id === "personal")!.resets_at).toBeNull()
+      expect(error.reset_at).toBe(work.resets_at)
+      const exhausted = (await events(app)).filter(e => e.kind === "pool_exhausted")
+      expect(exhausted.map(e => e.incidentId)).toEqual([error.incident_id!])
+    })
+  }
+
+  it("keeps 503 no_eligible_profiles when the user's own exclusions alone empty the pool", async () => {
+    setSetting("routingExcludedProfiles", ["work", "personal", "spare"])
+    setSetting("routingManagedExcludedProfiles", ["work"])
+    const app = createTestApp()
+
+    const res = await post(app, { content: "manual exclusion only" })
+
+    expect(res.status).toBe(503)
+    expect((await errorOf(res)).type).toBe("no_eligible_profiles")
+    expect((await events(app)).map(e => e.kind)).not.toContain("pool_exhausted")
+  })
+
+  it("advertises the behaviour on GET /settings/api/routing", async () => {
+    const res = await createTestApp().fetch(new Request("http://localhost/settings/api/routing"))
+    const body = await res.json() as { capabilities?: string[] }
+    expect(body.capabilities).toContain("managed-exclusion-no-routable")
+  })
+})
+
+describe("plain active mode", () => {
+  it("still answers a refusal with the account's own error, outside any incident", async () => {
+    process.env.MERIDIAN_ROUTING = "active"
+    failingDirs.add("nr-work")
+    const app = createTestApp()
+
+    const res = await post(app)
+
+    expect(res.status).toBe(429)
+    const error = await errorOf(res)
+    expect(error.type).toBe("rate_limit_error")
+    expect(error.code).toBeUndefined()
+    expect(error.message.startsWith(PREFIX)).toBe(false)
+    expect((await events(app)).map(e => e.kind)).not.toContain("pool_exhausted")
+  }, 20_000)
+})

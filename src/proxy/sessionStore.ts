@@ -993,7 +993,7 @@ interface StoreCommit {
   seq: number
 }
 
-async function mutateStore(mutator: (document: SessionStoreDocument) => boolean): Promise<void> {
+async function mutateStore(mutator: (document: SessionStoreDocument) => boolean, beforePublish?: () => void, afterCommit?: () => void): Promise<void> {
   const database = storeDatabase()
   const commitToken = randomUUID()
   await enqueueStoreTask(database, async () => {
@@ -1018,18 +1018,25 @@ async function mutateStore(mutator: (document: SessionStoreDocument) => boolean)
           }
         }
         const seq = base.seq + 1
-        return { ops: storeChangeOps(base.document, draft, seq, commitToken), result: { base, draft, seq } }
+        const ops = storeChangeOps(base.document, draft, seq, commitToken)
+        // Recheck authority at the publication boundary: the queue and the
+        // lock wait yield to cancellation and forced shutdown.
+        if (ops.length > 0) beforePublish?.()
+        return { ops, result: { base, draft, seq } }
       },
       landedDespiteError: () => readStoreInfo(database).commit_token === commitToken,
     })
-    if (!committed || !commit) return
-    if (storeCaches.get(database) === commit.base) {
-      storeCaches.set(database, { seq: commit.seq, document: committedDocument(commit.base.document, commit.draft) })
-    } else if ((storeCaches.get(database)?.seq ?? -1) < commit.seq) {
-      // A read replaced the cache before this commit landed; the next read
-      // loads what the database holds.
-      storeCaches.delete(database)
+    if (committed && commit) {
+      if (storeCaches.get(database) === commit.base) {
+        storeCaches.set(database, { seq: commit.seq, document: committedDocument(commit.base.document, commit.draft) })
+      } else if ((storeCaches.get(database)?.seq ?? -1) < commit.seq) {
+        // A read replaced the cache before this commit landed; the next read
+        // loads what the database holds.
+        storeCaches.delete(database)
+      }
     }
+    // Complete local effects before admitting the next writer.
+    afterCommit?.()
   })
 }
 
@@ -1322,7 +1329,18 @@ export async function storeSharedSession(
   expectedGeneration?: StoredSessionGeneration | null,
   clientLineageHash?: string | null,
   resumeContextHash?: string | null,
+  beforePublish?: () => void,
 ): Promise<StoredSessionGeneration | false> {
+  // Capture caller-owned history before the queue or disk yields. Validation
+  // and publication must refer to the same values even if the caller reuses
+  // its arrays or locators while this transaction waits.
+  messageHashes = messageHashes?.slice()
+  sdkMessageUuids = sdkMessageUuids?.slice()
+  contextUsage = contextUsage === undefined ? undefined : structuredClone(contextUsage)
+  messageBlockHashes = messageBlockHashes?.map(blocks => blocks.slice())
+  passthroughToolCallIds = passthroughToolCallIds?.slice() ?? passthroughToolCallIds
+  currentTranscript = currentTranscript === undefined ? undefined : { ...currentTranscript }
+  sourceTranscript = sourceTranscript === undefined ? undefined : { ...sourceTranscript }
   if (currentTranscript !== undefined) {
     validateTranscriptLocator(currentTranscript, claudeSessionId)
   }
@@ -1428,7 +1446,7 @@ export async function storeSharedSession(
       }
     }
     return true
-  })
+  }, beforePublish)
   return storedGeneration
 }
 
@@ -1460,6 +1478,7 @@ export async function claimPriorityAttempt(options: {
   expectedAssignmentGeneration: PriorityAssignmentGeneration
   turn?: PriorityAttemptTurn
 }): Promise<PriorityAttemptClaim | false> {
+  options = structuredClone(options)
   if (!options.routeKey || options.routeKey.length > 512) {
     throw new Error("priority attempt requires a bounded route key")
   }
@@ -1653,7 +1672,9 @@ function validatePriorityPublicationInput(options: SharedSessionAndPriorityAssig
  */
 export async function storeSharedSessionAndPriorityAssignment(
   options: SharedSessionAndPriorityAssignmentOptions,
+  beforePublish?: () => void,
 ): Promise<SharedSessionAndPriorityAssignmentResult | false> {
+  options = structuredClone(options)
   validatePriorityPublicationInput(options)
   let result: SharedSessionAndPriorityAssignmentResult | false = false
   await mutateStore((document) => {
@@ -1825,7 +1846,7 @@ export async function storeSharedSessionAndPriorityAssignment(
       previousAssignment: existingAssignment ? structuredClone(existingAssignment) : null,
     }
     return true
-  })
+  }, beforePublish)
   return result
 }
 
@@ -1844,7 +1865,9 @@ export interface FinalizeSharedSessionAndPriorityAssignmentOptions {
  */
 export async function finalizeSharedSessionAndPriorityAssignment(
   options: FinalizeSharedSessionAndPriorityAssignmentOptions,
+  beforePublish?: () => void,
 ): Promise<boolean> {
+  options = structuredClone(options)
   let finalized = false
   await mutateStore((document) => {
     if (document.meta.version !== PRIORITY_STORE_META_VERSION) return false
@@ -1891,7 +1914,7 @@ export async function finalizeSharedSessionAndPriorityAssignment(
     }
     finalized = true
     return true
-  })
+  }, beforePublish)
   return finalized
 }
 
@@ -1916,6 +1939,7 @@ export interface RollbackSharedSessionAndPriorityAssignmentResult {
 export async function rollbackSharedSessionAndPriorityAssignment(
   options: RollbackSharedSessionAndPriorityAssignmentOptions,
 ): Promise<RollbackSharedSessionAndPriorityAssignmentResult | false> {
+  options = structuredClone(options)
   let result: RollbackSharedSessionAndPriorityAssignmentResult | false = false
   await mutateStore((document) => {
     if (document.meta.version !== PRIORITY_STORE_META_VERSION) return false
@@ -2003,7 +2027,9 @@ export async function attachSharedTranscriptLocator(
   expectedClaudeSessionId: string,
   locator: TranscriptLocator,
   expectedGeneration?: StoredSessionGeneration,
+  beforePublish?: () => void,
 ): Promise<StoredSessionGeneration | false> {
+  locator = { ...locator }
   validateTranscriptLocator(locator, expectedClaudeSessionId)
   let attachedGeneration: StoredSessionGeneration | false = false
   await mutateStore(({ sessions: store, meta }) => {
@@ -2037,7 +2063,7 @@ export async function attachSharedTranscriptLocator(
       return false
     }
     return true
-  })
+  }, beforePublish)
   return attachedGeneration
 }
 
@@ -2163,6 +2189,7 @@ export function listSupersededProfileConversations(options: ProfileCopyPruneOpti
  * Returns the number of mappings removed.
  */
 export async function pruneSupersededProfileCopies(options: ProfileCopyPruneOptions): Promise<number> {
+  options = { ...options, profileIds: new Set(options.profileIds) }
   // Select from the cached document first so the common no-op sweep takes no
   // lock and writes nothing.
   if (selectSupersededProfileCopies(currentDocument(), options, Date.now()).length === 0) {
@@ -2224,7 +2251,7 @@ export function listStoredSessions(): Array<{
   }))
 }
 
-export async function clearSharedSessions(): Promise<void> {
+export async function clearSharedSessions(afterCommit?: () => void): Promise<void> {
   await mutateStore(({ sessions: store, meta }) => {
     for (const key of Object.keys(store)) {
       delete store[key]
@@ -2242,7 +2269,7 @@ export async function clearSharedSessions(): Promise<void> {
       }
     }
     return true
-  })
+  }, undefined, afterCommit)
 }
 
 /**

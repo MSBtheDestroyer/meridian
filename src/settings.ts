@@ -18,7 +18,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import { configPath } from "./configDir"
-import type { PriorityFailbackPolicy } from "./proxy/routing"
+import type { ClaudeExtraUsagePolicy, PriorityFailbackPolicy } from "./proxy/routing"
 import type { UsageReserveMap } from "./proxy/usageReserve"
 import type { ClaudeExecutableMode } from "./proxy/claudeExecutablePreference"
 import type { PageLayout } from "./telemetry/pageLayout"
@@ -45,6 +45,9 @@ export interface MeridianSettings {
    *  profiles.json order. MERIDIAN_PROFILE_ORDER env var takes precedence. */
   profileOrder?: string[]
   priorityFailback?: PriorityFailbackPolicy
+  /** Pool-routing weekly reserve per profile id, in percent (e.g.
+   *  `{ "personal": 20 }`). MERIDIAN_WEEKLY_RESERVE env var takes precedence. */
+  weeklyReserve?: Record<string, number>
   routingExcludedProfiles?: string[]
   routingManagedExcludedProfiles?: string[]
   /**
@@ -60,6 +63,9 @@ export interface MeridianSettings {
    * `PUT /settings/api/routing`; re-read per request.
    */
   usageReserves?: UsageReserveMap
+  /** Pool routing: when an account on Extra Usage may take work (`reserve`
+   *  default). MERIDIAN_CLAUDE_EXTRA_USAGE env var takes precedence. */
+  claudeExtraUsage?: ClaudeExtraUsagePolicy
   /** The ChatGPT seat (accountUserId) unpinned ChatGPT turns go to first; POST /profiles/active. */
   chatGptActiveSeat?: string
   /** Operator-chosen profile ids for ChatGPT seats, keyed by seat id (accountUserId). */
@@ -109,9 +115,10 @@ export interface MeridianSettings {
    */
   errorReportingDsn?: string
   /**
-   * Days Claude Code keeps the transcripts requests leave on disk before its
-   * own sweep deletes them; 0 keeps every one. Unset means 30, Claude Code's
-   * default. MERIDIAN_TRANSCRIPT_RETENTION_DAYS wins, and a profile whose own
+   * Opt-in: when set (1-3650), Claude Code's own retention cleanup runs in
+   * Meridian's SDK children and deletes its files older than this many days in
+   * each profile's config directory. Unset is off.
+   * MERIDIAN_TRANSCRIPT_RETENTION_DAYS wins, and a profile whose own
    * settings.json names `cleanupPeriodDays` keeps that. Re-read on every
    * request; see proxy/transcriptRetention.ts.
    */
@@ -121,6 +128,11 @@ export interface MeridianSettings {
    *  because someone asked it to. The header shows the running version either
    *  way. MERIDIAN_NO_UPDATE_CHECK=1 forces it off regardless. */
   checkForUpdates?: boolean
+  /** Keep idle one-hour-cache sessions warm with a few small cache-read
+   *  requests (prompt-cache keepalive). Off unless switched on, because each
+   *  one counts against the account's usage. MERIDIAN_CACHE_KEEPALIVE wins.
+   *  Re-read per turn and per scheduler tick. */
+  cacheKeepalive?: boolean
   /** Name the machine Meridian runs on beside the site header's status, so
    *  several instances can be told apart at a glance. Off unless switched on,
    *  because it also publishes the hostname in the unauthenticated /health. */

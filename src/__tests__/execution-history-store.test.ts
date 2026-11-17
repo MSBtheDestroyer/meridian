@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
+import { getConversationFingerprint } from "../proxy/session/fingerprint"
 import { join } from "node:path"
-import { lookupSession, rollbackPrioritySessionPublication, storeSession, type PrioritySessionPublication } from "../proxy/session/cache"
+import { clearSessionCache, lookupSession, rollbackPrioritySessionPublication, storeSession, type PrioritySessionPublication } from "../proxy/session/cache"
 import { computeLineageHash } from "../proxy/session/lineage"
 import { openCodePrimaryAgentContextHash } from "../proxy/adapters/opencodeAgentContext"
 import { claimPriorityAttempt, lookupPriorityAssignmentResult, lookupSharedSession, lookupSharedSessionResult, setSessionStoreDir } from "../proxy/sessionStore"
-import { commitRawSession, readCommittedSession, releaseStoreDatabase } from "./storeDatabaseHelpers"
+import { commitRawSession, holdWriteLock, readCommittedSession, releaseStoreDatabase } from "./storeDatabaseHelpers"
 
 const messages = [{ role: "user", content: "raw original objective" }]
 const continuation = [...messages, { role: "assistant", content: "answer" }, { role: "user", content: "next question" }]
@@ -119,5 +120,79 @@ describe("durable raw proof and execution reuse proof", () => {
     const errors = spyOn(console, "error").mockImplementation(() => {})
     try { expect(lookupSharedSessionResult("malformed-system").status).toBe("error") }
     finally { errors.mockRestore() }
+  })
+
+  it("captures the headerless rollback key before an ordered store write yields", async () => {
+    const history = [{ role: "user", content: "headerless rollback original objective" }]
+    const originalHistory = structuredClone(history)
+    const cwd = "/fixture/headerless-rollback"
+    const key = getConversationFingerprint(history, cwd)
+    await storeSession(undefined, history, "sdk-before", cwd)
+    const before = lookupSharedSessionResult(key)
+    if (before.status !== "found") throw new Error("fixture mapping missing")
+    const publication = await priorityPublication("headerless-rollback")
+    expect(await storeSession(undefined, history, "sdk-published", cwd, undefined, undefined,
+      undefined, undefined, undefined, undefined, before.generation, publication)).not.toBe(false)
+
+    const holder = await holdWriteLock(directory)
+    const pending = rollbackPrioritySessionPublication(undefined, history, cwd, publication)
+    try {
+      expect(pending).toBeInstanceOf(Promise)
+      history[0]!.content = "caller changed its input while rollback waited"
+      expect(lookupSharedSession(key)?.claudeSessionId).toBe("sdk-published")
+    } finally {
+      await holder.release()
+      await pending
+    }
+    expect(lookupSharedSession(key)?.claudeSessionId).toBe("sdk-before")
+    // Force the genuine store-error fallback so disk reads cannot hide a stale LRU.
+    const entry = readCommittedSession(directory, key)
+    if (!entry) throw new Error("fixture mapping missing")
+    commitRawSession(directory, key, { ...entry, resumeContextHash: "not-a-digest" })
+    await releaseStoreDatabase(directory)
+    const errors = spyOn(console, "error").mockImplementation(() => {})
+    try {
+      const result = lookupSession(undefined, [...originalHistory,
+        { role: "assistant", content: "answer" }, { role: "user", content: "next" }], cwd)
+      expect(result.type).toBe("continuation")
+      if (result.type !== "continuation") throw new Error("Expected restored fallback")
+      expect(result.session.claudeSessionId).toBe("sdk-before")
+    } finally {
+      errors.mockRestore()
+    }
+  })
+
+  it.each(["pending-clear", undefined])("clears the fallback repopulated while durable cleanup waits (%s)", async (key) => {
+    const cwd = "/fixture/pending-json-clear"
+    await storeSession(key, messages, "old-sdk", cwd)
+    const holder = await holdWriteLock(directory)
+    const pending = clearSessionCache()
+    const later = storeSession("later", messages, "later-sdk", cwd)
+    try {
+      expect(pending).toBeInstanceOf(Promise)
+      // A synchronous read can populate memory from the still-authoritative disk record.
+      const during = lookupSession(key, continuation, cwd)
+      expect(during.type).toBe("continuation")
+    } finally {
+      await holder.release()
+      await Promise.all([pending, later])
+    }
+    const durableKey = key ?? getConversationFingerprint(messages, cwd)
+    expect(lookupSharedSessionResult(durableKey).status).toBe("missing")
+    // Force the genuine store-error fallback for the cleared key.
+    const laterEntry = readCommittedSession(directory, "later")
+    if (!laterEntry) throw new Error("later mapping missing")
+    commitRawSession(directory, durableKey, { ...laterEntry, resumeContextHash: "not-a-digest" })
+    await releaseStoreDatabase(directory)
+    const errors = spyOn(console, "error").mockImplementation(() => {})
+    try {
+      expect(lookupSession(key, continuation, cwd).type).toBe("diverged")
+      const newest = lookupSession("later", continuation, cwd)
+      expect(newest.type).toBe("continuation")
+      if (newest.type !== "continuation") throw new Error("Later publication lost")
+      expect(newest.session.claudeSessionId).toBe("later-sdk")
+    } finally {
+      errors.mockRestore()
+    }
   })
 })

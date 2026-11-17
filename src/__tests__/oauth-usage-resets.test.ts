@@ -52,7 +52,7 @@ describe("OAuth reset inventory boundary", () => {
       { type: "five_hour", utilization: 0.36, resetsAt: 1793831400000 },
       { type: "seven_day", utilization: 0.05, resetsAt: 1794330000000 },
     ])
-    expect(entry.extraUsage).toEqual({ isEnabled: true, monthlyLimit: 100, usedCredits: 12, utilization: 0.12, currency: "USD" })
+    expect(entry.extraUsage).toEqual({ isEnabled: true, monthlyLimit: 1, usedCredits: 0.12, utilization: 0.12, currency: "USD", exponent: 2 })
   })
 
   test.each([true, false])("preserves an empty eligible=%s inventory", async eligible => {

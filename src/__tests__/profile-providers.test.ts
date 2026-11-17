@@ -290,6 +290,8 @@ describe("brand colours", () => {
     expect(hint).toContain("background: var(--brand-bright, var(--accent));")
     expect(hint).toContain("clip-path: inset(0 0 100% 0);")
     expect(css).toContain(".profile-card.switchable:hover > .strip-hint, .profile-card.switchable:focus-visible > .strip-hint { clip-path: inset(0); }")
+    // Hover lifts a dimmed card's fade; keyboard focus lifts it from the hint, which it reveals.
+    expect(css).toContain(".profile-card.spend-fading:focus-visible > .strip-hint, .profile-card.spend-spent:focus-visible > .strip-hint { filter: none; opacity: 1; }")
     // The fade dims a card's children; the active strip is spared with the name row.
     expect(css).toContain(".profile-card.active.spend-fading > .card-strip, .profile-card.active.spend-spent > .card-strip { filter: none; opacity: 1; }")
     expect(css).not.toContain(".switch-hint")
@@ -621,6 +623,19 @@ describe("the profiles page draws the same groups", () => {
     expect(html).toContain('class="switch-btn switch-to"')
   })
 
+  test("the header badge names an account's allowance, with its plan and tier on hover, in place of the type", () => {
+    const { html } = rendered(new MemoryStorage(), [
+      claude("c1", { isActive: true, allowance: "20x", planLabel: "Claude Max 20x", rateLimitTier: "default_claude_max_20x" }),
+      claude("c2", { allowance: "5x", planLabel: "Claude Max 5x" }),
+      claude("c3"),
+      seat("g1", { isActive: true, allowance: "1x", planLabel: "ChatGPT Plus" }),
+    ])
+    expect(html).toContain('<span class="profile-badge provider-badge">Claude</span><span class="profile-badge badge-type" title="Claude Max 20x \u00b7 default_claude_max_20x">20x</span>')
+    expect(html).toContain('<span class="profile-badge provider-badge">Claude</span><span class="profile-badge badge-type" title="Claude Max 5x">5x</span>')
+    expect(html).toContain('<span class="profile-badge provider-badge">ChatGPT</span><span class="profile-badge badge-type" title="ChatGPT Plus">1x</span>')
+    expect(html.split('badge-type">claude-max<').length - 1).toBe(1)
+  })
+
   test("a chip and the search compose; the count covers only the providers on screen", () => {
     const storage = new MemoryStorage()
     const { page } = rendered(storage, mixed())
@@ -657,6 +672,41 @@ describe("the profiles page draws the same groups", () => {
     expect(storage.getItem(HIDDEN_PROVIDERS_KEY)).toBe('["chatgpt","claude"]')
   })
 
+  test("a card updating after a sign-in stays visible during a search for its old email", () => {
+    const storage = new MemoryStorage()
+    const profiles = [claude("c1", { email: "old@example.com" }), claude("c2", { email: "other@example.com" })]
+    // A seat on the page too, so turning the Claude chip off is not refused
+    // as hiding the last provider.
+    const { page } = rendered(storage, [...profiles, seat("g1")])
+    const cards = ["c1", "c2"].map(id => {
+      const el = stubElement()
+      el.attrs.set("data-id", id)
+      el.attrs.set("data-group", "claude")
+      return el
+    })
+    page.select("#content .profile-card[data-id]", cards)
+    const shown = () => cards.filter(c => !c.hidden).map(c => c.attrs.get("data-id"))
+    page.run("setProfileQuery('old@example.com')")
+    expect(shown()).toEqual(["c1"])
+
+    // The re-login landed on another account: the email changed under the
+    // search, and the card is still updating.
+    const updating = [claude("c1", { email: "new@example.com", factsRefresh: { state: "updating", since: 1 } }), profiles[1]]
+    page.run(`lastProfiles = ${JSON.stringify({ profiles: updating })}; applyProfileFilter()`)
+    expect(shown()).toEqual(["c1"])
+    expect(page.element("profiles-filter-count").textContent).toBe("1 of 2")
+
+    // The page's own memory of the sign-in keeps it too, before the server says so.
+    page.run(`lastProfiles = ${JSON.stringify({ profiles: [claude("c1", { email: "new@example.com" }), profiles[1]] })}; applyProfileFilter()`)
+    expect(shown()).toEqual([])
+    page.run("meridianCardStatus.beginUpdate('c1'); applyProfileFilter()")
+    expect(shown()).toEqual(["c1"])
+
+    // A hidden provider still hides it: the exemption is from the search only.
+    page.run("meridianProviders.setHidden('claude', true); applyProfileFilter()")
+    expect(shown()).toEqual([])
+  })
+
   test("a link to an account of a hidden provider shows that provider again", () => {
     const storage = new MemoryStorage()
     storage.setItem(HIDDEN_PROVIDERS_KEY, '["chatgpt"]')
@@ -668,6 +718,19 @@ describe("the profiles page draws the same groups", () => {
     page.run("location.hash = '#g1'; jumpToProfileAnchor()")
     expect(page.run<boolean>("meridianProviders.isHidden('chatgpt')")).toBe(false)
     expect(storage.getItem(HIDDEN_PROVIDERS_KEY)).toBe("[]")
+  })
+
+  test("every card can be removed, each through its own provider's route", () => {
+    const { page, html } = rendered(new MemoryStorage(), mixed())
+    const removeButtons = [...html.matchAll(/title="(Remove [a-z]+)" onclick="startRemove\(&quot;([^&]+)&quot;\)"/g)].map(m => [m[2], m[1]])
+    expect(removeButtons).toEqual([["c1", "Remove profile"], ["c2", "Remove profile"], ["g1", "Remove seat"], ["g2", "Remove seat"]])
+
+    page.run("var removeRoutes = []; fetch = function (url, init) { removeRoutes.push([url, init.body]); return new Promise(function () {}); }")
+    page.run("commitRemove('c2'); commitRemove('g1')")
+    expect(page.run<string[][]>("removeRoutes")).toEqual([
+      ["/profiles/claude/remove", '{"profile":"c2"}'],
+      ["/profiles/chatgpt/remove", '{"profile":"g1"}'],
+    ])
   })
 })
 
@@ -824,6 +887,20 @@ describe("the landing page filters by login state", () => {
     expect(visible(html)).toEqual([])
     expect(html).toContain(`<div class="provider-none login-none">${LOGIN_STATES_NONE_SHOWN_HTML}</div>`)
   })
+
+  test("a card updating after a sign-in stays on screen while its state's chip is off, not its provider's", () => {
+    // Signing in moves the card out of Needs auth, so ?login=needs-auth would
+    // otherwise drop it at the moment it is being fixed.
+    const profiles = byState().map(p => p.id === "c-out" ? { ...p, factsRefresh: { state: "updating", since: 1 } } : p)
+    const sectionOf = (storage: MemoryStorage) => loadPage(landingHtml, storage).run<{ html: string }>(
+      `profileSection(null, {}, ${JSON.stringify({ profiles, routing: "active" })}, { auth: { loggedIn: true } })`,
+    ).html
+    const storage = new MemoryStorage()
+    storage.setItem(HIDDEN_LOGIN_STATES_KEY, '["needs-auth"]')
+    expect(visible(sectionOf(storage))).toEqual(["c-ok", "c-out", "c-soon", "g-ok", "g-ok2"])
+    storage.setItem(HIDDEN_PROVIDERS_KEY, '["claude"]')
+    expect(visible(sectionOf(storage))).toEqual(["g-ok", "g-ok2"])
+  })
 })
 
 describe("the profiles page filters by login state", () => {
@@ -884,7 +961,22 @@ describe("the profiles page filters by login state", () => {
     page.run("location.hash = '#c-out'; jumpToProfileAnchor()")
     expect(storage.getItem(HIDDEN_LOGIN_STATES_KEY)).toBe("[]")
   })
+
+  test("a card updating after a sign-in stays on screen while its state's chip is off, not its provider's", () => {
+    const storage = new MemoryStorage()
+    storage.setItem(HIDDEN_LOGIN_STATES_KEY, '["needs-auth"]')
+    const { page } = rendered(storage)
+    const shown = stubCards(page)
+    page.run("applyProfileFilter()")
+    expect(shown()).not.toContain("c-out")
+    const profiles = byState().map(p => p.id === "c-out" ? { ...p, factsRefresh: { state: "updating", since: 1 } } : p)
+    page.run(`lastProfiles = ${JSON.stringify({ profiles })}; applyProfileFilter()`)
+    expect(shown()).toContain("c-out")
+    page.run("meridianProviders.setHidden('claude', true); applyProfileFilter()")
+    expect(shown()).toEqual(["g-ok", "g-ok2"])
+  })
 })
+
 
 // ---------------------------------------------------------------------------
 // ?provider= in the address (profileFilterUrl.ts).
@@ -1106,7 +1198,7 @@ describe("?login= names the login-state chips that are on", () => {
   })
 })
 
-/** The three links Portal's auth warnings open, and the accounts each must show. */
+/** Links a client's needs-login warning can open, and the accounts each must show. */
 const AUTH_LINKS: Array<[string, string[]]> = [
   ["?login=needs-auth", ["c-out", "g-out"]],
   ["?login=needs-auth&provider=claude", ["c-out"]],
@@ -1193,6 +1285,7 @@ describe("needs-auth links on the profiles page", () => {
     expect(storage.writes).toBe(0)
   })
 })
+
 for (const [name, html, path, rootId, selector, apply] of [
   ["landing", landingHtml, "/", "content", ".profile-card[data-group]", "applyProviderFilter()"],
   ["profiles", profilePageHtml, "/profiles", "profiles-section", "#content .profile-card[data-id]", "applyProfileFilter()"],

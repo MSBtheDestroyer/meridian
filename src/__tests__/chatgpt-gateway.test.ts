@@ -934,7 +934,7 @@ describe("ChatGPT seats on the profile surface", () => {
     writePool([account(0), account(1)])
     const before = snapshotPoolDir()
     const { app } = await server("follow-external")
-    const res = await post(app, "/profiles/remove", { profile: "seat1-pace-1" })
+    const res = await post(app, "/profiles/chatgpt/remove", { profile: "seat1-pace-1" })
     expect(res.status).toBe(409)
     const body = await res.json() as { error: string; code: string; provider: string }
     expect(body).toMatchObject({ code: "owned_elsewhere", provider: "chatgpt" })
@@ -1299,7 +1299,7 @@ describe("owned mode signs its own seats in", () => {
       const seat2 = (await listed()).profiles.find(p => p.seat === "user-2__workspace-2")!.id
       saveSettings({ profileOrder: ["dead-one", seat2, "zero"] })
 
-      const res = await post(proxy.app, "/profiles/remove", { profile: "s1-kspace-1" })
+      const res = await post(proxy.app, "/profiles/chatgpt/remove", { profile: "s1-kspace-1" })
       expect(res.status).toBe(200)
       expect(await res.json()).toMatchObject({ success: true, profile: "dead-one", provider: "chatgpt", activeProfile: "zero" })
 
@@ -1315,11 +1315,11 @@ describe("owned mode signs its own seats in", () => {
       const after = await listed()
       expect(after.profiles.map(p => p.id)).toEqual(["zero", seat2])
       expect(after.activeProfiles?.chatgpt).toBe("zero")
-      expect((await post(proxy.app, "/profiles/remove", { profile: "dead-one" })).status).toBe(400)
+      expect((await post(proxy.app, "/profiles/chatgpt/remove", { profile: "dead-one" })).status).toBe(404)
 
       expect(after.profiles.find(p => p.id === seat2)).toMatchObject({ planTier: "free" })
       // The paid successor goes too, so the pointer falls to the free seat, the only one left.
-      expect((await post(proxy.app, "/profiles/remove", { profile: "zero" })).status).toBe(200)
+      expect((await post(proxy.app, "/profiles/chatgpt/remove", { profile: "zero" })).status).toBe(200)
       expect(getSetting("chatGptActiveSeat")).toBe("user-2__workspace-2")
       expect(getSetting("chatgpt")?.seatCreditsPolicy).toEqual({})
       expect(getSetting("chatgpt")?.seatRenewalHours).toEqual({})

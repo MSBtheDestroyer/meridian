@@ -195,6 +195,20 @@ describe("landing page layout", () => {
     expect(landingHtml).toContain("ANTHROPIC_BASE_URL")
   })
 
+  test("the intro's address chips wrap on a phone instead of scrolling it sideways", () => {
+    const phone = landingHtml.indexOf("@media (max-width: 720px) {\n    .intro code {")
+    expect(phone).toBeGreaterThanOrEqual(0)
+    const rule = landingHtml.slice(phone, landingHtml.indexOf("}", phone))
+    expect(rule).toContain("white-space: normal")
+    expect(rule).toContain("overflow-wrap: anywhere")
+  })
+
+  test("a Claude Code executable path wraps inside its Settings card", () => {
+    const at = settingsPageHtml.indexOf("#claude-exe-card code {")
+    expect(at).toBeGreaterThanOrEqual(0)
+    expect(settingsPageHtml.slice(at, settingsPageHtml.indexOf("}", at))).toContain("overflow-wrap: anywhere")
+  })
+
   test("stats strip shows meaningful telemetry, not fillers", () => {
     // Token + cache signals are in; TTFB stays on the /telemetry page
     expect(landingHtml).toContain("tokenUsage")
@@ -572,6 +586,10 @@ describe("wide page layout", () => {
   })
 
   test("settings toggles, pricing rows and provider cards keep their values near their labels", () => {
+    // Contained, the 810px card holds two 360px-or-wider rows; a single column
+    // would put each control some 800px from its label.
+    expect(ruleIn(settingsPageHtml, ".setting-grid"))
+      .toContain("grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr))")
     expect(ruleIn(settingsPageHtml, 'html[data-layout="wide"] .setting-grid'))
       .toContain("grid-template-columns: repeat(auto-fill, minmax(min(560px, 100%), 1fr))")
     expect(ruleIn(settingsPageHtml, 'html[data-layout="wide"] .pricing-table')).toContain("width: auto")

@@ -293,10 +293,3 @@ export function usageReserveResponse(message: string, opensAt: number | null, no
     headers: { "Content-Type": "application/json", ...retryAfterHeaders(seconds) },
   })
 }
-
-/** The refusal for work with nowhere to go but profiles their reserves hold back. */
-export function allHeldMessage(holds: ReadonlyMap<string, UsageReserveState>): string {
-  const named = [...holds].map(([id, hold]) => `${id} (${describeUsageReserveHold(hold)})`).join("; ")
-  return `Every eligible profile is held back by its usage reserve: ${named}. `
-    + "The rest of each window is kept for use elsewhere, so this request was not sent."
-}

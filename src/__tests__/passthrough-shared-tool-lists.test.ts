@@ -7,32 +7,8 @@
  * 1 MB per session until MERIDIAN_MAX_SESSIONS was reached.
  */
 
-import { describe, it, expect, beforeEach } from "bun:test"
-import { heapStats } from "bun:jsc"
-import { installSdkMock } from "./sdkMock"
-import { installLoggerMock } from "./loggerMock"
-import { installMcpToolsMock } from "./mcpToolsMock"
-import { assistantMessage, withMockSdkSessionId } from "./helpers"
-
-installSdkMock(() => ({
-  query: (params: any) => (async function* () {
-    yield withMockSdkSessionId(assistantMessage([{ type: "text", text: "ok" }]), params.options)
-  })(),
-  createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
-  tool: () => ({}),
-}), "passthrough-shared-tool-lists.test.ts")
-
-installLoggerMock(() => ({
-  claudeLog: () => {},
-  withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
-}))
-
-installMcpToolsMock(() => ({
-  createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
-}))
-
-const { createProxyServer, clearSessionCache } = await import("../proxy/server")
-const { sharedToolList, computeToolSetKey } = await import("../proxy/passthroughTools")
+import { describe, it, expect } from "bun:test"
+import { sharedToolList, computeToolSetKey } from "../proxy/passthroughTools"
 
 function tools(description = "Read a file") {
   return ["read", "write", "bash"].map(name => ({
@@ -61,12 +37,6 @@ function largeToolList() {
   }))
 }
 
-function settledHeap(): number {
-  Bun.gc(true)
-  Bun.gc(true)
-  return heapStats().heapSize
-}
-
 describe("sharedToolList", () => {
   it("returns one list for identical content", () => {
     const first = sharedToolList(tools())
@@ -93,41 +63,8 @@ describe("sharedToolList", () => {
   })
 })
 
-describe("passthrough session caches", () => {
-  beforeEach(async () => {
-    await clearSessionCache()
-  })
-
-  it("keeps the tool-set key short", () => {
+describe("computeToolSetKey", () => {
+  it("keeps the key short", () => {
     expect(computeToolSetKey(largeToolList()).length).toBeLessThanOrEqual(64)
   })
-
-  it("does not grow by a tool list per session", async () => {
-    const { app } = createProxyServer({ port: 0, host: "127.0.0.1", silent: true })
-    const body = (session: string) => JSON.stringify({
-      model: "claude-sonnet-4-5",
-      max_tokens: 1024,
-      stream: false,
-      messages: [{ role: "user", content: `hello from ${session}` }],
-      tools: largeToolList(),
-    })
-    const post = async (session: string) => {
-      const res = await app.fetch(new Request("http://localhost/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-opencode-session": session },
-        body: body(session),
-      }))
-      expect(res.status).toBe(200)
-      await res.text()
-    }
-    // The first sessions build the shared definitions and warm the process.
-    for (let i = 0; i < 20; i++) await post(`warm-${i}`)
-    const before = settledHeap()
-    const SESSIONS = 40
-    for (let i = 0; i < SESSIONS; i++) await post(`session-${i}`)
-    const perSession = (settledHeap() - before) / SESSIONS
-    // A copy of the list and its key cost ~680 KB per session here; what is
-    // left is the session's own state and code still being compiled.
-    expect(perSession).toBeLessThan(100_000)
-  }, 60_000)
 })

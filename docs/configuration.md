@@ -40,7 +40,8 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_DEFAULT_AGENT` | — | `opencode` | Default adapter for unrecognized agents: `opencode`, `forgecode`, `pi`, `prime`, `crush`, `droid`, `cherry`, `claude-code`, `passthrough`, `polytoken`, `openai`, `jcode`, `letta`, `codex`. Aliases: `prime-agent`, `cherrystudio`, `claudecode`. Re-read per request from the process environment — restart the proxy to pick up deployment-level env changes. |
 | `MERIDIAN_ROUTING` | — | `active` | Session-to-profile routing: `active` (all traffic to the active profile), `sticky` ([sticky session routing](profiles.md#sticky-session-routing)), or `priority` ([priority failover](profiles.md#priority-failover-routing)) |
 | `MERIDIAN_PROFILE_ORDER` | — | *(config order)* | Priority-mode pool order, comma-separated, highest priority first (e.g. `work,personal`). Also editable at `/settings`. |
-| `MERIDIAN_PRIORITY_FAILBACK` | — | `new-conversation` | Priority failback policy: `new-conversation` (current behavior) or `next-user-turn`. Environment value overrides `priorityFailback` in the settings JSON. Applies only to priority routing and OpenCode turn metadata; other adapters retain `new-conversation` behavior. |
+| `MERIDIAN_PRIORITY_FAILBACK` | — | `new-conversation` | Priority failback policy: `new-conversation` (current behavior) or `next-user-turn`. Environment value overrides `priorityFailback` in the settings JSON. Applies only to priority routing and the turn metadata signed by the OpenCode plugin and the Pi extension; other adapters retain `new-conversation` behavior. |
+| `MERIDIAN_CLAUDE_EXTRA_USAGE` | — | `reserve` | Pool routing: when an account drawing paid Extra Usage may take work. `reserve` only once no account has plan allowance left, `never` not at all (`429` instead), `immediately` in normal order. Overrides `claudeExtraUsage` in the settings JSON. See [priority failover](profiles.md#priority-failover-routing). |
 | `MERIDIAN_FOLLOW_ACTIVE` | `CLAUDE_PROXY_FOLLOW_ACTIVE` | unset | Base URL of another Meridian instance to take the active profile from, e.g. `http://127.0.0.1:3456`. For a development instance running beside a primary one — see [Following another instance's active profile](#following-another-instances-active-profile). |
 | `MERIDIAN_PASSTHROUGH_EARLY_STOP` | — | `1` | Set to `0` to disable [digest-turn elimination](#how-tool-calling-works-in-passthrough) and restore the old end-of-turn behavior |
 | `MERIDIAN_PASSTHROUGH_MAX_TURNS` | `CLAUDE_PROXY_PASSTHROUGH_MAX_TURNS` | *(unset — capped at 1)* | Pin the passthrough SDK turn budget. An explicit positive value wins over the one-turn cap. With early stop enabled, a budget above one still stops after a batch forwarded to the client (see [digest-turn elimination](#how-tool-calling-works-in-passthrough)), so the pin adds headroom before the tool boundary; structured-output requests retain the normal SDK completion loop. Unset it unless you still need it. |
@@ -59,16 +60,18 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_SUPPRESS_SCRATCHPAD` | — | `1` | Set to `0` to disable prompt-level scratchpad suppression in passthrough mode (#627, #1049) |
 | `MERIDIAN_SUPPRESS_SCRATCHPAD_ENV` | — | `0` | Set to `1` to also pass `CLAUDE_CODE_SESSION_KIND=bg` to the SDK subprocess. Disabled by default to prevent CLI 2.1.274+ from registering persistent phantom background jobs under `~/.claude/jobs/` (#1049) |
 | `MERIDIAN_SUPPRESS_IMPLICIT_ATTACHMENTS` | — | `1` | Set to `0` to stop defaulting `CLAUDE_CODE_DISABLE_ATTACHMENTS=1` in passthrough mode. Does not clear an explicitly inherited CLI setting. See [known limitations](#known-limitations). |
+| `MERIDIAN_CACHE_KEEPALIVE` | — | unset (off) | Set to `1` to keep idle one-hour-cache sessions warm with a few small cache-read requests; `0` forces it off. Wins over `cacheKeepalive` in `settings.json`. See [Prompt-cache keepalive](#prompt-cache-keepalive). |
+| `MERIDIAN_CACHE_KEEPALIVE_MAX_IN_FLIGHT` | — | `1` | Keepalive requests allowed to run at once across all sessions, clamped to `1`–`2`. |
 | `MERIDIAN_COMPACTION_SURVIVAL` | — | `0` | Set to `1` to resume the old SDK session after a client shortens its history head into a summary. By default Meridian replays the supplied summary in a fresh SDK session so the removed context is released. Equal-length pruning still resumes. |
 | `MERIDIAN_CONFIG_DIR` | — | `~/.config/meridian` | Meridian's own config directory. Moving it moves everything inside it — see [below](#relocating-the-config-directory). |
 | `MERIDIAN_PRICING_CONFIG` | `CLAUDE_PROXY_PRICING_CONFIG` | `~/.config/meridian/model-pricing.json` | Path to the model pricing overrides file used by cost estimation |
 | `MERIDIAN_PROFILES` | — | unset | JSON array of profile configs (overrides disk discovery). See [Multi-Profile Support](profiles.md). |
-| `MERIDIAN_DEFER_TOOL_THRESHOLD` | — | `15` | Number of tools before non-core tools are deferred via ToolSearch. Set to `0` to disable. |
+| `MERIDIAN_DEFER_TOOL_THRESHOLD` | — | `15` | Number of tools before non-core tools are deferred via ToolSearch. A client that marks any tool `defer_loading: true` manages deferral itself and is never auto-deferred. Set to `0` to disable. |
 | `MERIDIAN_TELEMETRY_PERSIST` | `CLAUDE_PROXY_TELEMETRY_PERSIST` | unset | Enable SQLite telemetry persistence. Data survives proxy restarts. |
 | `MERIDIAN_TELEMETRY_DB` | `CLAUDE_PROXY_TELEMETRY_DB` | `~/.config/meridian/telemetry.db` | SQLite database path (when persistence is enabled) |
 | `MERIDIAN_TELEMETRY_RETENTION_DAYS` | `CLAUDE_PROXY_TELEMETRY_RETENTION_DAYS` | `7` | Days to retain telemetry data before cleanup |
-| `MERIDIAN_TRANSCRIPT_RETENTION_DAYS` | `CLAUDE_PROXY_TRANSCRIPT_RETENTION_DAYS` | `30` | Days Claude Code keeps the transcripts requests leave on disk before deleting them; `0` keeps them all. `transcriptRetentionDays` in `settings.json` (or the `/settings` page) is the alternative, and the environment wins. See [Transcript retention](#transcript-retention). |
-| `MERIDIAN_TRANSCRIPT_SWEEP_INTERVAL_MS` | `CLAUDE_PROXY_TRANSCRIPT_SWEEP_INTERVAL_MS` | `10800000` (3 hours) | How often Meridian sweeps the transcripts of idle profiles; `0` leaves the sweep to requests alone. See [Transcript retention](#transcript-retention). |
+| `MERIDIAN_TRANSCRIPT_RETENTION_DAYS` | `CLAUDE_PROXY_TRANSCRIPT_RETENTION_DAYS` | unset (off) | **Opt-in.** `1`-`3650` turns on Claude Code's own cleanup in request processes and the idle sweep, which deletes **all** of its files older than that many days in each profile's config directory, not only transcripts. `0` pins it off over a saved setting; any other value is ignored. Wins over `transcriptRetentionDays` in `settings.json` (or the `/settings` page). See [Transcript retention](#transcript-retention). |
+| `MERIDIAN_TRANSCRIPT_SWEEP_INTERVAL_MS` | `CLAUDE_PROXY_TRANSCRIPT_SWEEP_INTERVAL_MS` | `10800000` (3 hours) | Only with transcript retention on. How often Meridian looks for profile config directories Claude Code has not cleaned for a day and runs its cleanup there in an idle process. `0` turns the idle sweep off. See [Transcript retention](#transcript-retention). |
 | `MERIDIAN_DEFAULT_PROFILE` | — | *(first profile)* | Default profile ID when no header is sent |
 | `MERIDIAN_ADAPTER_INSTANCES` | — | unset | JSON [adapter instance](agents.md#adapter-instances) definitions, overriding `~/.config/meridian/adapter-instances.json` |
 | `MERIDIAN_BETA_POLICY` | — | `allow-safe` | Client `anthropic-beta` header handling: `allow-safe`, `strip-all`, or `allow-all` |
@@ -77,11 +80,12 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_NO_UPDATE_CHECK` | — | unset | Set to `1` to force the update check off even when the `checkForUpdates` setting is on. No outbound request is made at all when set. See [Build provenance](#build-provenance-and-staying-current). |
 | `MERIDIAN_UPDATE_CHECK_URL` | — | npm dist-tags | Registry endpoint for the update check. Point it at a mirror on restricted networks; it must return `{"latest":"<version>"}`. |
 | `MERIDIAN_UPDATE_CHECK_PATH` | — | `~/.cache/meridian/update-check.json` | Where the update check caches its result. |
-| `MERIDIAN_UPDATE_CHECK_REGISTRY` | — | `https://registry.npmjs.org` | Registry the plugin update check asks for each plugin package's `/-/package/<name>/dist-tags`. |
+| `MERIDIAN_UPDATE_CHECK_REGISTRY` | — | `https://registry.npmjs.org` | Registry the plugin update check asks for each plugin package's `/-/package/<name>/dist-tags`. When `MERIDIAN_UPDATE_CHECK_URL` is set and this is not, plugins are not checked at all (rather than asking the public registry); set both to check plugins through your mirror. |
 | `MERIDIAN_PLUGIN_UPDATE_CHECK_PATH` | — | `~/.cache/meridian/plugin-update-check.json` | Where the plugin update check caches its results. |
 | `MERIDIAN_BUILD_SOURCE` | — | *(derived from the install path)* | Overrides the `build.source` reported by `/health`: `npm`, `local`, or `dev`. Normally set by [`bin/meridian-launchd.sh`](#running-as-a-service-without-drift), not by hand. |
 | `MERIDIAN_BUILD_SHA`, `MERIDIAN_BUILD_BRANCH`, `MERIDIAN_BUILD_DIRTY` | — | unset | Optional commit stamps surfaced in `/health` `build`. Absent unless something sets them at launch. |
 | `MERIDIAN_ERROR_REPORTING_DSN` | — | unset | GlitchTip/Sentry DSN to report Meridian's own crashes to; `errorReportingDsn` in `settings.json` is the alternative, and the environment wins. Off when neither is set. See [Error reporting](#error-reporting). |
+| `MERIDIAN_USAGE_CACHE_TTL_MS` | `CLAUDE_PROXY_USAGE_CACHE_TTL_MS` | `30000` | How long each Claude profile's usage reading from Anthropic's OAuth usage endpoint is reused before `/v1/usage/quota/all` and other readers ask again. Values below `30000` use `30000`, and values above `300000` use `300000`, so an expired or revoked login still shows within five minutes. While clients poll usage, this sets how often Meridian asks Anthropic per profile; raise it (for example to `150000`) when many polling clients keep the usage endpoint answering 429. |
 | `MERIDIAN_DEBUG` | `CLAUDE_PROXY_DEBUG` | unset | Set to `1` for verbose request/session logging |
 | `MERIDIAN_SILENT` | `CLAUDE_PROXY_SILENT` | unset | Set to `1` to suppress startup output (used by embedding plugins) |
 | `MERIDIAN_ENFORCE_MAX_TOKENS` | `CLAUDE_PROXY_ENFORCE_MAX_TOKENS` | unset | Set to `1` to apply the client output budget; see [output limits](#known-limitations). |
@@ -136,6 +140,16 @@ not a reconstruction of the model actually served.
 
 See Anthropic's [overview](https://platform.claude.com/docs/en/models/haiku-5-5/overview)
 and [migration guide](https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide).
+
+### Fable 5.2
+
+Request `claude-fable-5-2` explicitly; the bare `fable` alias still defaults to
+`claude-fable-5-1`. Use Claude Code **2.1.322 or newer** (including when
+selecting a system/custom executable); older CLIs may not recognize the model and
+fall back to a 200k context window. Fable 5.2 has a native **1M context
+window** and always-on adaptive thinking controlled by effort, so `/v1/models`
+advertises it without disabled-thinking support. `claude-mythos-5-2` rides the
+same Fable tier and pricing ($8 / $40 per MTok, $0.20 cache reads).
 
 ### Read-only credentials
 
@@ -211,7 +225,7 @@ second instance pointed at an empty directory starts genuinely empty:
 
 | File | Holds |
 |---|---|
-| `settings.json` | Active profile, routing mode, priority order, `checkForUpdates`, `transcriptRetentionDays`, page `layout` |
+| `settings.json` | Active profile, routing mode, priority order, `checkForUpdates`, `cacheKeepalive`, page `layout`, `transcriptRetentionDays` |
 | `profiles.json` | Configured profiles ([Multi-Profile Support](profiles.md)) |
 | `profiles/<id>/` | Per-profile `CLAUDE_CONFIG_DIR` (credentials, SDK state) |
 | `adapter-instances.json` | [Adapter instances](agents.md#adapter-instances) |
@@ -286,15 +300,30 @@ What it does and does not change:
 - **Following your own address is refused** at startup: the followed value
   could never change and local switching would be refused, freezing the active
   profile permanently.
+- **Usage figures come from the followed instance too**, polled every two
+  minutes from its `GET /v1/usage/quota/all` and matched by profile id.
+  Anthropic's usage endpoint is rate limited per account, and that budget is
+  shared by every process holding the account's credentials, so two instances
+  polling the same accounts compete for it and the loser reads `429` for all of
+  them. A follower therefore makes no usage call of its own while it has the
+  followed instance's figures. The cadence is far longer than the followed
+  instance's 30s usage cache, so following it does not drive it into the same
+  limit. A profile the followed instance could not read is skipped, and this
+  instance tries its own credentials for it. Figures not refreshed for five
+  minutes are marked `stale`; after ten they stop being served, and the local
+  path decides again. A forced read (an account just hit its limit, or was just
+  signed in) still asks Anthropic, because it needs the account's figures now.
+  Profiles are matched by id, so each id must name the same account on both
+  instances.
 
 The mode is announced at startup and surfaced on `/profiles/list` as a `follow`
 object (`url`, `activeProfile`, `followedValue`, `reason`, `stale`,
 `lastSyncedAt`, `lastError`), which the shared header chip renders on every
 page.
 
-Limitation: the poll sends no credentials, so a followed instance behind
-`MERIDIAN_API_KEY` will always fail the poll and the follower will fall back to
-its local active profile.
+Limitation: the polls send no credentials, so a followed instance behind
+`MERIDIAN_API_KEY` will always fail them and the follower will fall back to
+its local active profile and its own usage reads.
 
 ### Subprocess traffic
 
@@ -350,6 +379,7 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `GET /telemetry` | Performance dashboard |
 | `GET /telemetry/requests` | Recent request metrics (JSON) |
 | `GET /telemetry/summary` | Aggregate statistics (JSON) |
+| `GET /telemetry/timeseries` | Requests, errors, tokens, cache hit rate, p50 latency and estimated cost per time bucket (JSON); see [Monitoring](../MONITORING.md#diagnostic-queries) |
 | `GET /telemetry/logs` | Diagnostic logs (JSON) |
 | `GET /metrics` | Prometheus exposition format metrics |
 | `GET /profiles` | Profile management page |
@@ -362,9 +392,10 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `POST /profiles/add/start` | Begin creating a new profile — validates the name and returns the authorize URL (see [Adding from the web UI](profiles.md#from-the-web-ui-add-a-profile)) |
 | `POST /profiles/add/complete` | Finish that creation — writes the profile only once Anthropic returns credentials |
 | `GET /v1/usage/quota` | Usage windows for the active profile (JSON) |
-| `GET /v1/usage/quota/all` | Usage windows for every profile (JSON) |
+| `GET /v1/usage/quota/all` | Usage windows and Claude banked-reset grants with expiration dates for every profile (JSON) |
+| `POST /v1/usage/quota/reset` | Explicitly redeem a Claude banked reset with `profile`, `grantId` and caller-owned `requestId`; [request and outcome contract](../MONITORING.md#redeeming-a-banked-reset) |
 | `GET /settings` | Routing, SDK feature toggles, model pricing, telemetry storage, update-check, site-header and page layout UI |
-| `GET/PUT /settings/api/updates` | Read or set `checkForUpdates` (JSON `{"checkForUpdates": true}`); takes effect on the running proxy. Also reports each loaded plugin's installed and latest version in `plugins` |
+| `GET/PUT /settings/api/updates` | Read or set `checkForUpdates` (JSON `{"checkForUpdates": true}`); takes effect on the running proxy. Also reports each loaded plugin's installed and latest version in `plugins`; turning it on also sends loaded plugins' npm package names to the registry |
 | `GET/PUT /settings/api/header` | Read or set `showHostname` (JSON `{"showHostname": true}`): name the machine beside the header's status; takes effect on the running proxy |
 | `GET/PUT /settings/api/hooks`, `POST /settings/api/hooks/test` | [Event hooks](#event-hooks) and the public URL (JSON); `test` sends a `hooks.test` event |
 | `GET /callback/<id>/<path>` | A loopback OAuth redirect, relayed from another machine (see [Event hooks](#event-hooks)). No API key; unknown ids are 404 |
@@ -380,11 +411,12 @@ Illustrative health response excerpt (versions and status vary by installation):
   "build": { "source": "npm", "version": "1.50.0", "latest": "1.50.0", "updateAvailable": false },
   "auth": { "loggedIn": true, "email": "you@example.com", "subscriptionType": "max" },
   "mode": "internal",
-  "plugin": { "opencode": "configured" }
+  "plugin": { "opencode": "configured", "pi": "not-configured" }
 }
 ```
 
 `plugin.opencode` is `"configured"` when `meridian setup` has been run, `"not-configured"` otherwise.
+`plugin.pi` is `"configured"` when `meridian setup --client pi` has installed the Pi extension, `"not-configured"` otherwise.
 Claude and combined-provider health responses also carry `upstream.claude`, described under
 [Readiness and upstream reachability](#readiness-and-upstream-reachability).
 
@@ -522,17 +554,28 @@ the request path. If the registry is unreachable it keeps reporting the last
 version it saw rather than dropping the field. Toggling it in the UI applies to
 the running proxy; switching it off also clears `build.latest`.
 
-The same pass checks every loaded plugin installed from an npm package. A
-plugin's package is the nearest `package.json` above the file Meridian loaded,
-which gives its name and installed version; a lone file dropped into
-`plugins/`, or a private package, is listed as not checkable. Each package is
-asked once per interval however many plugins share it, cached to
+The same pass checks every loaded plugin installed from an npm package, so
+**turning the check on also sends the npm package name of each loaded plugin to
+the registry** (one switch covers both checks; there is no separate one for
+plugins). A plugin's package is the nearest `package.json` above the
+file Meridian loaded, which gives its name and installed version. A lone file
+dropped into `plugins/` (or a symlink to one), a private package, a package
+whose `publishConfig.registry` names a non-public registry other than the
+one being asked, and a
+package.json that is not a JSON object are listed as not checkable, with the
+reason. When `MERIDIAN_UPDATE_CHECK_URL` points Meridian's own check at a
+mirror and `MERIDIAN_UPDATE_CHECK_REGISTRY` is unset, no plugin is checked and
+every plugin says to set `MERIDIAN_UPDATE_CHECK_REGISTRY`. Each package is asked
+once per interval however many plugins share it, at most four at a time and all
+within one 5s deadline (so switching the check on answers in about 5s even on a
+network that drops the requests), cached to
 `~/.cache/meridian/plugin-update-check.json`, and a failed lookup is reported on
 that plugin with the last version it saw. A plugin added by **Reload Plugins**
 is checked at once. The results are listed under **Updates** on `/settings` and
 in `plugins` on `GET /settings/api/updates`: per plugin `name`, `path`,
 `status`, `checkable` (`reason` when false), `package`, `installed`, `latest`,
-`updateAvailable`, `checkedAt` and `error`.
+`updateAvailable`, `checkedAt` and `error`. The list is present while the
+check is off, without `latest`.
 `MERIDIAN_NO_UPDATE_CHECK=1` forces it off regardless of the setting, so a
 fleet can refuse the call in one place. The launcher script's own install-time
 check below is separate and has its own switch.
@@ -898,57 +941,85 @@ While draining:
 Every request leaves a Claude Code transcript on disk -
 `projects/<project>/<session>.jsonl` and its sidecar files - in the config
 directory of the profile that served it (`~/.claude` without profiles).
-Claude Code deletes transcripts nobody has touched for `cleanupPeriodDays`,
-but it only reads that setting from a settings source it is allowed to load,
-and Meridian starts Claude Code with every settings file switched off so
-nothing on the proxy host leaks into a request. Meridian therefore hands the
-period over itself, as a flag setting, which loads no file.
+Claude Code has its own retention cleanup, but it runs only when an enabled
+settings source names `cleanupPeriodDays` or its user settings are loaded, and
+Meridian normally starts Claude Code with every settings file switched off so
+nothing on the proxy host leaks into a request. So, by default, nothing cleans
+that directory and it keeps growing.
 
-- **30 days by default**, Claude Code's own default. Change it with
-  `MERIDIAN_TRANSCRIPT_RETENTION_DAYS`, `transcriptRetentionDays` in
-  `settings.json`, or the `/settings` page; the environment wins. A change
-  applies to the next request.
-- **`0` keeps every transcript.** Meridian then passes no period and Claude
-  Code deletes nothing. Meridian never passes `0` itself: current Claude Code
-  rejects it, and older versions read it as "write no transcripts".
+**Retention is off by default.** Turn it on with
+`MERIDIAN_TRANSCRIPT_RETENTION_DAYS`, `transcriptRetentionDays` in
+`settings.json`, or the `/settings` page (1 to 3650 days; the environment
+wins, and `MERIDIAN_TRANSCRIPT_RETENTION_DAYS=0` pins it off over a saved
+value). Meridian then passes the period to every request's Claude Code process
+as a flag setting, which loads no settings file. A change applies to the next
+request.
+
+**What it deletes.** This is Claude Code's cleanup, not Meridian's, and it is
+not limited to transcripts. In each profile's config directory it deletes,
+by modification time alone, everything of its kind older than the period:
+
+- transcripts of conversations Meridian no longer tracks. Before a cleanup can
+  run, Meridian gives every transcript it still maps or has a request pinned
+  to a current modification time, so those survive it (if that fails, the
+  request runs without a period that time). A cleanup started outside
+  Meridian, such as interactive Claude Code sharing `~/.claude`, does not see
+  that: an affected conversation's next request finds no transcript to resume
+  and Meridian replays the history the client sent into a fresh session
+  (flattened text trimmed to the model's context window; SDK thinking is not
+  restored);
+- file history, plans, tasks, uploads, shell snapshots, debug logs, backups,
+  and Claude Code's other caches, jobs and logs.
+
+Without profiles that directory is your own `~/.claude`, shared with your
+interactive Claude Code.
+
 - **A config directory's own `settings.json` wins** when it sets
-  `cleanupPeriodDays` and retention is on here. Without profiles that
-  directory is your own `~/.claude`, so a retention you chose for interactive
-  Claude Code still holds. If that file cannot be parsed, or names a value
-  Claude Code would reject, no period is passed and nothing is deleted there.
+  `cleanupPeriodDays` and retention is on here, so a retention you chose for
+  interactive Claude Code still holds. If that file cannot be parsed, or names
+  a value Claude Code would reject, no period is passed for that directory.
   A `cleanupPeriodDays` from your organisation's managed settings outranks all
-  of these inside Claude Code.
-- **When it runs:** Claude Code sweeps in the background a few seconds after a
-  process starts, at most once a day per config directory (`.last-cleanup`
-  there records the last run). A request's process often ends before the
-  sweep gets going. After upgrading, the first sweep can take up to a day:
-  older versions let Claude Code record a skipped sweep as a run.
-- **Idle profiles:** two minutes after startup and then every three hours,
-  Meridian looks at every profile's config directory, one at a time. Where
-  Claude Code has not swept for a day and no request is running, it starts
-  one Claude Code process just for the sweep and stops it once
-  `.last-cleanup` advances, or after ten minutes. That process gets no
-  prompt, makes no model call, writes no transcript, and cannot reach the
-  network: every connection it opens goes to a local proxy that refuses it.
-  It starts only when an SDK slot is free and no request is waiting for one,
-  and holds that slot until the sweep finishes: about half a minute in
-  testing, ten minutes at most.
-  Change the interval with `MERIDIAN_TRANSCRIPT_SWEEP_INTERVAL_MS`; `0` turns
-  idle sweeps off and leaves the cleanup to requests.
-- **Logins are never touched:** a Claude Code process whose stored login is
-  about to expire refreshes it. The idle sweep skips a directory whose login
-  expires within 30 minutes, leaving it until Meridian's own refresher has
-  rolled it over. The refusing proxy would stop a refresh from reaching
-  Anthropic anyway. The stored login is compared before and after each sweep
-  process; if it ever changed, Meridian logs `transcript sweep STOPPED` and
-  runs no further idle sweeps until it restarts. An instance under
-  `MERIDIAN_CREDENTIALS_READONLY` never runs idle sweeps; whichever instance
-  owns the logins does.
-- **Resuming an expired conversation:** a conversation idle for longer than the
-  period has no transcript left to resume. Meridian retries the resume a few
-  times, then replays the history into a fresh session, so the request still
-  succeeds; the replay is flattened text trimmed to the model's context window
-  and cannot restore SDK thinking.
+  of these inside Claude Code. With `MERIDIAN_LOAD_CONTEXT=1` or `claudeMd:
+  full`, the period Meridian passes also outranks one in a loaded project or
+  local settings file.
+- **Meridian never passes `0`.** Current Claude Code rejects
+  `cleanupPeriodDays: 0` as invalid, and older versions read it as "write no
+  transcripts at all".
+- **When it runs:** Claude Code cleans up in the background a few seconds after
+  a request's process starts, at most once a day per config directory
+  (`.last-cleanup` there records the last run). A short request's process often
+  ends before the cleanup gets going (in testing, a process that lived under
+  about 5 s never cleaned up), and a profile that serves no requests would
+  never be cleaned, so Meridian runs an idle sweep (below).
+- **Idle sweep.** Every three hours (`MERIDIAN_TRANSCRIPT_SWEEP_INTERVAL_MS`,
+  `0` turns it off), for each profile config directory not cleaned for a day,
+  Meridian starts one Claude Code process that is sent nothing, cannot reach
+  the network (every connection goes to a local proxy that refuses it), and is
+  stopped once its cleanup has run, at most 10 minutes. One directory at a
+  time, never one a request runs in (a request arriving there stops it), and
+  only when an SDK slot is free with another left for requests; the slot is
+  held until the process has exited. It skips a directory whose login is due
+  for renewal within 30 minutes, starts nothing under
+  `MERIDIAN_CREDENTIALS_READONLY`, and stops until restart, with a log line, if a
+  stored login changes during a run in a way no renewal explains.
+- **The first cleanup can wait a day.** Claude Code stamps `.last-cleanup`
+  even when retention is off and it skips the deletion, so after you turn
+  retention on, a config directory that served a request in the previous
+  24 hours deletes nothing until that stamp is a day old.
+- **Race with a resume:** a conversation idle for longer than the period whose
+  resume is still loading its transcript while a concurrent cleanup deletes it
+  can lose its earlier SDK-side history without Meridian noticing. Meridian's
+  own processes refresh mapped transcripts before cleaning up, so this needs a
+  cleanup started outside Meridian in the same directory, and retention on.
+
+**Off does not mean "keep everything".** With retention off Meridian passes no
+period and changes nothing about Claude Code's own behavior, which is exactly
+what it does without this setting. If an instance loads Claude Code settings
+files (`MERIDIAN_LOAD_CONTEXT=1`, or an adapter's `claudeMd` set to `full`
+outside passthrough), Claude Code's user settings are enabled and it applies
+your own `cleanupPeriodDays`, or its default of 30 days, as it always has. A
+loaded project settings file or your organisation's managed settings that name
+a period are applied the same way.
 
 ## Session identity
 
@@ -1152,6 +1223,7 @@ Every request line carries `lineage=`, and every divergence also carries
 | `missing-session-header` | An OpenCode request arrived without its session header |
 | `moved-on-elsewhere` | Another profile's copy, used since, holds more of the history; this profile's older copy would drop the replies given there, so the turn replays |
 | `concurrent-race`, `priority-failback` | Lost a commit race; routed to another profile |
+| `interrupted-turn-kept:<why>` | The previous turn was stopped mid-stream and this request cannot resume the session kept for it (see [Stopping a turn](#stopping-a-turn)). `<why>` is `kept-assistant` (the request carries assistant content after the session's reply: the client kept the partial output), `prefix-changed` (an earlier message was edited), `reply-changed` (the session's own reply was altered or dropped), `no-user-turn` (nothing new after that reply) or `unknown-tool-result` (a tool result for a call the session never made) |
 | `independent-request:headerless-tool-result` | The client-driven tool loop above |
 | `independent-request:fork-source` | Declared `x-meridian-source: fork-*` |
 | `independent-request:subagent` | Declared a subagent flow |
@@ -1161,9 +1233,100 @@ A resumed turn prints no `diverged=` field at all. The
 `independent-request:*` causes skip session lookup before it happens; the rest
 are the verdict of a lookup that ran.
 
+A turn that replays its history for a reason other than the lookup's verdict
+says why with `replay=`, after `diverged=` when both are present. Every such
+line reads `session=new`. One value applies, in this order:
+
+| `replay=` | When it appears |
+|---|---|
+| `transformed-history` | A plugin rewrote the history this turn runs. This does not depend on the lookup, so it appears on any line, `lineage=new` (with its `diverged=`) included |
+| `changed-or-unproved-primary-agent` | The lookup found a session (`lineage=continuation`, `compaction` or `undo`), but OpenCode's primary agent is not the one that session was published with, or that session recorded none |
+| `unproved-sdk-prefix` | The lookup found a session (`lineage=continuation`, `compaction` or `undo`) that holds no proof its SDK transcript matches this history: it was published from a plugin-rewritten history, or it is a stopped turn's kept session read without that turn's record (after a restart, or on another process sharing the store; see [Stopping a turn](#stopping-a-turn)) |
+
 `headerless-tool-result` also prints a one-time warning at the first
 occurrence, because it is a property of how the client is wired rather than of
 a single turn.
+
+### Stopping a turn
+
+Stopping a streaming turn after its output started (Stop or Esc in the client,
+or a dropped connection) no longer always costs the next message a full replay.
+Meridian keeps the conversation's session, which still ends at the last
+completed turn, and lets the next message decide:
+
+- A client that discards the stopped turn's partial output (Pi, Prime Agent)
+  sends only the user's side of the conversation after it. That message resumes
+  the session and reads the prompt cache.
+- A client that keeps the partial output (OpenCode, Oh My Pi) sends it back as
+  an assistant message. The session never received that output, so the message
+  replays the whole history, partial included, exactly as before
+  (`diverged=interrupted-turn-kept:kept-assistant`).
+
+No setting is involved. A turn that already sent a tool call to the client, a
+non-stream request, and `POST /v1/sessions/:key/cancel` still replay the next
+message. The kept session resumes only on the Meridian process that kept it:
+after a restart, or on another process sharing the session store, the next
+message replays, logged as `lineage=continuation session=new
+replay=unproved-sdk-prefix`. A stopped turn ends [prompt-cache keepalive](#prompt-cache-keepalive)
+tracking until a later turn writes the one-hour cache again.
+
+One exception remains: under priority routing across several profiles, a
+conversation whose client signs its turns (the OpenCode V2 plugin, the Pi
+extension) is not checked after a stop yet. Its next message resumes the
+session as it always has, so a client that kept the partial output (OpenCode)
+is answered without it.
+
+### Prompt-cache keepalive
+
+Off by default. When a session sits idle long enough for its prompt cache to
+expire, the next turn writes the whole conversation to the cache again. A
+Claude Max (subscription) session through the Agent SDK writes the one-hour
+cache tier, so short pauses already cost nothing; this only helps sessions
+left idle for more than an hour, such as a user away at a meeting.
+
+Turn it on with `MERIDIAN_CACHE_KEEPALIVE=1`, or `"cacheKeepalive": true` in
+`settings.json` (the environment wins, and `MERIDIAN_CACHE_KEEPALIVE=0`
+forces it off). Both are re-read on every turn and every scheduler tick, so
+no restart is needed. There is no request header for it: the operator
+decides.
+
+When it is on:
+
+- Only a main conversation (not a subagent, title or summary request) of a
+  keyed passthrough session on a `claude-max` profile is eligible, and
+  only while its latest real turn wrote the **one-hour** cache tier. A turn
+  that writes the five-minute tier (API keys, Extra Usage) or that the client
+  cancels stops keepalives for that session; a turn that stops at a tool call
+  keeps them.
+- About 55 minutes after the latest real turn, and 55 minutes after each
+  keepalive, Meridian resumes the session's stored transcript exactly as the
+  next turn would, adds a short prompt, and stops as soon as the response
+  starts. At most three keepalives per idle period (about three hours); after
+  that the cache is allowed to expire.
+- The next real turn on the session ends the idle period and starts a new one.
+  Side calls that share the session key (Claude Code's classifier and title
+  requests) do not.
+- Keepalives never change the session. They are not saved, so the next turn
+  resumes the same transcript and mapping it would have without them.
+- A keepalive is skipped, not queued, when it would take the last free SDK
+  slot (`MERIDIAN_MAX_CONCURRENT`; with a limit of `1` keepalive never runs), when another keepalive is already running
+  (`MERIDIAN_CACHE_KEEPALIVE_MAX_IN_FLIGHT`), and while the session's account
+  is using Extra Usage, rate-limited, cooling down or benched from `[1m]`.
+  It always uses the account the session was published under and never fails
+  over to another profile.
+- It is skipped when the cache has already expired, and at a tool checkpoint
+  with more than eight pending tool calls, where it could not reuse the cache.
+- Each keepalive still counts toward subscription usage, at the cached-input
+  rate.
+- Shutdown and drain stop new keepalives, abort a running one and wait for its
+  Claude Code process to exit, like any other request.
+
+Keepalives appear in `/telemetry` with `requestSource: "cache-keepalive"`.
+They are left out of the request, error, cache-hit and cost figures and shown
+separately (the **Cache Keepalive** section, `cacheKeepalive` in
+`GET /telemetry/summary`, and `meridian_cache_keepalive_beats_total` in
+`/metrics`). One that never reached upstream is a skipped refresh, not an
+error.
 
 ## Concurrent requests to the same session
 
@@ -1645,6 +1808,8 @@ Codex and Polytoken require client-owned tools and cannot be switched to interna
 4. The client executes the tool locally and sends the result back
 
 For large tool sets (>15 tools), non-core tools are automatically deferred via the SDK's ToolSearch mechanism. Core tools (read, write, edit, bash, glob, grep) are always loaded eagerly. The deferral threshold is configurable with `MERIDIAN_DEFER_TOOL_THRESHOLD`.
+
+A client that marks any tool `defer_loading: true` manages deferral itself and is never auto-deferred. A client that also sends its own `ToolSearch` tool gets a single search path: its eager tools stay registered, a deferred tool is registered (eagerly) once the conversation references it through a `tool_reference`, unreferenced deferred tools stay unregistered, and Meridian adds no ToolSearch of its own — `tool_reference` blocks reach the model as text naming the tool as Meridian registered it. Each newly discovered tool changes the registered tool set, so that turn re-primes the prompt cache, as it did before when the client added the discovered tool to its own tool list. Other client-deferral keeps the inner ToolSearch, and `tool_reference` names in client tool results are mapped to the registered names.
 
 **Digest-turn elimination** — after a tool call is captured, the SDK would normally invoke the model one more time to "digest" the denial before ending the turn. That extra invocation is discarded by the proxy but fully billed — and on always-thinking models like Fable it costs a full thinking pass each time.
 

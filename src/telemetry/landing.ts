@@ -16,9 +16,9 @@ import { profileProvidersCss, profileProvidersJs } from "./profileProviders"
 import { profileLoginStatesCss, profileLoginStatesJs } from "./profileLoginStates"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "./profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT, isUnusableJs } from "./profileSpent"
-import { selectionHoldJs } from "./selectionHold"
 import { domPatchJs } from "./domPatch"
 import { profileCardStatusCss, profileCardStatusJs } from "./profileCardStatus"
+import { textSelectionJs } from "./textSelection"
 
 export const landingHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -42,9 +42,9 @@ export const landingHtml = `<!DOCTYPE html>
     background: var(--surface); border: 1px solid var(--border); border-radius: 5px;
     padding: 1px 6px; color: var(--accent2); white-space: nowrap; }
   /* The address chips carry this instance's own host, which can be longer
-     than a phone's column: meridian-gpt.desktop.ts.nowaker.net was 348px in
-     a 272px column at 320px and scrolled the page sideways. A desktop keeps
-     each chip unbroken; a phone lets it wrap. */
+     than a phone's column: a 37-character host was 348px in a 272px column at
+     320px and scrolled the page sideways. A desktop keeps each chip unbroken;
+     a phone lets it wrap. */
   @media (max-width: 720px) {
     .intro code { white-space: normal; overflow-wrap: anywhere; }
   }
@@ -94,8 +94,6 @@ export const landingHtml = `<!DOCTYPE html>
   .profile-card.spend-fading:hover > *, .profile-card.spend-spent:hover > * { filter: none; opacity: 1; }
   .profile-card.active.spend-fading > .profile-head, .profile-card.active.spend-spent > .profile-head { filter: none; opacity: 1; }
   .profile-card.active.spend-fading > .card-strip, .profile-card.active.spend-spent > .card-strip { filter: none; opacity: 1; }
-  /* An active card that needs a login keeps its brand ring outside the red
-     border, so it still reads as the active one by more than hue. */
   .profile-card.needs-login { border-color: var(--red); }
   .profile-card.needs-login .prof-dot { background: var(--red); }
   .spend-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
@@ -138,6 +136,7 @@ export const landingHtml = `<!DOCTYPE html>
     letter-spacing: 0.5px; text-transform: uppercase; text-align: center; white-space: nowrap; overflow: hidden; pointer-events: none; }
   .card-strip.strip-hint { background: var(--brand-bright, var(--accent)); clip-path: inset(0 0 100% 0); transition: clip-path 0.15s; }
   .profile-card.switchable:hover > .strip-hint, .profile-card.switchable:focus-visible > .strip-hint { clip-path: inset(0); }
+  .profile-card.spend-fading:focus-visible > .strip-hint, .profile-card.spend-spent:focus-visible > .strip-hint { filter: none; opacity: 1; }
   @media (max-width: 720px) {
     .profile-card.active, .profile-card.switchable { padding-top: 18px; }
   }
@@ -184,9 +183,6 @@ export const landingHtml = `<!DOCTYPE html>
   .prof-pop-value .cached-tag { color: var(--muted); font-size: 10px; font-style: italic; white-space: nowrap; }
   .prof-pop-value .fact-explanation { display: none; margin-top: 4px; color: var(--muted); font-family: inherit; line-height: 1.4; }
   .prof-pop-value:focus > .fact-explanation { display: block; }
-  /* A hidden overlay still counts toward the page's scroll width, and one
-     hung off the icon at 256px or more reaches past a phone's right edge.
-     On a narrow screen it spans the card's header row instead. */
   @media (max-width: 720px) {
     .prof-pop { left: -4px; right: -4px; }
   }
@@ -399,22 +395,24 @@ function setViewSort(mode){
 }
 
 ${reorderClientJs}
-${selectionHoldJs}
 ${profileProvidersJs}
 ${profileLoginStatesJs}
 ${domPatchJs}
 ${profileCardStatusJs}
+${textSelectionJs}
 
 var providersPresent=[];
 // How many cards the login-state chips count; below two they are not drawn.
 var loginTotal=0;
 
-function cardShown(group,state){
-  return meridianProviders.visible(group,providersPresent)&&meridianLoginStates.visible(state,loginTotal);
+// A card shows when its provider's chip is on AND its login state's chip is
+// on. A card updating after a sign-in is about to change state, so the
+// login-state chips leave it on screen until the new state is known.
+function cardShown(group,state,updating){
+  return meridianProviders.visible(group,providersPresent)&&(updating||meridianLoginStates.visible(state,loginTotal));
 }
 
-// A chip hides or shows cards where they stand: a card shows when its
-// provider's chip AND its login state's chip are on. Hidden cards stay in the
+// The chips hide or show cards where they stand. Hidden cards stay in the
 // page, so a drag still saves their place in the order. A heading shows while
 // any card of its provider does.
 function applyProviderFilter(){
@@ -423,7 +421,7 @@ function applyProviderFilter(){
   var groupShown={};var shown=0;
   for(var i=0;i<cards.length;i++){
     var group=cards[i].getAttribute('data-group');
-    var on=cards[i].classList.contains('updating')||cardShown(group,cards[i].getAttribute('data-login-state'));
+    var on=cardShown(group,cards[i].getAttribute('data-login-state'),cards[i].classList.contains('updating'));
     cards[i].hidden=!on;
     if(on){shown++;groupShown[group]=true}
   }
@@ -575,23 +573,27 @@ function profileSection(q,s,pl,h){
   var slots=meridianProviders.slots(groups);
   var grouped=groups.length>1;
   providersPresent=groups.map(function(g){return g.provider});
-  function loginStateOf(p){
-    return meridianLoginStates.stateOf({loggedIn:p.loggedIn,error:(quotaByProfile[p.id]||{}).error,renewalRequiredSoon:!!(p.entry&&p.entry.renewalRequiredSoon)});
+  function updateOf(p){return p.entry?meridianCardStatus.updateOf(p.entry,null):null}
+  function updatingOf(p){
+    var update=updateOf(p);
+    return !!(update&&update.state==='updating');
   }
-  var loginStates=slots.map(function(s){return loginStateOf(s.item)});
+  var loginStates=slots.map(function(s){
+    var p=s.item;
+    return meridianLoginStates.stateOf({loggedIn:p.loggedIn,error:(quotaByProfile[p.id]||{}).error,renewalRequiredSoon:!!(p.entry&&p.entry.renewalRequiredSoon)});
+  });
   loginTotal=slots.length;
   var groupShown={};var anyCardShown=false;
-  for(var i=0;i<slots.length;i++)if(cardShown(slots[i].provider,loginStates[i])){groupShown[slots[i].provider]=true;anyCardShown=true}
+  for(var g=0;g<slots.length;g++)if(cardShown(slots[g].provider,loginStates[g],updatingOf(slots[g].item))){groupShown[slots[g].provider]=true;anyCardShown=true}
   var reorderable=multi&&!meridianReorder.envPinned()&&viewSort==='configured';
   var cards='';
   var shown=[];
   var pos=0;
   for(var i=0;i<slots.length;i++){
     var slot=slots[i];
-    var update=slot.item.entry?meridianCardStatus.updateOf(slot.item.entry,null):null;
+    var update=updateOf(slot.item);
     var updating=!!(update&&update.state==='updating');
-    // A card being updated after a sign-in stays on screen whatever the chips say.
-    var cardHidden=!updating&&!cardShown(slot.provider,loginStates[i]);
+    var cardHidden=!cardShown(slot.provider,loginStates[i],updating);
     if(grouped&&slot.place===0)cards+=meridianProviders.headingHtml(slot.group,!groupShown[slot.provider]);
     var p=slot.item;var cost=profileCost(byProfile,p);
     var chat=isChatGptProfile(p.entry);
@@ -814,11 +816,6 @@ document.getElementById('content').addEventListener('click',function(e){
     if(loginChip==='*'){var firstState=document.querySelector('.provider-chip[data-login-chip]');if(firstState)firstState.focus()}
     return;
   }
-  // Releasing a drag-select dispatches a click too, and that one is the end of
-  // a copy rather than a request to switch account. A plain click has already
-  // collapsed whatever was selected by the time it fires, so this refuses only
-  // the gesture that really was a selection.
-  if(meridianSelection.live())return;
   if(onHandle(e))return;
   // The card is itself the switch button, so the icon inside one has to opt
   // out of it or reading an account would move all traffic to that account.
@@ -827,6 +824,9 @@ document.getElementById('content').addEventListener('click',function(e){
   if(e.target.closest('a'))return;
   var tab=e.target.closest('.sort-tab');
   if(tab&&tab.dataset.sort){setViewSort(tab.dataset.sort);return}
+  // Releasing a drag-select over a card dispatches a click on it too; that
+  // click finished a copy, so it is not a request to switch account.
+  if(meridianSelection.live())return;
   var card=e.target.closest('.profile-card.switchable');
   if(card&&card.dataset.profile)switchProfile(card.dataset.profile);
 });
@@ -840,7 +840,12 @@ document.getElementById('content').addEventListener('keydown',function(e){
 viewSort=readStoredSort()||viewSort;
 meridianReorder.init({onSaved:refresh});
 refresh();
-setInterval(function(){if(!meridianReorder.dragging() && !infoPopOpen() && !meridianSelection.holdsRedraw())refresh()},10000);
+function pollRefresh(){
+  if(document.visibilityState!=='visible'||meridianReorder.dragging()||infoPopOpen())return;
+  refresh();
+}
+setInterval(pollRefresh,10000);
+document.addEventListener('visibilitychange',pollRefresh);
 ` + profileBarJs + `
 </script>
 </body>

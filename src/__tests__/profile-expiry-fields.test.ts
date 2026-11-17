@@ -186,7 +186,8 @@ if (!isScenario(arg)) {
     const { resetActiveProfile } = await import("../proxy/profiles")
     const expiryFields = ["refreshTokenExpiresAt", "daysUntilRenewal", "renewalRequiredSoon", "accessTokenExpiresAt"] as const
     const historyFields = ["authObtainedAt", "authObtainedVia", "lastRefreshAt", "firstUnauthedAt", "unauthedReason"] as const
-    // Duplicate-account and post-sign-in status, reported for every profile.
+    // Duplicate-account and post-sign-in status, reported for every profile
+    // (owner-approved 2026-10-26, #1446; see the API contract).
     const statusFields = ["duplicateOf", "duplicateBasis", "factsRefresh"] as const
     const baseFields = [
       "id", "type", "isActive", "email", "subscriptionType", "organizationName", "rateLimitTier",

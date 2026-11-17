@@ -13,8 +13,9 @@
  * learning the sign-in succeeded and its next answer, the server has not been
  * asked yet - so the page also remembers the sign-in itself, and an answer
  * that was REQUESTED before the sign-in finished is not allowed to clear it.
- * While a card is updating it stays on screen whatever the filters say: a card
- * the user just signed in must not vanish because its login state changed.
+ * While a card is updating it stays on screen whatever the /profiles search
+ * says: a card the user just signed in must not vanish because the email it was
+ * found by changed under the search.
  *
  * `profileFindJs`'s pattern: the single browser-side copy, interpolated as a
  * string into each page, and evaluated verbatim by its tests.
@@ -59,6 +60,12 @@ var meridianCardStatus=(function(){
     return null;
   }
   function updating(id){return !!pending[id]}
+  // Read-only: whether a card is updating, by the server's word or the page's
+  // own memory of the sign-in. Unlike updateOf, it never ends the update.
+  function isUpdating(p){
+    if(!p)return false;
+    return !!(p.factsRefresh&&p.factsRefresh.state==='updating')||updating(p.id);
+  }
   function updateHtml(view){
     if(!view)return '';
     if(view.state==='updating')return '<div class="card-updating" role="status"><span class="card-spinner" aria-hidden="true"></span>Updating with the new sign-in\\u2026</div>';
@@ -70,18 +77,20 @@ var meridianCardStatus=(function(){
     beginUpdate:beginUpdate,
     updateOf:updateOf,
     updating:updating,
+    isUpdating:isUpdating,
     updateHtml:updateHtml
   };
 })();
 `
 
 export const profileCardStatusCss = `
-  .badge-duplicate { background: rgba(210,153,34,0.14); color: var(--yellow); border: 1px solid rgba(210,153,34,0.45); }
-  .card-updating { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--accent, var(--text)); margin: 6px 0 10px; }
+  .badge-duplicate { background: rgba(210,153,34,0.14); color: var(--yellow); border: 1px solid rgba(210,153,34,0.4); }
+  .card-updating { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin: 6px 0 10px; }
   .card-update-failed { font-size: 12px; color: var(--red); margin: 6px 0 10px; }
   .card-spinner { width: 12px; height: 12px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent;
     display: inline-block; animation: card-spin 0.8s linear infinite; flex: none; }
-  .profile-card.updating { opacity: 0.85; }
+  .profile-card.updating .usage-row, .profile-card.updating .no-usage,
+  .profile-card.updating .profile-details, .profile-card.updating .usage-section { opacity: 0.85; }
   @keyframes card-spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { .card-spinner { animation-duration: 2.4s; } }
 `

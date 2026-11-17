@@ -277,7 +277,7 @@ describe("terminal publication under a stalled lifecycle lock", () => {
       const key = `publication-winner-${stream}`
       expect((await app.fetch(turn(key, FIRST_TURN, false))).status).toBe(200)
       const spy = spyOn(lifecycle, "publishPinnedTranscript").mockImplementation(async () => {
-        expect(sessionStore.storeSharedSession(`personal:${key}`, "concurrent-winner")).toBeTruthy()
+        expect(await sessionStore.storeSharedSession(`personal:${key}`, "concurrent-winner")).toBeTruthy()
         throw stalled()
       })
       try {

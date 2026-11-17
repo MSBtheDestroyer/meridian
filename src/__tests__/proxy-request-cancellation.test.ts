@@ -10,6 +10,7 @@ import * as sessionStore from "../proxy/sessionStore"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
+import { holdStoreWrites } from "./storeDatabaseHelpers"
 type QueryMode = "complete" | "wait-for-abort" | "expose-then-fail"
 
 let mode: QueryMode = "complete"
@@ -288,6 +289,34 @@ describe("request cancellation propagation", () => {
     const response = await next!
     expect(response.status).toBe(200)
     expect(sessionStore.lookupSharedSession(sessionId)).toBeDefined()
+  })
+
+  it.each(["request", "shutdown"] as const)("never publishes a mapping revoked by %s while its store write waits", async (cause) => {
+    const controller = new AbortController()
+    const server = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const entered = Promise.withResolvers<void>()
+    const released = Promise.withResolvers<void>()
+    let publications = 0
+    // The fork's store is sessions.db: hold the next write transaction where
+    // upstream held the sessions.json fsync, and count the ones that commit.
+    const writes = holdStoreWrites(getSessionStoreDir(), () => entered.resolve(), released.promise, () => {
+      if (sessionStore.lookupSharedSession("cancel-during-store-fsync")) publications++
+    })
+    try {
+      const response = server.app.fetch(makeRequest(false, controller.signal, "cancel-during-store-fsync"))
+      await entered.promise
+      if (cause === "request") controller.abort("cancel during durable write")
+      else server.forceAbortInFlight?.()
+      released.resolve()
+      expect((await response).status).toBe(499)
+      expect(sessionStore.lookupSharedSession("cancel-during-store-fsync")).toBeUndefined()
+      // Another proxy must never be able to resume the canceled target, even
+      // briefly between a late publication and its compensating eviction.
+      expect(publications).toBe(0)
+    } finally {
+      released.resolve()
+      writes.mockRestore()
+    }
   })
 
   it("aborts a streaming SDK query when the response body is cancelled", async () => {

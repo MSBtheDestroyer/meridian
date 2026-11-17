@@ -11,7 +11,7 @@
 
 import { execFileSync, spawnSync } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
-import { mkdirSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { configPath } from "../configDir"
@@ -310,6 +310,8 @@ export function buildLoginCredentials(
   const refreshTokenExpiresAt = typeof refreshDeadline === "number"
     && Number.isFinite(refreshDeadline) && refreshDeadline > now && refreshDeadline <= 8.64e15
     ? refreshDeadline : undefined
+  // A null seat only clears a stored one; a new credential has none to clear.
+  const { seatTier, ...knownPlan } = plan
   return {
     claudeAiOauth: {
       accessToken: tokenData.access_token,
@@ -317,7 +319,8 @@ export function buildLoginCredentials(
       expiresAt: tokenData.expires_at ?? now + (tokenData.expires_in ?? 8 * 60 * 60) * 1000,
       ...(refreshTokenExpiresAt ? { refreshTokenExpiresAt } : {}),
       scopes: tokenData.scope?.split(" ").filter(Boolean) ?? OAUTH_SCOPES,
-      ...plan,
+      ...knownPlan,
+      ...(seatTier ? { seatTier } : {}),
     },
   }
 }
@@ -787,11 +790,12 @@ export async function profileRemove(id: string): Promise<void> {
     process.exit(1)
   }
 
-  if (getSetting("activeProfile") === id) setSetting("activeProfile", "")
-
   console.log(`\x1b[32m✓ Profile "${id}" removed.\x1b[0m`)
   for (const orphan of result.dirsOrphaned) {
     console.error(`\x1b[33m⚠ Left behind ${orphan.dir}: ${orphan.reason}\x1b[0m`)
+  }
+  if (result.activeProfile !== undefined) {
+    console.log(result.activeProfile ? `  Active profile is now "${result.activeProfile}".` : "  No profile is active now.")
   }
   if (result.profiles.length > 0) {
     printEnvHint(result.profiles)

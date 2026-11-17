@@ -60,7 +60,7 @@ export const settingsPageHtml = `<!DOCTYPE html>
      the row to whichever was wider - a select sized to its longest option
      left the text one word per line. On a narrow screen the control wraps
      under the label, never the description beside it. */
-  .setting-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .setting-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr)); gap: 10px; }
   .setting-stack { display: flex; flex-direction: column; gap: 10px; }
   /* Wide layout: one row across the whole window puts a toggle a thousand
      pixels from its label, so rows keep a readable width and add columns,
@@ -156,6 +156,9 @@ export const settingsPageHtml = `<!DOCTYPE html>
   .add-btn { background: var(--accent); border: none; color: #fff; border-radius: 6px;
     padding: 5px 14px; font-size: 12px; font-weight: 500; cursor: pointer; }
   .pricing-note { font-size: 11px; color: var(--muted); margin-top: 12px; line-height: 1.6; }
+  /* An executable path is one long unbroken string; on a phone it would widen
+     the whole page rather than wrap. */
+  #claude-exe-card code { overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -253,15 +256,15 @@ ${profileBarHtml}
 
   <h1 style="margin-top:40px">Transcript Retention</h1>
   <p class="subtitle" style="max-width:720px;line-height:1.6">
-    Every request leaves a Claude Code transcript on disk, under <code>projects/</code> in the config directory of
-    the profile that served it. Claude Code deletes transcripts nobody has touched for this many days, the same
-    cleanup it runs for your own Claude Code sessions, so that directory stops growing forever. The cleanup runs
-    inside Meridian's Claude Code processes, at most once a day per profile. For a profile that is idle and has not
-    been cleaned for a day, Meridian starts one Claude Code process just for the cleanup every few hours; it gets no
-    prompt and cannot reach the network. A conversation idle for longer than this has no transcript left to resume from;
-    Meridian then replays its history into a fresh session. 0 keeps every transcript. A profile whose own
-    <code>settings.json</code> sets <code>cleanupPeriodDays</code> keeps its own value.
-    Changes apply to the next request - no restart needed.
+    Every request leaves a Claude Code transcript on disk, in the config directory of the profile that served it,
+    and Meridian starts Claude Code with its own cleanup switched off, so that directory keeps growing.
+    <strong style="color:var(--text)">Off by default.</strong> Set a number of days to turn on Claude Code's own
+    cleanup in the processes that serve requests. <strong style="color:var(--yellow)">When on, Claude Code deletes
+    all of its files older than that in each profile directory</strong>, not only transcripts: transcripts (including
+    conversations Meridian still maps, which then replay from the client's history), file history, plans, tasks,
+    uploads, shell snapshots, debug logs and backups. Without profiles that directory is your own
+    <code>~/.claude</code>. A profile whose own <code>settings.json</code> sets <code>cleanupPeriodDays</code> keeps
+    its value. Changes apply to the next request; no restart needed.
   </p>
   <div class="adapter-card" id="transcripts-card">
     <div id="transcripts-body">Loading…</div>
@@ -272,7 +275,8 @@ ${profileBarHtml}
     Meridian is installed and updated by hand, so an instance can sit on an old version for weeks without
     anyone noticing. Switch this on and it asks the npm registry once a day whether a newer version is
     published; the site header then says so, beside the version it is running. The same check covers every
-    loaded plugin installed from an npm package, listed below. Off unless you turn it on —
+    loaded plugin installed from an npm package, listed below, so turning it on also sends those plugins'
+    package names to the registry. Off unless you turn it on —
     nothing contacts the registry until then. The header shows the running version either way.
   </p>
   <div class="adapter-card" id="updates-card">
@@ -968,22 +972,20 @@ async function putTelemetry(body) {
 
 async function loadTranscripts() {
   const cfg = await (await fetch('/settings/api/transcripts')).json();
-  const lim = cfg.limits || { min: 0, max: 3650 };
+  const lim = cfg.limits || { min: 1, max: 3650 };
   const eff = cfg.effective || {};
-  const now = eff.days === 0 ? 'off, every transcript is kept'
-    : eff.days + ' days' + (eff.source === 'default' ? ' (default)' : '');
-
-  const days = (n) => n == null ? null : (n === 0 ? 'off, every transcript is kept' : n + ' days');
+  const days = (n) => n == null || n === 0 ? null : n.toLocaleString() + ' days';
+  const now = eff.days > 0 ? 'Claude Code deletes its files older than ' + days(eff.days) : 'off, nothing is deleted';
 
   document.getElementById('transcripts-body').innerHTML = settingRowHtml({
     label: 'Delete after',
     forId: 'tr-days',
     controlHtml: '<input type="number" class="setting-input" id="tr-days" value="' + (cfg.saved == null ? '' : cfg.saved) + '"'
-      + ' min="' + lim.min + '" max="' + lim.max + '" step="1" placeholder="' + cfg.default + '" style="width:110px">'
+      + ' min="' + lim.min + '" max="' + lim.max + '" step="1" placeholder="off" style="width:110px">'
       + '<span class="setting-unit">days</span>',
-    desc: 'Leave blank for the default of ' + cfg.default + ' days.',
+    desc: 'Leave blank or 0 for off. ' + lim.min + ' to ' + lim.max + ' days turns the cleanup on.',
     statusHtml: [nowLine(telemetryEsc(now))],
-    envText: cfg.envOverride ? envOverrideText(cfg.envSource, days(eff.days), days(cfg.saved)) : null,
+    envText: envOverrideText((cfg.envSources || {}).transcriptRetentionDays, eff.days > 0 ? days(eff.days) : 'off', days(cfg.saved)),
   });
 
   document.getElementById('tr-days').addEventListener('change', async (e) => {
@@ -1017,7 +1019,7 @@ async function loadUpdates() {
   else if (!build.latest) state = 'checking…';
   else state = build.updateAvailable ? telemetryEsc(build.latest) + ' available' : 'up to date';
 
-  document.getElementById('updates-body').innerHTML = '<div class="setting-stack">' + settingRowHtml({
+  document.getElementById('updates-body').innerHTML = settingRowHtml({
     label: 'Check for updates',
     forId: 'upd-enabled',
     controlHtml: '<input type="checkbox" id="upd-enabled"' + (cfg.checkForUpdates ? ' checked' : '') + (cfg.envOptOut ? ' disabled' : '') + '>',
@@ -1027,8 +1029,11 @@ async function loadUpdates() {
         + (build.source && build.source !== 'npm' ? ' from a ' + telemetryEsc(build.source) + ' build; the header shows its separate release and runtime provenance' : '')
         + '.',
     ],
-    envText: cfg.envOptOut ? envOverrideText(cfg.envSource, 'off, no update checks', cfg.checkForUpdates ? 'on' : null) : null,
-  }) + pluginUpdateRows(cfg) + '</div>';
+    envText: !cfg.envOptOut ? null
+      : cfg.checkForUpdates
+        ? envOverrideText({ name: 'MERIDIAN_NO_UPDATE_CHECK', value: null }, 'off, no update checks', 'on')
+        : 'In use: off, no update checks, from MERIDIAN_NO_UPDATE_CHECK (env); this setting is off as well',
+  }) + pluginUpdatesHtml(cfg);
 
   const box = document.getElementById('upd-enabled');
   if (box && !cfg.envOptOut) box.addEventListener('change', (e) => putUpdates(e.target.checked));
@@ -1044,15 +1049,15 @@ function pluginUpdateState(p, enabled) {
   return installed + (p.error ? failed : ', checking…');
 }
 
-function pluginUpdateRows(cfg) {
+function pluginUpdatesHtml(cfg) {
   const plugins = cfg.plugins || [];
-  if (plugins.length === 0) return '<div class="setting-status">No plugins loaded.</div>';
-  return plugins.map(function (p) {
-    return settingRowHtml({
-      label: 'Plugin: ' + p.name,
-      controlHtml: p.package ? '<code>' + telemetryEsc(p.package) + '</code>' : '',
-      statusHtml: [pluginUpdateState(p, cfg.enabled)],
-    });
+  if (plugins.length === 0) return '<div class="pricing-note">No plugins loaded.</div>';
+  return '<div class="pricing-note" style="margin-bottom:6px">Plugins</div>' + plugins.map(function (p) {
+    return '<div style="display:flex;align-items:baseline;gap:12px;margin-bottom:8px;flex-wrap:wrap;font-size:13px">'
+      + '<span style="color:var(--muted);width:150px;overflow-wrap:anywhere">' + telemetryEsc(p.name) + '</span>'
+      + (p.package ? '<code>' + telemetryEsc(p.package) + '</code>' : '')
+      + '<span style="color:var(--muted);font-size:12px">' + pluginUpdateState(p, cfg.enabled) + '</span>'
+      + '</div>';
   }).join('');
 }
 
@@ -1099,14 +1104,13 @@ async function loadClaudeExecutable() {
   const active = cfg.active
     ? claudeExeCandidate(cfg.active) + ' <span style="color:var(--muted)">(' + telemetryEsc(cfg.active.source) + ')</span>'
     : '<span style="color:var(--red)">' + telemetryEsc(cfg.activeError || 'none resolved') + '</span>';
-  const envPathName = (cfg.envSource && cfg.envSource.name) || 'MERIDIAN_CLAUDE_PATH';
   let envText = null;
   if (cfg.envOverride && cfg.active && cfg.active.source === 'env') {
-    envText = envOverrideText(cfg.envSource,
+    envText = envOverrideText({ name: 'MERIDIAN_CLAUDE_PATH', value: null },
       cfg.active.path + (cfg.active.version ? ' ' + cfg.active.version : ''),
       cfg.mode === 'custom' && cfg.customPath ? 'custom ' + cfg.customPath : cfg.mode);
   } else if (cfg.envOverride) {
-    envText = envPathName + ' is set but not used: ' + (cfg.envOverride.detail || 'it cannot run');
+    envText = 'MERIDIAN_CLAUDE_PATH is set but not used: ' + (cfg.envOverride.detail || 'it cannot run');
   }
   let h = '<div class="setting-stack">' + settingRowHtml({
     label: 'Executable',

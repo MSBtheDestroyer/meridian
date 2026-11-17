@@ -11,6 +11,7 @@ import { assistantMessage, withMockSdkSessionId } from "./helpers"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
+import { installModelsMock } from "./modelsMock"
 
 type QueryCall = { readonly oauthToken?: string; readonly model?: string }
 
@@ -37,11 +38,10 @@ installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
-// mock.module is process-global: spread the real module and replace only the
-// auth probe, which must not reach the host.
-const actualModels = await import("../proxy/models")
-mock.module("../proxy/models", () => ({
-  ...actualModels,
+// Through the shared models dispatcher: a mock.module of ../proxy/models here
+// would replace it for every later file in the run. The auth probe must not
+// reach the host.
+installModelsMock(() => ({
   getClaudeAuthStatusAsync: async () => ({ loggedIn: true, subscriptionType: "max" }),
 }))
 
@@ -94,7 +94,9 @@ function recordUsage(profileId: string, window: "five_hour" | "seven_day", utili
   rateLimitStore.record(profileId, { status: "allowed", rateLimitType: window, utilization, resetsAt: Date.now() + resetsInMs })
 }
 
-type ErrorBody = { error?: { type?: string; message?: string; retry_after?: number } }
+type ErrorBody = {
+  error?: { type?: string; code?: string; message?: string; retry_after?: number; profiles?: Array<{ id: string; reason: string; resets_at: string | null }> }
+}
 
 const FLAT_WEEK_95 = { seven_day: { floor: 95, ceiling: 95 } }
 const PACED_5H_80 = { five_hour: { floor: 80, ceiling: 100 } }
@@ -229,9 +231,12 @@ describe("a held Claude profile under active routing", () => {
 
     // Then
     expect(response.status).toBe(429)
-    const message = (await response.json() as ErrorBody).error?.message ?? ""
-    expect(message).toContain("work (weekly at 96%, capped at 95%)")
-    expect(message).toContain("personal (5-hour at 60%, capped at 50%)")
+    const error = (await response.json() as ErrorBody).error
+    expect(error?.code).toBe("no_routable_account")
+    expect(error?.profiles).toEqual([
+      { id: "work", reason: "reserve_held", resets_at: expect.any(String) },
+      { id: "personal", reason: "reserve_held", resets_at: expect.any(String) },
+    ])
     const retryAfter = Number(response.headers.get("retry-after"))
     expect(retryAfter).toBeGreaterThan(3600 - 10)
     expect(retryAfter).toBeLessThanOrEqual(3600)
@@ -325,7 +330,9 @@ describe("a held Claude profile in a priority pool", () => {
 
     // Then
     expect(response.status).toBe(429)
-    expect((await response.json() as ErrorBody).error?.message).toContain("Every eligible profile is held back by its usage reserve")
+    const error = (await response.json() as ErrorBody).error
+    expect(error?.code).toBe("no_routable_account")
+    expect(error?.message).toContain("every eligible profile is held back by its usage reserve")
     expect(queryCalls).toEqual([])
   })
 })

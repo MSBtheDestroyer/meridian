@@ -598,8 +598,8 @@ export function processIncarnationPredatesBoot(owner: ProcessIncarnation): boole
 }
 
 // os.uptime() is reported in whole seconds on some platforms, so the derived
-// boot instant can land up to a second late. Only activity clearly before it
-// counts as belonging to an earlier boot.
+// boot instant can land up to a second late. Only times clearly before it
+// count as belonging to an earlier boot.
 const BOOT_CLOCK_TOLERANCE_MS = 5_000
 
 /** Wall-clock instant this host booted. */

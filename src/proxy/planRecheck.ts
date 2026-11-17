@@ -45,18 +45,25 @@ export async function runCredentialMaintenance(store: StoreIdentity, operation: 
   return promise
 }
 
+/** Whether a stored plan reading is missing, undated or expired, and no lookup was tried in the retry window. */
+export function planReadingDue(state: Omit<PlanState, "accessToken">, store: StoreIdentity, now = Date.now()): boolean {
+  const checkedAt = state.planCheckedAt
+  const dated = typeof checkedAt === "number" && Number.isFinite(checkedAt)
+  if (!planFieldsMissing(state) && dated && now - checkedAt < PLAN_RECHECK_MS) return false
+
+  const key = store.refreshKey
+  const attempted = key ? attemptedByKey.get(key) : attemptedByStore.get(store)
+  return attempted === undefined || now - attempted >= PLAN_RETRY_MS
+}
+
 export async function readPlanUpdate(state: PlanState, store: StoreIdentity): Promise<{
   readonly fields: OAuthPlanFields
   readonly checkedAt: number
 } | null> {
   const now = Date.now()
-  const checkedAt = state.planCheckedAt
-  const dated = typeof checkedAt === "number" && Number.isFinite(checkedAt)
-  if (!planFieldsMissing(state) && dated && now - checkedAt < PLAN_RECHECK_MS) return null
+  if (!planReadingDue(state, store, now)) return null
 
   const key = store.refreshKey
-  const attempted = key ? attemptedByKey.get(key) : attemptedByStore.get(store)
-  if (attempted !== undefined && now - attempted < PLAN_RETRY_MS) return null
   if (key) attemptedByKey.set(key, now)
   else attemptedByStore.set(store, now)
 

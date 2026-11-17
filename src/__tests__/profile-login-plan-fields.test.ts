@@ -230,6 +230,13 @@ describe("buildLoginCredentials", () => {
     expect("rateLimitTier" in creds.claudeAiOauth).toBe(false)
   })
 
+  it("does not write the null seat a personal account reports", () => {
+    const creds = buildLoginCredentials(TOKEN_DATA, { subscriptionType: "max", seatTier: null })
+
+    expect(creds.claudeAiOauth.subscriptionType).toBe("max")
+    expect("seatTier" in creds.claudeAiOauth).toBe(false)
+  })
+
   it("still carries the tokens, scopes and expiry", () => {
     const creds = buildLoginCredentials(TOKEN_DATA, {}, 1_000_000)
 

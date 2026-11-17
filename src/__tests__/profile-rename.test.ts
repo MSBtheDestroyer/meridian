@@ -351,15 +351,6 @@ describe("applyProfileRename", () => {
     expect(getSetting("activeProfile")).toBe("personal")
   })
 
-  test("renaming a profile outside the pool order leaves it alone", () => {
-    seed([{ id: "work" }, { id: "spare" }])
-    setSetting("profileOrder", ["spare"])
-
-    applyProfileRename("work", "employer", { profilesDir, configFile })
-
-    expect(getSetting("profileOrder")).toEqual(["spare"])
-  })
-
   test("the pool order follows the rename, keeping the profile's position", () => {
     seed([{ id: "work" }, { id: "spare" }])
     setSetting("profileOrder", ["work", "spare"])
@@ -372,13 +363,22 @@ describe("applyProfileRename", () => {
       .toEqual({ order: ["employer", "spare"], unknown: [] })
   })
 
-  test("renaming a different profile leaves the pool order alone", () => {
+  test("a renamed profile later in the pool order keeps its position", () => {
     seed([{ id: "work" }, { id: "personal" }])
     setSetting("profileOrder", ["personal", "work"])
 
     applyProfileRename("work", "employer", { profilesDir, configFile })
 
     expect(getSetting("profileOrder")).toEqual(["personal", "employer"])
+  })
+
+  test("renaming a profile outside the pool order leaves it alone", () => {
+    seed([{ id: "work" }, { id: "spare" }])
+    setSetting("profileOrder", ["spare"])
+
+    applyProfileRename("work", "employer", { profilesDir, configFile })
+
+    expect(getSetting("profileOrder")).toEqual(["spare"])
   })
 
   test("a renamed profile still resolves under its old name", () => {

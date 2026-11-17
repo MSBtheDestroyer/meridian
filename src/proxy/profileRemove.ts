@@ -1,5 +1,6 @@
 /**
- * Profile removal.
+ * Claude profile removal, shared by `meridian profile remove` and
+ * `POST /profiles/claude/remove`.
  *
  * Removing a profile drops its entry from profiles.json and deletes the
  * credential directory it owns. Both halves are planned before either is
@@ -16,19 +17,15 @@
  * a redirect left behind by a rename, and "remove x" deleting the profile now
  * called y is not what anybody means.
  *
- * This is a leaf module - it shares profileRename.ts's disk primitives and
- * imports nothing from server.ts, profileCli.ts or session/.
+ * This is a leaf module - no imports from server.ts, profileCli.ts or session/.
  */
 
-import { existsSync, rmSync } from "node:fs"
-import { join } from "node:path"
+import { existsSync, realpathSync, rmSync } from "node:fs"
+import { isAbsolute, join, relative, resolve } from "node:path"
+import { getSetting, saveSettings, type MeridianSettings } from "../settings"
 import { readProfileConfigForUpdate, withProfileConfigLockSync } from "./profileConfigStore"
 import type { ProfileConfig } from "./profiles"
-import {
-  defaultProfilesConfigFile,
-  defaultProfilesDir,
-  saveProfileConfigTo,
-} from "./profileRename"
+import { defaultProfilesConfigFile, defaultProfilesDir, saveProfileConfigTo } from "./profileRename"
 
 /**
  * Which on-disk directories should be removed when this profile is deleted.
@@ -36,21 +33,41 @@ import {
  * Browser-login profiles drop their explicit `claudeConfigDir`, and only when
  * it lives under `profilesDir` - a profile pointed at ~/.claude names the
  * host's own credentials, which removing one account must never delete.
- * oauth-token profiles store no `claudeConfigDir` at all, so their isolation
- * dir at `profilesDir/<id>` is derived instead; it is created by the SDK
- * during use rather than written on the profile, and was orphaned forever
- * before this covered it.
+ * oauth-token profiles drop the pinned isolation dir at `profilesDir/<id>`
+ * (created by the SDK during use, not stored on the profile itself).
  */
 export function dirsToRemoveOnProfileRemove(profile: ProfileConfig, profilesDir: string): string[] {
   const dirs: string[] = []
-  if (profile.claudeConfigDir?.startsWith(profilesDir)) {
+  if (profile.claudeConfigDir && strictlyInside(profile.claudeConfigDir, profilesDir)) {
     dirs.push(profile.claudeConfigDir)
   }
   if (profile.oauthToken || profile.type === "oauth-token") {
     const isolationDir = join(profilesDir, profile.id)
-    if (!dirs.includes(isolationDir)) dirs.push(isolationDir)
+    if (!dirs.includes(isolationDir) && strictlyInside(isolationDir, profilesDir)) dirs.push(isolationDir)
   }
   return dirs
+}
+
+/** Symlinks resolved where the path exists, so a link cannot lead outside. */
+function canonicalPath(path: string): string {
+  try { return realpathSync(path) } catch { return resolve(path) }
+}
+
+/**
+ * Whether `dir` lies below `root`. Not `root` itself, which would delete every
+ * profile's credentials, and not a sibling that merely shares its prefix
+ * (`profiles-backup`) or a path that climbs back out (`profiles/../x`).
+ */
+function strictlyInside(dir: string, root: string): boolean {
+  const rel = relative(canonicalPath(root), canonicalPath(dir))
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)
+}
+
+/** Every directory a profile reads credentials from, owned or not. */
+function dirsInUse(profile: ProfileConfig, profilesDir: string): string[] {
+  const dirs = dirsToRemoveOnProfileRemove(profile, profilesDir)
+  if (profile.claudeConfigDir) dirs.push(profile.claudeConfigDir)
+  return dirs.map(canonicalPath)
 }
 
 export interface ProfileRemovePlan {
@@ -62,9 +79,15 @@ export interface ProfileRemovePlan {
   dirsToRemove: string[]
 }
 
-export type PlanProfileRemoveResult =
-  | { ok: true; plan: ProfileRemovePlan }
-  | { ok: false; error: string; hint?: string }
+export type ProfileRemoveFailure = {
+  ok: false
+  /** `unknown_profile`: profiles.json has no entry with this id. */
+  code: "unknown_profile" | "store_write_failed"
+  error: string
+  hint?: string
+}
+
+export type PlanProfileRemoveResult = { ok: true; plan: ProfileRemovePlan } | ProfileRemoveFailure
 
 export function planProfileRemove(
   profiles: ProfileConfig[],
@@ -74,25 +97,47 @@ export function planProfileRemove(
   const idx = profiles.findIndex(p => p.id === id)
   if (idx === -1) {
     const byAlias = profiles.find(p => p.aliases?.includes(id))
-    if (byAlias) {
-      return {
-        ok: false,
-        error: `Profile "${id}" not found.`,
-        hint: `"${id}" is a former name of "${byAlias.id}" — remove that instead.`,
-      }
+    return {
+      ok: false,
+      code: "unknown_profile",
+      error: `Profile "${id}" not found.`,
+      ...(byAlias ? { hint: `"${id}" is a former name of "${byAlias.id}" - remove that instead.` } : {}),
     }
-    return { ok: false, error: `Profile "${id}" not found.` }
   }
 
   const removed = profiles[idx]!
+  const remaining = profiles.filter((_, i) => i !== idx)
+  // Two profiles signed in to one directory share its credentials; the one
+  // that stays must keep them.
+  const stillUsed = new Set(remaining.flatMap(p => dirsInUse(p, profilesDir)))
   return {
     ok: true,
     plan: {
-      profiles: profiles.filter((_, i) => i !== idx),
+      profiles: remaining,
       removed,
-      dirsToRemove: dirsToRemoveOnProfileRemove(removed, profilesDir),
+      dirsToRemove: dirsToRemoveOnProfileRemove(removed, profilesDir).filter(dir => !stillUsed.has(canonicalPath(dir))),
     },
   }
+}
+
+/**
+ * The settings that name a removed profile, rewritten without it. Only keys
+ * that change are returned. The active pointer moves to the first remaining
+ * profile, or is cleared when none remain; the saved failover order drops the
+ * profile and the former names that redirected to it.
+ */
+export function profileRemovalSettings(
+  removed: Pick<ProfileConfig, "id" | "aliases">,
+  remaining: readonly ProfileConfig[],
+  settings: Pick<MeridianSettings, "activeProfile" | "profileOrder">,
+): Pick<MeridianSettings, "activeProfile" | "profileOrder"> {
+  const names = new Set([removed.id, ...(removed.aliases ?? [])])
+  const update: Pick<MeridianSettings, "activeProfile" | "profileOrder"> = {}
+  if (settings.activeProfile === removed.id) update.activeProfile = remaining[0]?.id
+  if (settings.profileOrder?.some(id => names.has(id))) {
+    update.profileOrder = settings.profileOrder.filter(id => !names.has(id))
+  }
+  return update
 }
 
 export interface ApplyProfileRemoveOptions {
@@ -106,7 +151,9 @@ export type ApplyProfileRemoveResult =
   | {
       ok: true
       id: string
-      /** Directories actually deleted, for the caller to report. */
+      /** Former names that redirected to the removed profile. */
+      aliases: string[]
+      /** Directories actually deleted. */
       dirsRemoved: string[]
       /**
        * Directories the list no longer claims and that could not be deleted.
@@ -115,9 +162,11 @@ export type ApplyProfileRemoveResult =
        * directory outlives every profile that named it.
        */
       dirsOrphaned: { dir: string; reason: string }[]
+      /** Where the persisted active pointer moved; absent when it named another profile. */
+      activeProfile?: string | null
       profiles: ProfileConfig[]
     }
-  | { ok: false; error: string; hint?: string }
+  | ProfileRemoveFailure
 
 export function applyProfileRemove(
   id: string,
@@ -125,7 +174,7 @@ export function applyProfileRemove(
 ): ApplyProfileRemoveResult {
   const configFile = options.configFile ?? defaultProfilesConfigFile()
   try { return withProfileConfigLockSync(configFile, () => applyProfileRemoveLocked(id, options)) }
-  catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) } }
+  catch (error) { return { ok: false, code: "store_write_failed", error: error instanceof Error ? error.message : String(error) } }
 }
 
 function applyProfileRemoveLocked(id: string, options: ApplyProfileRemoveOptions): ApplyProfileRemoveResult {
@@ -142,9 +191,16 @@ function applyProfileRemoveLocked(id: string, options: ApplyProfileRemoveOptions
   } catch (err) {
     return {
       ok: false,
+      code: "store_write_failed",
       error: `Could not write ${configFile}: ${err instanceof Error ? err.message : err}`,
     }
   }
+
+  const settings = profileRemovalSettings(plan.removed, plan.profiles, {
+    activeProfile: getSetting("activeProfile"),
+    profileOrder: getSetting("profileOrder"),
+  })
+  if (Object.keys(settings).length > 0) saveSettings(settings)
 
   const dirsRemoved: string[] = []
   const dirsOrphaned: { dir: string; reason: string }[] = []
@@ -158,5 +214,13 @@ function applyProfileRemoveLocked(id: string, options: ApplyProfileRemoveOptions
     }
   }
 
-  return { ok: true, id: plan.removed.id, dirsRemoved, dirsOrphaned, profiles: plan.profiles }
+  return {
+    ok: true,
+    id: plan.removed.id,
+    aliases: plan.removed.aliases ?? [],
+    dirsRemoved,
+    dirsOrphaned,
+    ...("activeProfile" in settings ? { activeProfile: settings.activeProfile ?? null } : {}),
+    profiles: plan.profiles,
+  }
 }

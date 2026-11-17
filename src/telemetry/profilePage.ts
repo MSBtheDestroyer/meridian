@@ -11,7 +11,6 @@ import { PROVIDERS_NONE_SHOWN_HTML, profileProvidersCss, profileProvidersJs } fr
 import { LOGIN_STATES_NONE_SHOWN_HTML, profileLoginStatesCss, profileLoginStatesJs } from "./profileLoginStates"
 import { isUnusableJs } from "./profileSpent"
 import { WINDOW_LABELS } from "./profileUsage"
-import { selectionHoldJs } from "./selectionHold"
 import { domPatchJs } from "./domPatch"
 import { profileCardStatusCss, profileCardStatusJs } from "./profileCardStatus"
 
@@ -443,7 +442,7 @@ ${reorderLiveRegionHtml}
       <code>meridian profile list</code> \u2014 show all profiles and auth status<br>
       <code>meridian profile login &lt;name&gt;</code> \u2014 re-authenticate an expired profile<br>
       <code>meridian profile rename &lt;old&gt; &lt;new&gt;</code> \u2014 rename a profile (or use the pencil above)<br>
-      <code>meridian profile remove &lt;name&gt;</code> \u2014 remove a profile
+      <code>meridian profile remove &lt;name&gt;</code> \u2014 remove a profile (or use the trash can above)
     </div>
     <p style="font-size:13px;color:var(--muted);margin-top:12px">
       Renaming keeps the old name working: requests still naming it are served by
@@ -463,6 +462,7 @@ ${reorderLiveRegionHtml}
 // (see profile-usage.test.ts) and the labels object is interpolated here so
 // the browser script and TS module share their data.
 var WINDOW_LABELS = ${JSON.stringify(WINDOW_LABELS)};
+var PROFILE_INPUT_ATTRS = '${PROFILE_INPUT_ATTRS}';
 
 function labelForWindow(type) {
   if (WINDOW_LABELS[type]) return WINDOW_LABELS[type];
@@ -492,20 +492,24 @@ function formatResetCountdown(resetsAt) {
   return remHr > 0 ? 'in ' + days + 'd ' + remHr + 'h' : 'in ' + days + 'd';
 }
 
+function formatExtraUsageAmount(amount, currency) {
+  var code = currency || '';
+  var prefix = code === 'USD' ? '$' : /^[A-Z]{3}$/.test(code) ? code + ' ' : code;
+  return prefix + amount.toFixed(2);
+}
+
 function formatExtraUsage(eu) {
   if (!eu || !eu.isEnabled) return null;
   var monthlyLimit = isFinite(eu.monthlyLimit) ? eu.monthlyLimit : 0;
   if (monthlyLimit <= 0) return null;
-  var used = isFinite(eu.usedCredits) ? eu.usedCredits : 0;
-  var utilization = (eu.utilization != null && isFinite(eu.utilization))
-    ? Math.max(0, Math.min(1, eu.utilization))
-    : (monthlyLimit > 0 ? Math.max(0, Math.min(1, used / monthlyLimit)) : 0);
-  var currency = eu.currency || '';
+  var used = isFinite(eu.usedCredits) ? Math.max(0, eu.usedCredits) : 0;
+  var share = used / monthlyLimit;
   return {
-    used: (currency + used.toFixed(2)).trim(),
-    limit: (currency + monthlyLimit.toFixed(2)).trim(),
-    utilizationPct: Math.round(utilization * 100),
-    status: classifyUtilization(utilization),
+    used: formatExtraUsageAmount(used, eu.currency),
+    limit: formatExtraUsageAmount(monthlyLimit, eu.currency),
+    over: used > monthlyLimit ? formatExtraUsageAmount(used - monthlyLimit, eu.currency) : null,
+    utilizationPct: Math.round(share * 100),
+    status: classifyUtilization(share),
   };
 }
 
@@ -513,7 +517,6 @@ function formatExtraUsage(eu) {
 ${isUnusableJs}
 
 ${reorderClientJs}
-${selectionHoldJs}
 ${profileProvidersJs}
 ${profileLoginStatesJs}
 ${domPatchJs}
@@ -565,10 +568,7 @@ var updatePollTimer = null;
 // innerHTML, which would blank the input mid-keystroke.
 var editingProfile = null;
 var renameError = null;
-// Profile awaiting a remove confirmation, and the error from the last rejected
-// attempt. The poll is suspended while one is pending for the same reason a
-// rename suspends it: a redraw mid-decision would take the confirmation away
-// and leave the click that follows landing on whatever moved into its place.
+// A profile or seat being removed: its confirm panel is open, and the poll waits.
 var removingProfile = null;
 var removeError = null;
 
@@ -647,9 +647,11 @@ function cancelRemove() {
 }
 
 async function commitRemove(id) {
+  var target = ((lastProfiles && lastProfiles.profiles) || []).find(function (p) { return p.id === id; });
+  var route = target && isChatGptProfile(target) ? '/profiles/chatgpt/remove' : '/profiles/claude/remove';
   var data;
   try {
-    var res = await fetch('/profiles/remove', {
+    var res = await fetch(route, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ profile: id })
@@ -669,9 +671,16 @@ async function commitRemove(id) {
   redraw();
 }
 
+// Refreshes overlap (the 10s poll, the quicker one while a card updates, a
+// finished sign-in), and their answers can land out of order: one asked for
+// before an answer already drawn is older than the page and is dropped.
+var refreshesIssued = 0;
+var refreshDrawn = 0;
+
 async function refresh() {
   if (editingProfile || removingProfile || detailFactFocused()) return;
   var requestedAt = Date.now();
+  var seq = ++refreshesIssued;
   try {
     var [profilesRes, quotaRes, routingRes] = await Promise.all([
       fetch('/profiles/list'),
@@ -683,9 +692,15 @@ async function refresh() {
     if (quotaRes && quotaRes.ok) {
       try { quota = await quotaRes.json(); } catch (_) { quota = null; }
     }
-    if (quota) lastQuota = quota;
+    var routing = null;
     if (routingRes && routingRes.ok) {
-      try { meridianReorder.adopt(await routingRes.json()); } catch (_) { /* keep the last good order */ }
+      try { routing = await routingRes.json(); } catch (_) { routing = null; }
+    }
+    if (seq < refreshDrawn) return;
+    refreshDrawn = seq;
+    if (quota) lastQuota = quota;
+    if (routing) {
+      try { meridianReorder.adopt(routing); } catch (_) { /* keep the last good order */ }
     }
     lastProfiles = profiles;
     lastProfilesRequestedAt = requestedAt;
@@ -694,7 +709,7 @@ async function refresh() {
     render(profiles, lastQuota);
     noticeNewChatGptSeats(profiles.profiles || []);
   } catch {
-    if (detailFactFocused()) return;
+    if (seq < refreshDrawn || detailFactFocused()) return;
     document.getElementById('content').innerHTML = '<div class="empty-state"><h2>Could not load profiles</h2><p>Is Meridian running?</p></div>';
   }
 }
@@ -715,8 +730,6 @@ function codeSpans(text) {
     return i % 2 === 1 ? '<code>' + esc(part) + '</code>' : esc(part);
   }).join('');
 }
-
-var PROFILE_INPUT_ATTRS = '${PROFILE_INPUT_ATTRS}';
 
 var ICON_COPY = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25zM5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25z"/></svg>';
 
@@ -1095,9 +1108,10 @@ function renderUsageSection(profileQuota, p) {
       +     '<span class="usage-label">Extra usage</span>'
       +     '<span class="usage-pct">' + extra.utilizationPct + '%' + usageTag + '</span>'
       +   '</div>'
-      +   '<div class="usage-bar"><div class="usage-fill" style="width:' + extra.utilizationPct + '%"></div></div>'
+      +   '<div class="usage-bar"><div class="usage-fill" style="width:' + Math.min(100, extra.utilizationPct) + '%"></div></div>'
       +   '<div class="usage-extra-row" style="margin-top:4px">'
-      +     '<span class="usage-reset">' + esc(extra.used) + ' / ' + esc(extra.limit) + '</span>'
+      +     '<span class="usage-reset">' + esc(extra.used) + ' / ' + esc(extra.limit)
+      +       (extra.over ? ', over by ' + esc(extra.over) : '') + '</span>'
       +   '</div>'
       + '</div>';
   } else if (credits) {
@@ -1200,8 +1214,11 @@ function render(data, quotaData) {
       html += "<a class=\\"profile-name\\" href=\\"#" + esc(encodeURIComponent(p.id)) + "\\" title=\\"Link to this profile\\">" + esc(p.id) + "</a>";
       if (isActive) html += "<span class=\\"profile-badge badge-active\\">active</span>";
       html += meridianProviders.badgeHtml(slot.provider, "profile-badge");
-      // A seat's type is its provider's name, which the badge before it says.
-      if ((p.type || "claude-max") !== slot.provider) html += "<span class=\\"profile-badge badge-type\\">" + esc(p.type || "claude-max") + "</span>";
+      // The allowance (20x, 5x) tells accounts apart; the type does not, as
+      // every claude-max profile shares it. Without an allowance the type
+      // stays, except on a seat, whose type is the provider badge's name.
+      if (p.allowance) html += '<span class="profile-badge badge-type" title="' + attr([p.planLabel, p.rateLimitTier].filter(Boolean).join(' \u00b7 ')) + '">' + esc(p.allowance) + '</span>';
+      else if ((p.type || "claude-max") !== slot.provider) html += "<span class=\\"profile-badge badge-type\\">" + esc(p.type || "claude-max") + "</span>";
       // The pill / shows, in the words of whoever holds the login.
       if (needsLogin) {
         var access = profileAccessHelp(p);
@@ -1212,7 +1229,7 @@ function render(data, quotaData) {
       if ((quotaById[p.id] || {}).servingOnCredits) html += '<span class="profile-badge badge-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
       html += "<span class=\\"profile-card-actions\\">";
       html += "<button class=\\"icon-btn\\" title=\\"Rename profile\\" onclick=\\"startRename(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_PENCIL + "</button>";
-      html += "<button class=\\"icon-btn danger\\" title=\\"Remove profile\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
+      html += "<button class=\\"icon-btn danger\\" title=\\"" + (isChatGptProfile(p) ? "Remove seat" : "Remove profile") + "\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
       html += "</span>";
     }
     html += '</div>';
@@ -1233,7 +1250,9 @@ function render(data, quotaData) {
       html += '</div></div>';
     } else if (removingProfile === p.id) {
       html += '<div class="remove-confirm">';
-      html += '<div class="remove-confirm-text">Remove <strong>' + esc(p.id) + '</strong>? Its stored credentials are deleted with it, so putting it back means logging in again.</div>';
+      html += '<div class="remove-confirm-text">Remove <strong>' + esc(p.id) + '</strong>? ' + (isChatGptProfile(p)
+        ? 'Its stored credentials are deleted with it, so putting it back means logging in again.'
+        : 'Credentials Meridian stored for it are deleted with it; a login it shares with another profile or with your own Claude Code stays. Requests that name it with <code>x-meridian-profile</code> are refused afterwards.') + '</div>';
       if (removeError) html += '<div class="rename-error">' + esc(removeError) + '</div>';
       html += '<div class="remove-confirm-actions">';
       html += '<button class="confirm-btn danger" onclick="commitRemove(&quot;'+esc(p.id)+'&quot;)">Remove</button>';
@@ -1267,7 +1286,7 @@ function render(data, quotaData) {
   meridianPatch.html(document.getElementById('content'), html);
   meridianReorder.restoreFocus(refocusId);
   if (anyUpdating && !updatePollTimer) {
-    updatePollTimer = setTimeout(function () { updatePollTimer = null; refresh(); }, 1500);
+    updatePollTimer = setTimeout(pollUpdate, 1500);
   }
   // The markup carries placeholder hrefs. Restore them from the cache, then top
   // up anything missing or near expiry in the background.
@@ -1305,9 +1324,11 @@ function writeProfilesUrl(hashId) {
 }
 
 // A card shows when its provider's chip is on AND its login state's chip is on
-// AND it matches the search; a provider's heading shows while any of its cards
-// does. The count and the no-match message count only the cards the chips
-// leave on screen.
+// AND it matches the search. A card updating after a sign-in (see
+// profileCardStatus.ts) skips the search and the login-state chips: both can
+// change under it with the new sign-in. A provider's heading shows while any
+// of its cards does. The count and the no-match message count only the cards
+// the chips leave on screen.
 function applyProfileFilter() {
   var profiles = profilesForFind();
   var byId = Object.create(null);
@@ -1318,12 +1339,11 @@ function applyProfileFilter() {
   var groupShown = Object.create(null);
   for (var c = 0; c < cards.length; c++) {
     var group = cards[c].getAttribute('data-group');
+    var cardProfile = byId[cards[c].getAttribute('data-id')];
+    var updating = meridianCardStatus.isUpdating(cardProfile);
     var chipsOn = meridianProviders.visible(group, providersPresent)
-      && meridianLoginStates.visible(cards[c].getAttribute('data-login-state'), loginTotal);
-    // A card being updated after a sign-in stays where the user left it, even
-    // when its new login state is one the chips hide.
-    if (cards[c].classList.contains('updating')) chipsOn = true;
-    var match = chipsOn && profileMatchesQuery(byId[cards[c].getAttribute('data-id')], profileQuery);
+      && (updating || meridianLoginStates.visible(cards[c].getAttribute('data-login-state'), loginTotal));
+    var match = chipsOn && (profileMatchesQuery(cardProfile, profileQuery) || updating);
     cards[c].hidden = !match;
     if (chipsOn) inView++;
     if (match) { shown++; groupShown[group] = true; }
@@ -1384,7 +1404,7 @@ function jumpToProfileAnchor() {
   var card = document.getElementById(profileAnchorElementId(id));
   if (!card) return;
   // Following a link to one profile outranks a filter that hides it, the
-  // provider chip included.
+  // provider and login-state chips included.
   var group = card.getAttribute('data-group');
   if (group && !meridianProviders.visible(group, providersPresent)) {
     meridianProviders.setHidden(group, false);
@@ -2497,15 +2517,28 @@ meridianReorder.init({ onSaved: refresh });
 refresh();
 if (!restorePendingAdd()) resetAddForm('');
 // A poll re-renders every card, so it must not land while one is being
-// operated on: mid-drag it replaces the cards being dragged, mid-login or
-// mid-add it wipes the panel the code is being pasted into, and mid-copy it
-// takes the selected text away with the nodes that carried it. Each panel
-// keeps its own state, so each needs its own term - resetAddForm nulls
-// activeAdd, which is the addId the paste is about to be sent with.
-setInterval(function () {
-  if (!meridianReorder.dragging() && !activeLogin && !activeAdd && !activeChatGptRelogin
-    && !meridianSelection.holdsRedraw()) refresh();
-}, 10000);
+// operated on: mid-drag it replaces the cards being dragged, and mid-login or
+// mid-add it wipes the panel the code is being pasted into. Each panel keeps
+// its own state, so each needs its own term - resetAddForm nulls activeAdd,
+// which is the addId the paste is about to be sent with. A hidden tab skips
+// polls and catches up when it is shown again.
+function pollRefresh() {
+  if (document.visibilityState !== 'visible' || meridianReorder.dragging()
+    || activeLogin || activeAdd || activeChatGptRelogin) return;
+  refresh();
+}
+// The 1.5s poll while a card updates: a hidden tab keeps the timer, not the
+// request, so the update resumes within 1.5s of the tab being shown again.
+function pollUpdate() {
+  if (document.visibilityState !== 'visible') {
+    updatePollTimer = setTimeout(pollUpdate, 1500);
+    return;
+  }
+  updatePollTimer = null;
+  refresh();
+}
+setInterval(pollRefresh, 10000);
+document.addEventListener('visibilitychange', pollRefresh);
 ` + profileBarJs + `
 </script>
 </body>

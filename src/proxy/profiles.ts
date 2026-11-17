@@ -350,6 +350,27 @@ export function resolveProfile(
   return buildResolvedProfile(profile)
 }
 
+export function authKeepaliveTargets(
+  configProfiles: ProfileConfig[] | undefined,
+  defaultProfile: string | undefined,
+): Array<{ profileId?: string; envOverrides?: Record<string, string> }> {
+  const effective = getEffectiveProfiles(configProfiles)
+  if (effective.length === 0) return [{}]
+  return effective
+    .map(profile => resolveProfile(configProfiles, defaultProfile, profile.id))
+    .filter(resolved => Object.keys(resolved.env).length > 0)
+    .map(resolved => ({ profileId: resolved.id, envOverrides: resolved.env }))
+}
+
+export function usesDefaultAuthContext(
+  configProfiles: ProfileConfig[] | undefined,
+  defaultProfile: string | undefined,
+): boolean {
+  const effective = getEffectiveProfiles(configProfiles)
+  if (effective.length === 0) return true
+  return effective.some(profile => Object.keys(resolveProfile(configProfiles, defaultProfile, profile.id).env).length === 0)
+}
+
 /**
  * Look a profile up by id, then by alias. Real profiles ALWAYS win: an alias
  * is only a redirect left behind by a rename, and a stale one must never
@@ -372,7 +393,8 @@ export function findProfileByIdOrAlias(
  * spending an account the client never asked for. `isOtherPool` names ids
  * another pool on this instance serves (ChatGPT seats); those keep their
  * existing handling. An instance with no profiles has nothing to pin and
- * ignores the header as before.
+ * ignores the header as before, and `default` keeps resolving as it always has
+ * for clients that send it unconditionally.
  */
 export function unknownPinnedProfile(
   requested: string | undefined,
@@ -380,7 +402,7 @@ export function unknownPinnedProfile(
   isOtherPool: (id: string) => boolean = () => false,
 ): string | undefined {
   const id = requested?.trim()
-  if (!id || profiles.length === 0) return undefined
+  if (!id || profiles.length === 0 || id === DEFAULT_PROFILE_ID) return undefined
   if (findProfileByIdOrAlias(profiles, id) || isOtherPool(id)) return undefined
   return id
 }

@@ -6,6 +6,7 @@ import { assistantMessage, withMockSdkSessionId } from "./helpers"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
+import { installModelsMock } from "./modelsMock"
 
 type QueryCall = {
   readonly oauthToken?: string
@@ -54,13 +55,10 @@ installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
-// mock.module is process-global and runs during the load phase, so a partial
-// module here becomes every other file's models module for the whole run.
-// Spread the real one and override only what must not reach the host: the auth
-// probe and the `claude` executable lookup.
-const actualModels = await import("../proxy/models")
-mock.module("../proxy/models", () => ({
-  ...actualModels,
+// Through the shared models dispatcher: a mock.module of ../proxy/models here
+// would replace it for every later file in the run. The auth probe must not
+// reach the host.
+installModelsMock(() => ({
   getClaudeAuthStatusAsync: async () => ({ loggedIn: true, subscriptionType: "max" }),
 }))
 
@@ -314,9 +312,9 @@ describe("profile mutation reconciliation", () => {
       setSetting("routingExcludedProfiles", ["personal"])
 
       // When
-      const response = await app.fetch(new Request("http://localhost/profiles/remove", {
+      const response = await app.fetch(new Request("http://localhost/profiles/claude/remove", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", origin: "http://localhost" },
         body: JSON.stringify({ profile: "work" }),
       }))
 
@@ -442,9 +440,10 @@ describe("work routing exclusions", () => {
     // When
     const response = await app.fetch(anthropicRequest())
 
-    // Then
-    expect(response.status).toBe(503)
-    expect(await responseErrorType(response)).toBe("no_eligible_profiles")
+    // Then: the managed list took the last account, so it is a capacity wait.
+    expect(response.status).toBe(429)
+    const body = await response.json() as { error?: { code?: string } }
+    expect(body.error?.code).toBe("no_routable_account")
     expect(queryCalls).toHaveLength(0)
   })
 
