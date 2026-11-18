@@ -417,6 +417,56 @@ describe("work routing exclusions", () => {
     expect(queryCalls).toHaveLength(0)
   })
 
+  it("serves a pin to a profile only the managed list excludes on that profile", async () => {
+    // Given: the supervisor's list takes both accounts out of unpinned work
+    setSetting("routingManagedExcludedProfiles", ["work", "personal"])
+    const app = createTestApp()
+
+    // When
+    const response = await app.fetch(anthropicRequest("/v1/messages", "work"))
+
+    // Then: an explicit pin is the user choosing the account
+    expect(response.status).toBe(200)
+    expect(queryCalls.map(call => call.oauthToken)).toEqual(["token-work"])
+  })
+
+  it("serves a managed-excluded pin through OpenAI compatibility", async () => {
+    setSetting("routingManagedExcludedProfiles", ["work"])
+    const app = createTestApp()
+
+    const response = await app.fetch(new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-meridian-profile": "work" },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "work" }] }),
+    }))
+
+    expect(response.status).toBe(200)
+    expect(queryCalls.map(call => call.oauthToken)).toEqual(["token-work"])
+  })
+
+  it("still refuses a pin the user's own list excludes when the managed list names it too", async () => {
+    setSetting("routingExcludedProfiles", ["work"])
+    setSetting("routingManagedExcludedProfiles", ["work"])
+    const app = createTestApp()
+
+    const response = await app.fetch(anthropicRequest("/v1/messages", "work"))
+
+    expect(response.status).toBe(409)
+    expect(await responseErrorType(response)).toBe("profile_excluded")
+    expect(queryCalls).toHaveLength(0)
+  })
+
+  it("keeps unpinned work off a managed-excluded profile", async () => {
+    setActiveProfile("work")
+    setSetting("routingManagedExcludedProfiles", ["work"])
+    const app = createTestApp()
+
+    const response = await app.fetch(anthropicRequest())
+
+    expect(response.status).toBe(200)
+    expect(queryCalls.map(call => call.oauthToken)).toEqual(["token-personal"])
+  })
+
   it("returns 503 without provider traffic when no automatic target is eligible", async () => {
     // Given
     setSetting("routingExcludedProfiles", ["work", "personal"])

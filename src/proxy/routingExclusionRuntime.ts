@@ -25,15 +25,19 @@ export function evaluateRoutingProfileAccess(input: {
   readonly defaultProfile?: string
   readonly purpose: RoutingPurpose
   readonly explicitProfileId?: string
+  /** The user's own exclusions: refused even when pinned. */
   readonly excludedProfileIds: readonly string[]
+  /** The supervisor's exclusions: out of unpinned work, served when pinned. */
+  readonly managedExcludedProfileIds?: readonly string[]
   readonly heldProfileIds?: readonly string[]
 }): RoutingProfileAccess {
   const heldProfileIds = canonicalRoutingExcludedProfileIds(input.profiles, input.heldProfileIds ?? [])
+  const managedExcludedProfileIds = canonicalRoutingExcludedProfileIds(input.profiles, input.managedExcludedProfileIds ?? [])
   // What unpinned routing (the priority pool) must pass by: the excluded
-  // profiles and the held ones alike.
+  // profiles, managed or not, and the held ones alike.
   const excludedProfileIds = canonicalRoutingExcludedProfileIds(
     input.profiles,
-    [...input.excludedProfileIds, ...heldProfileIds],
+    [...input.excludedProfileIds, ...managedExcludedProfileIds, ...heldProfileIds],
   )
   const explicitProfileId = input.explicitProfileId
     ? canonicalProfileId(input.profiles, input.explicitProfileId)
@@ -46,6 +50,7 @@ export function evaluateRoutingProfileAccess(input: {
     purpose: input.purpose,
     availableProfileIds,
     excludedProfileIds: canonicalRoutingExcludedProfileIds(input.profiles, input.excludedProfileIds),
+    managedExcludedProfileIds,
     heldProfileIds,
     ...(explicitProfileId ? { explicitProfileId } : {}),
   })

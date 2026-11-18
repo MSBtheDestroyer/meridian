@@ -724,9 +724,16 @@ describe("ChatGPT seats on the profile surface", () => {
     saveSettings({ routingManagedExcludedProfiles: ["seat0-pace-0"] })
     expect((await post(app, "/profiles/active", { profile: "seat0-pace-0" })).status).toBe(409)
     expect((await post(app, "/profiles/active", { profile: "nobody" })).status).toBe(400)
+    // The supervisor's list keeps the seat out of unpinned work only; a pin is the user choosing it.
     const pinned = await app.fetch(responses(LUNA, { "x-meridian-profile": "seat0-pace-0" }))
-    expect(pinned.status).toBe(409)
-    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-1"])
+    expect(pinned.status).toBe(200)
+    await pinned.text()
+    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-1", "workspace-0"])
+
+    saveSettings({ routingManagedExcludedProfiles: [], routingExcludedProfiles: ["seat0-pace-0"] })
+    const refused = await app.fetch(responses(LUNA, { "x-meridian-profile": "seat0-pace-0" }))
+    expect(refused.status).toBe(409)
+    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-1", "workspace-0"])
 
     // A held seat is refused as held, not as excluded, so a supervisor can tell them apart.
     saveSettings({ routingManagedExcludedProfiles: [], routingHeldProfiles: ["seat1-pace-1"] })

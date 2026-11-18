@@ -1258,6 +1258,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     configuredRoutingExcludedProfileIds(),
   )
   const routingExcludedProfileIds = () => routingExcludedProfileIdsFor(getEffectiveProfiles(finalConfig.profiles))
+  // The two lists split again where a pin is judged: the user's own refuses
+  // a pin, the supervisor's only keeps unpinned work away.
+  const userRoutingExcludedProfileIds = () => parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles"))
+  const managedRoutingExcludedProfileIds = () => parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles"))
   // Held profiles (`routingHeldProfiles`, supervisor-owned): out of every
   // unpinned pick and every warm, yet served when a request pins one - the
   // account a measured run spends alone.
@@ -3236,7 +3240,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           defaultProfile: finalConfig.defaultProfile,
           purpose: warmProfileId ? "warm" : "work",
           explicitProfileId: requestedProfileId,
-          excludedProfileIds: routingExcludedProfileIds(),
+          excludedProfileIds: userRoutingExcludedProfileIds(),
+          managedExcludedProfileIds: managedRoutingExcludedProfileIds(),
           heldProfileIds: routingHeldProfileIds(),
         })
         switch (routingAccess.access.kind) {
@@ -10220,6 +10225,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     aliases: () => getSetting("chatGptProfileAliases"),
     activeSeat: () => getSetting("chatGptActiveSeat"),
     excluded: configuredRoutingExcludedProfileIds,
+    pinExcluded: userRoutingExcludedProfileIds,
     held: configuredRoutingHeldProfileIds,
     order: priorityProfileOrderSetting,
     spent: (profileId) => spentProfiles.get(profileId),
@@ -13397,7 +13403,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       defaultProfile: finalConfig.defaultProfile,
       purpose: "work",
       explicitProfileId: requestedProfileId,
-      excludedProfileIds: routingExcludedProfileIds(),
+      excludedProfileIds: userRoutingExcludedProfileIds(),
+      managedExcludedProfileIds: managedRoutingExcludedProfileIds(),
       heldProfileIds: routingHeldProfileIds(),
     })
     switch (routingAccess.access.kind) {

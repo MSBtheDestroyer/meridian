@@ -317,6 +317,8 @@ A profile can be held out of rotation, for example to measure what one job spend
 
 Unlike `routingExcludedProfiles`, which refuses pinned work and still allows warms, a hold refuses warms and still allows pinned work.
 
+`routingManagedExcludedProfiles` (a supervisor's list, written through the same endpoint) keeps a profile out of unpinned work and off the active pointer, but a request pinned to it with `x-meridian-profile` is served there. Only the user's own `routingExcludedProfiles` refuses a pin (`409` with `profile_excluded`).
+
 ### Profile commands
 
 | Command | Description |

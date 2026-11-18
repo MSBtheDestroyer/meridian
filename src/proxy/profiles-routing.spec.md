@@ -138,6 +138,16 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   errors. A pool only
   billing refusals ran out keeps the last-tried account's error and status:
   waiting will not reopen it, so it is not a rate limit.
+- **A pin passes the supervisor's exclusions, never the user's.** Work pinned
+  with `x-meridian-profile` to a profile that only
+  `routingManagedExcludedProfiles` names is served on that profile, Claude
+  and ChatGPT alike: the managed list is a supervisor's policy for work
+  nobody assigned, and a pin is the user choosing the account. The user's own
+  `routingExcludedProfiles` still answers 409 `profile_excluded` for a pin,
+  whether or not the managed list names it too. Unpinned work, the active
+  pointer (`POST /profiles/active`) and warms keep treating both lists alike.
+  `GET /settings/api/routing` lists `pin-bypasses-managed-exclusion` in
+  `capabilities`.
 - **One incident per outage.** The first `pool_exhausted` event on
   `/profiles/events` since a Claude account last served work opens an
   incident `inc_<epoch ms>_<seq>` (that event's own `at` and `seq`); every

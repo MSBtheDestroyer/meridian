@@ -86,6 +86,11 @@ export interface ChatGptProfileSurfaceDeps {
   /** Seats kept out of work: profile ids, seat ids, or Claude ids (ignored here). None when absent. */
   excluded?: () => readonly string[]
   /**
+   * The exclusions a pinned turn cannot pass: the user's own list, without
+   * the supervisor's managed one. Defaults to `excluded`.
+   */
+  pinExcluded?: () => readonly string[]
+  /**
    * Seats held out of rotation: no unpinned work and no warm reaches them,
    * but a turn pinned to one is served there. None when absent.
    */
@@ -178,9 +183,9 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
     return seats
   }
 
-  /** Seats no work may be pinned to: logged out, or excluded from work. */
-  const refusedSeats = (list: readonly ChatGptProfile[]): Set<string> => {
-    const seats = seatsNamed(list, deps.excluded?.() ?? [])
+  /** Seats out of work: logged out, or excluded from work by either list. */
+  const refusedSeats = (list: readonly ChatGptProfile[], names = deps.excluded?.() ?? []): Set<string> => {
+    const seats = seatsNamed(list, names)
     for (const profile of list) if (loginFor(profile).state === "needs_login") seats.add(profile.seat)
     return seats
   }
@@ -277,7 +282,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
         return { kind: "unknown" as const, id: named }
       }
       if (pinned) {
-        if (purpose === "work" && refusedSeats(list).has(pinned.seat)) {
+        if (purpose === "work" && refusedSeats(list, (deps.pinExcluded ?? deps.excluded)?.() ?? []).has(pinned.seat)) {
           return { kind: "refuse" as const, profile: pinned, reason: "excluded" as const }
         }
         if (purpose === "warm" && heldSeats(list).has(pinned.seat)) {
