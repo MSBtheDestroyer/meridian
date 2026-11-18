@@ -10675,7 +10675,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       usageReserves: usageReserves(),
       // What a supervisor may rely on this build doing; read rather than
       // guessed from a version, which forks share.
-      capabilities: ["managed-exclusion-no-routable"],
+      capabilities: ["managed-exclusion-no-routable", "profile-model-list", "pin-bypasses-managed-exclusion"],
       profiles: profileIds,
       saved: {
         routing: getSetting("routing") ?? null,

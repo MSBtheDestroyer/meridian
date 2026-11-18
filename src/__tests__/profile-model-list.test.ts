@@ -147,6 +147,13 @@ describe("GET /v1/models pinned to a profile", () => {
     expect(upstreamCalls).toHaveLength(0)
   })
 
+  it("advertises the per-profile list and the managed-exclusion pin on GET /settings/api/routing", async () => {
+    const response = await app().fetch(new Request("http://localhost/settings/api/routing"))
+    const body = await response.json() as { capabilities?: string[] }
+
+    expect(body.capabilities).toEqual(expect.arrayContaining(["managed-exclusion-no-routable", "profile-model-list", "pin-bypasses-managed-exclusion"]))
+  })
+
   it("never logs or returns the credential", async () => {
     const team = await models(app(), "team")
 
