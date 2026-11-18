@@ -105,6 +105,7 @@ import { createPassthroughMcpServer, sharedPassthroughMcpServer, sharedToolList,
 import { describeLocalBootIdentity } from "./session/processIncarnation"
 import { openCodePrimaryAgentContextHash, requiresOpenCodeAgentReplay } from "./adapters/opencodeAgentContext"
 import { openCodeInstructionSections } from "./adapters/opencodeInstructionSections"
+import { PendingSystemPromptResets, requestsSystemPromptReset, SYSTEM_PROMPT_RESET_HEADER } from "./systemPromptReset"
 import { instructionSectionState, planInstructionSections } from "./session/instructionSections"
 import { getOpenCodeSourceFeatureOverrides } from "./adapters/opencodeSourceFeatures"
 import { detectServerTools, serverToolErrorMessage } from "./tools"
@@ -886,6 +887,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     authOwner.run(() => getClaudeAuthStatusAsync(profileId, envOverrides))
   const finalConfig = resolveBackendConfig(config)
   const claudeProviderFacts = new ClaudeProviderFacts()
+  const pendingSystemPromptResets = new PendingSystemPromptResets()
   const antigravity = finalConfig.backend === "combined" ? createAntigravityServer({ ...finalConfig, profiles: undefined, defaultProfile: undefined }) : undefined
   // Decided once per instance. Absent means GPT model names keep meaning
   // Claude, exactly as before ChatGPT support existed.
@@ -4151,7 +4153,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // can differ per attempt), but "did this session advance" is only
         // meaningful within one profile's cache scope — so commits and the
         // conflict check below both carry profileSessionId.
+        // An armed reset holds until a turn of this conversation publishes:
+        // that turn ran in a fresh SDK session (see executionReplay below).
+        const systemPromptResetArmed = Boolean(agentSessionId && pendingSystemPromptResets.isArmed(agentSessionId))
         const commitSessionTurn = (committedSdkSessionId: string | undefined) => {
+          if (systemPromptResetArmed && agentSessionId) pendingSystemPromptResets.settle(agentSessionId)
           if (profileSessionId) {
             requestMeta.sessionTurnLease?.markCommitted(profileSessionId)
             // Tool inheritance belongs to the successfully published branch.
@@ -4706,12 +4712,17 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           cachedSession.resumeContextHash,
           resumeContextHash,
         ))
+        // Claude Code resends the system prompt a transcript recorded; only a
+        // fresh session renders the client's current one.
+        const systemPromptReset = Boolean(cachedSession) && (systemPromptResetArmed
+          || requestsSystemPromptReset(c.req.header(SYSTEM_PROMPT_RESET_HEADER)))
         const executionReplay = executionHistory.changed || Boolean(cachedSession && !cachedSession.lineageHash)
-          || agentContextReplay
+          || agentContextReplay || systemPromptReset
         const executionReplayToolSessionId = executionReplay && isResume ? resumeSessionId : undefined
         const executionReplayReason = !executionReplay ? undefined
           : executionHistory.changed ? "transformed_history"
-            : agentContextReplay ? "changed_or_unproved_primary_agent" : "unproved_sdk_prefix"
+            : agentContextReplay ? "changed_or_unproved_primary_agent"
+              : systemPromptReset ? "system_prompt_reset" : "unproved_sdk_prefix"
         if (executionReplay) {
           claudeLog("session.execution_replay", { reason: executionReplayReason })
           isResume = false
@@ -10802,6 +10813,21 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       cancelled: { sessions: cancelled.keys.length, requests: cancelled.requestIds.length },
       requestIds: cancelled.requestIds,
     })
+  })
+
+  /**
+   * Arm a system prompt reset for a session key: its next turn that publishes
+   * replays the client history into a fresh SDK session, which renders the
+   * client's current system prompt. Process-local; gated by `/v1/*` auth.
+   */
+  app.post("/v1/sessions/:key/system-prompt-reset", (c) => {
+    const key = c.req.param("key")
+    if (!key) {
+      return c.json({ type: "error", error: { type: "invalid_request_error", message: "Session key is required" } }, 400)
+    }
+    pendingSystemPromptResets.arm(key)
+    claudeLog("session.system_prompt_reset_armed", { session: truncateSessionKey(key) })
+    return c.json({ session: key, pending: true })
   })
 
   // Telemetry dashboard and API
