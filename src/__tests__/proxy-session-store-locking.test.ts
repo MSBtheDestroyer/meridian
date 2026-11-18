@@ -90,14 +90,13 @@ describe("Shared session store locking", () => {
   it("gives exactly one of several processes the compare-and-swap on one generation", async () => {
     const initial = await storeSharedSession("contended", "claude-initial")
     expect(initial).not.toBe(false)
-    const go = join(tmpDir, "go")
     const children = Array.from({ length: 4 }, (_, worker) => Bun.spawn({
       cmd: [process.execPath, "-e", `
-        import { existsSync } from "node:fs"
         import { lookupSharedSessionResult, storeSharedSession } from ${JSON.stringify(modulePath)}
         const armed = lookupSharedSessionResult("contended")
         if (armed.status !== "found" || armed.generation !== ${JSON.stringify(initial)}) process.exit(2)
-        while (!existsSync(${JSON.stringify(go)})) await Bun.sleep(5)
+        console.log("armed")
+        await Bun.stdin.stream().getReader().read()
         const won = await storeSharedSession(
           "contended", "claude-worker-${worker}", undefined, undefined, undefined, undefined, undefined,
           undefined, undefined, undefined, undefined, undefined, armed.generation,
@@ -105,22 +104,33 @@ describe("Shared session store locking", () => {
         console.log(won === false ? "lost" : "won")
       `],
       env: { ...process.env, MERIDIAN_SESSION_DIR: tmpDir },
+      stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
     }))
-    await Bun.sleep(200)
-    writeFileSync(go, "")
+    const outputs = children.map((child) => ({ reader: child.stdout.getReader(), decoder: new TextDecoder(), text: "" }))
+    async function readUntil(output: (typeof outputs)[number], enough: (text: string) => boolean): Promise<void> {
+      while (!enough(output.text)) {
+        const { value, done } = await output.reader.read()
+        if (done) return
+        output.text += output.decoder.decode(value, { stream: true })
+      }
+    }
+    // Every child holds the initial generation before any of them may write,
+    // however long a loaded machine takes to start them.
+    await Promise.all(outputs.map((output) => readUntil(output, (text) => text.includes("armed\n"))))
+    for (const child of children) child.stdin.end()
 
     const outcomes: string[] = []
     for (const [worker, child] of children.entries()) {
-      const [exitCode, stdout, stderr] = await Promise.all([
+      const [exitCode, , stderr] = await Promise.all([
         child.exited,
-        new Response(child.stdout).text(),
+        readUntil(outputs[worker]!, () => false),
         new Response(child.stderr).text(),
       ])
       expect(stderr).toBe("")
       expect(exitCode).toBe(0)
-      outcomes.push(`${worker}:${stdout.trim()}`)
+      outcomes.push(`${worker}:${outputs[worker]!.text.trim().split("\n").at(-1)}`)
     }
     const winners = outcomes.filter((outcome) => outcome.endsWith(":won"))
     expect(winners).toHaveLength(1)
