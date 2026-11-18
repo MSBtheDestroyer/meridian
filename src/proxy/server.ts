@@ -104,6 +104,8 @@ import { parseToolInputObject } from "./toolInputJson"
 import { createPassthroughMcpServer, sharedPassthroughMcpServer, sharedToolList, createPassthroughReplayToolNameRenderer, resolveClientToolName, normalizeToolInput, hasRepairableToolInput, computeToolSetKey, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, passthroughMcpPrefix, resolveAutoDeferDecision, clientOwnsToolSearch, sdkOwnsPrefixedToolSearch, referencedToolNames, clientSearchRegistrationTools } from "./passthroughTools"
 import { describeLocalBootIdentity } from "./session/processIncarnation"
 import { openCodePrimaryAgentContextHash, requiresOpenCodeAgentReplay } from "./adapters/opencodeAgentContext"
+import { openCodeInstructionSections } from "./adapters/opencodeInstructionSections"
+import { instructionSectionState, planInstructionSections } from "./session/instructionSections"
 import { getOpenCodeSourceFeatureOverrides } from "./adapters/opencodeSourceFeatures"
 import { detectServerTools, serverToolErrorMessage } from "./tools"
 import { isSdkToolSearchCall, clientAbortDisposition, coalesceCompleteToolResultContinuation, createEarlyStopTracker, isClientForwardedToolUse, noteAssistantMessage, noteUserContent, settledToolCallAssistantUuid, settlesCheckpointThenContinues, shouldEarlyStop, trackerCoversStreamedCalls } from "./passthroughEarlyStop"
@@ -4907,6 +4909,26 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // Budget only the replay payload, never the lineage or SDK UUID mapping.
       const replaySource = messagesToConvert
       const freshReplay = !isResume && !resumeSessionId
+      // NOTE: OpenCode-specific section extraction (adapters/opencodeInstructionSections.ts).
+      // A resumed transcript keeps the system prompt its first turn recorded,
+      // so compare the client's instruction files against what it has seen.
+      const instructionSections = adapterBase === "opencode" && sdkFeatures.clientSystemPrompt !== false
+        ? openCodeInstructionSections(extractSystemText(body.system))
+        : undefined
+      const instructionPlan = instructionSections
+        ? planInstructionSections(cachedSession?.instructionSections, instructionSections, !freshReplay)
+        : undefined
+      // A fallback that replays into a fresh session renders the current prompt.
+      let instructionSectionPublication = instructionPlan?.state
+      const publishFreshInstructionSections = () => {
+        if (instructionSections) instructionSectionPublication = instructionSectionState(instructionSections)
+      }
+      if (instructionPlan && (instructionPlan.change.changed.length > 0 || instructionPlan.change.removed > 0)) {
+        claudeLog("session.instruction_sections_changed", {
+          changed: instructionPlan.change.changed.length,
+          removed: instructionPlan.change.removed,
+        })
+      }
       // Client usage describes its resumed context, not the fresh transcript;
       // derive replay capacity from the actual SDK model's window instead.
       const modelReplayBudget = () => replayBudgetFor(model, model === "sonnet" ? resolvedSonnetModel : resolvedHaikuModel())
@@ -5950,6 +5972,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     ))) throw new Error("Session mapping changed before resume fallback eviction")
                     mappingExpectedGeneration = refreshGenerationAfterEviction()
                     await replaceWithFreshTarget("non_stream_resume_replay")
+                    publishFreshInstructionSections()
                     currentSessionId = managedForkTarget?.sessionId
                     sdkUuidMap.length = 0
                     for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
@@ -6011,6 +6034,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     ))) throw new Error("Session mapping changed before model fallback eviction")
                     mappingExpectedGeneration = refreshGenerationAfterEviction()
                     await replaceWithFreshTarget("non_stream_model_fallback")
+                    publishFreshInstructionSections()
                     currentSessionId = managedForkTarget?.sessionId
                     sdkUuidMap.length = 0
                     for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
@@ -6707,6 +6731,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                           options.priorityPublication,
                           !executionHistory.changed,
                           resumeContextHash,
+                          instructionSectionPublication,
                           assertDurableWritesAllowed,
                         ), stored => {
                           // JSON cancellation shares this request queue; SQL flags wait for COMMIT below.
@@ -7387,6 +7412,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                       ))) throw new Error("Session mapping changed before resume fallback eviction")
                       mappingExpectedGeneration = refreshGenerationAfterEviction()
                       await replaceWithFreshTarget("stream_resume_replay")
+                      publishFreshInstructionSections()
                       currentSessionId = managedForkTarget?.sessionId
                       sdkUuidMap.length = 0
                       for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
@@ -7444,6 +7470,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                       ))) throw new Error("Session mapping changed before model fallback eviction")
                       mappingExpectedGeneration = refreshGenerationAfterEviction()
                       await replaceWithFreshTarget("stream_model_fallback")
+                      publishFreshInstructionSections()
                       currentSessionId = managedForkTarget?.sessionId
                       sdkUuidMap.length = 0
                       for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
@@ -8190,6 +8217,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                         options.priorityPublication,
                         !executionHistory.changed,
                         resumeContextHash,
+                        instructionSectionPublication,
                         assertDurableWritesAllowed,
                       ), stored => {
                         // JSON cancellation shares this request queue; SQL flags wait for COMMIT below.
@@ -8542,6 +8570,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                         options.priorityPublication,
                         !executionHistory.changed,
                         resumeContextHash,
+                        instructionSectionPublication,
                         assertDurableWritesAllowed,
                       ), stored => {
                         // JSON cancellation shares this request queue; SQL flags wait for COMMIT below.
@@ -9273,6 +9302,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                         options.priorityPublication,
                         !executionHistory.changed,
                         resumeContextHash,
+                        instructionSectionPublication,
                         assertDurableWritesAllowed,
                       ), stored => {
                         // JSON cancellation shares this request queue; SQL flags wait for COMMIT below.

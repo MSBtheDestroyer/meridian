@@ -111,6 +111,31 @@ describe("durable raw proof and execution reuse proof", () => {
     } finally { errors.mockRestore() }
   })
 
+  it("persists instruction section digests and drops them when a new SDK session replaces the mapping", async () => {
+    const sections = { seen: { ["c".repeat(64)]: "d".repeat(64) } }
+    await storeSession("sections", messages, "sdk-sections", undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, true, undefined, sections)
+    await releaseStoreDatabase(directory)
+    expect(readCommittedSession(directory, "sections")?.instructionSections).toEqual(sections)
+    const reloaded = lookupSession("sections", continuation)
+    if (reloaded.type === "diverged") throw new Error("Expected stored mapping")
+    expect(reloaded.session.instructionSections).toEqual(sections)
+    expect(await storeSession("sections", continuation, "sdk-other")).not.toBe(false)
+    expect(lookupSharedSession("sections")?.instructionSections).toBeUndefined()
+  })
+
+  it("fails closed on malformed persisted instruction section digests", async () => {
+    await storeSession("malformed-sections", messages, "sdk-malformed-sections")
+    const entry = readCommittedSession(directory, "malformed-sections")
+    if (!entry) throw new Error("fixture mapping missing")
+    commitRawSession(directory, "malformed-sections", { ...entry, instructionSections: { seen: { "/work/AGENTS.md": "x" } } })
+    await releaseStoreDatabase(directory)
+    const errors = spyOn(console, "error").mockImplementation(() => {})
+    try {
+      expect(lookupSharedSessionResult("malformed-sections").status).toBe("error")
+    } finally { errors.mockRestore() }
+  })
+
   it("fails closed on malformed persisted adapter context proof", async () => {
     await storeSession("malformed-system", messages, "sdk-malformed-system")
     const entry = readCommittedSession(directory, "malformed-system")

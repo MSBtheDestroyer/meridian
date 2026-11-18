@@ -17,6 +17,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { basename, isAbsolute, join } from "node:path"
 import type { TokenUsage } from "./session/lineage"
+import { isInstructionSectionState, type InstructionSectionState } from "./session/instructionSections"
 import {
   fileDigest,
   getStoreLockWaitMs,
@@ -50,6 +51,8 @@ export interface StoredSession {
   clientLineageHash?: string
   /** Adapter-owned stable context digest, never prompt text. */
   resumeContextHash?: string
+  /** Digests of the instruction sections the transcript's model has seen; never prompt text. */
+  instructionSections?: InstructionSectionState
   /** Per-message content hashes for precise diff-based compaction detection */
   messageHashes?: string[]
   /** Per-message hashes of individual content blocks for append-only tool results */
@@ -331,6 +334,9 @@ function validateStoredSession(key: string, value: unknown): asserts value is St
   if (entry.resumeContextHash !== undefined && (
     typeof entry.resumeContextHash !== "string" || !/^[a-f0-9]{64}$/.test(entry.resumeContextHash)
   )) throw new Error(`session store entry ${JSON.stringify(key)} has invalid resumeContextHash`)
+  if (entry.instructionSections !== undefined && !isInstructionSectionState(entry.instructionSections)) {
+    throw new Error(`session store entry ${JSON.stringify(key)} has invalid instructionSections`)
+  }
   const stringArrays = ["messageHashes", "passthroughToolCallIds"] as const
   for (const field of stringArrays) {
     const item = entry[field]
@@ -1329,6 +1335,7 @@ export async function storeSharedSession(
   expectedGeneration?: StoredSessionGeneration | null,
   clientLineageHash?: string | null,
   resumeContextHash?: string | null,
+  instructionSections?: InstructionSectionState | null,
   beforePublish?: () => void,
 ): Promise<StoredSessionGeneration | false> {
   // Capture caller-owned history before the queue or disk yields. Validation
@@ -1341,6 +1348,7 @@ export async function storeSharedSession(
   passthroughToolCallIds = passthroughToolCallIds?.slice() ?? passthroughToolCallIds
   currentTranscript = currentTranscript === undefined ? undefined : { ...currentTranscript }
   sourceTranscript = sourceTranscript === undefined ? undefined : { ...sourceTranscript }
+  instructionSections = instructionSections ? structuredClone(instructionSections) : instructionSections
   if (currentTranscript !== undefined) {
     validateTranscriptLocator(currentTranscript, claudeSessionId)
   }
@@ -1397,6 +1405,9 @@ export async function storeSharedSession(
       resumeContextHash: resumeContextHash === undefined
         ? sessionIdChanged ? undefined : existing?.resumeContextHash
         : resumeContextHash ?? undefined,
+      instructionSections: instructionSections === undefined
+        ? sessionIdChanged ? undefined : existing?.instructionSections
+        : instructionSections ?? undefined,
       messageHashes: messageHashes ?? existing?.messageHashes,
       messageBlockHashes: messageBlockHashes ?? existing?.messageBlockHashes,
       sdkMessageUuids: sdkMessageUuids ?? existing?.sdkMessageUuids,
@@ -1609,6 +1620,7 @@ export interface SharedSessionAndPriorityAssignmentOptions {
   lineageHash: string
   clientLineageHash?: string
   resumeContextHash?: string
+  instructionSections?: InstructionSectionState
   messageHashes: string[]
   sdkMessageUuids?: Array<string | null>
   contextUsage?: TokenUsage
@@ -1734,6 +1746,7 @@ export async function storeSharedSessionAndPriorityAssignment(
       lineageHash: options.lineageHash,
       clientLineageHash: options.clientLineageHash,
       resumeContextHash: options.resumeContextHash,
+      instructionSections: options.instructionSections,
       messageHashes: options.messageHashes,
       messageBlockHashes: options.messageBlockHashes,
       sdkMessageUuids: options.sdkMessageUuids,
