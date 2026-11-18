@@ -136,6 +136,7 @@ export type NoRoutableReason =
   | "model_benched"
   | "excluded"
   | "held"
+  | "no_cvp"
   | "extra_usage_off"
   | "logged_out"
 

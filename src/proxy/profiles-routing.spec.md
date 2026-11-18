@@ -16,7 +16,8 @@ Own the operator's **Claude accounts** and decide which one serves a request:
   `tokenRefresh.ts`, `oauth*.ts`,
   `planAllowance.ts`, `credentialsMode.ts`), the account each profile is
   signed in to (`organizationName.ts`), the models that account may use
-  (`accountModels.ts`), profiles signed in to one account
+  (`accountModels.ts`), the models it holds Cyber Verification Program
+  access on (`cvpAccess.ts`), profiles signed in to one account
   (`duplicateProfiles.ts`) and the post-sign-in re-read state
   (`profileFactsRefresh.ts`);
 - routing modes (`routing.ts`): `active` (default), `sticky` (rendezvous
@@ -120,7 +121,7 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   stream, the same `error` object in the SSE error frame after it. The
   incident is the message's last token because client SDKs keep only `type`
   and `message` of a stream error. `reason` is `excluded`, `held`,
-  `reserve_held`, `weekly_held`, `spent`, `model_benched` or
+  `no_cvp`, `reserve_held`, `weekly_held`, `spent`, `model_benched` or
   `extra_usage_off`, first match in that order; `logged_out` is reserved and
   no skip path produces it, since an auth failure is not a failover error. A
   profile with none of them (outside a retained route's single candidate) is
@@ -168,6 +169,43 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   exclusion. Without the header, or with one naming a ChatGPT seat, the
   answer is unchanged. The credential is never logged or returned.
   `GET /settings/api/routing` lists `profile-model-list` in `capabilities`.
+- **CVP access is learned, never fetched.** Anthropic tells which models an
+  account holds Cyber Verification Program access on only in claude.ai's
+  model selector (`GET /api/organizations/{org}/model_selector/{surface}` and
+  `/api/bootstrap/{org}/app_start`, `models[].badge.message` "CVP: Defense
+  Access", sent only with `anthropic-client-platform: web_claude_ai` or
+  `desktop_app`). The same paths on `api.anthropic.com` with an OAuth
+  credential answer the same lists without badges, and the program endpoints
+  refuse OAuth tokens (verified 2026-11-18), so Meridian keeps a per-profile,
+  per-model map (`cvp-access.json` beside settings, replaced atomically) fed
+  by two sources. `POST /profiles/:id/cvp-access` takes one surface's
+  `models[]` from something holding that account's claude.ai session: a
+  badged model is `active` with the badge's tier (Defense `c`, Red Team `b`,
+  Specialized `a`), an unbadged one `inactive`, and it replaces that
+  profile's previous reading. A refusal's `stop_details.cyber_verification`
+  (`{type: "active", tier}` or `{type: "inactive", reason}`, subagent rows
+  included) is recorded for the model the refusal names. A claude.ai reading
+  under 24 hours old decides; past that the newer of the two does. Model ids
+  are compared lowercase without `[1m]` or a `-YYYYMMDD` snapshot date, and
+  never by family: Mythos holds access where Fable, its tier, does not. A
+  Meridian sign-in forgets the profile's map, since it may be another
+  account; a token refresh does not. `/profiles/list` lists each profile's
+  map as `cvpAccess`.
+- **`x-meridian-require: cvp` routes unpinned work to CVP access.** Under pool
+  routing the candidate order is cut to profiles whose map shows `active`
+  access on the requested model before any other rule runs; the active
+  profile heads it only when it qualifies, and a retained route that does not
+  is refused. Under `active` and `sticky`, a resolved profile without access
+  is replaced by the first in active+priority order that has it and is not
+  reserve-held. With none, the request is refused unsent with
+  `no_routable_account` and reason `no_cvp` (null `resets_at`: waiting will
+  not grant access). Pins, warms and priority hops are exempt; an unknown
+  requirement token is 400, so a newer client's requirement is never routed
+  as if met. `GET /v1/models` with the header lists only models with access:
+  a pinned account's own, or unpinned every reachable account's, each with
+  `cvp_profiles` in that order; every pinned entry the map knows carries
+  `cyber_verification`. `GET /settings/api/routing` lists `cvp-routing` in
+  `capabilities`.
 - **One incident per outage.** The first `pool_exhausted` event on
   `/profiles/events` since a Claude account last served work opens an
   incident `inc_<epoch ms>_<seq>` (that event's own `at` and `seq`); every
