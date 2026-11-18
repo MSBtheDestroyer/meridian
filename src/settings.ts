@@ -51,6 +51,19 @@ export interface MeridianSettings {
   routingExcludedProfiles?: string[]
   routingManagedExcludedProfiles?: string[]
   /**
+   * The order `x-meridian-require: cvp` work tries Claude profiles in, owned
+   * by a cybersec switcher apart from `profileOrder`; empty or unset falls
+   * back to the pool order. Unflagged work never reads it.
+   */
+  cvpProfileOrder?: string[]
+  /** The profile that leads `x-meridian-require: cvp` work when it holds access on the model. */
+  cvpActiveProfile?: string
+  /**
+   * The cybersec switcher's own managed exclusions: out of unpinned cvp work,
+   * which reads this list instead of `routingManagedExcludedProfiles`.
+   */
+  cvpManagedExcludedProfiles?: string[]
+  /**
    * Profiles held out of rotation by a supervisor, for a measured run: no
    * unpinned work, failover or warm reaches them, but a request pinned with
    * `x-meridian-profile` is served there. Written through

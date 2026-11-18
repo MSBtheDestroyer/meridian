@@ -129,16 +129,20 @@ export function planProfileRemove(
 export function profileRemovalSettings(
   removed: Pick<ProfileConfig, "id" | "aliases">,
   remaining: readonly ProfileConfig[],
-  settings: Pick<MeridianSettings, "activeProfile" | "profileOrder">,
-): Pick<MeridianSettings, "activeProfile" | "profileOrder"> {
+  settings: Pick<MeridianSettings, RemovalSettingKey>,
+): Pick<MeridianSettings, RemovalSettingKey> {
   const names = new Set([removed.id, ...(removed.aliases ?? [])])
-  const update: Pick<MeridianSettings, "activeProfile" | "profileOrder"> = {}
+  const update: Pick<MeridianSettings, RemovalSettingKey> = {}
   if (settings.activeProfile === removed.id) update.activeProfile = remaining[0]?.id
-  if (settings.profileOrder?.some(id => names.has(id))) {
-    update.profileOrder = settings.profileOrder.filter(id => !names.has(id))
+  for (const key of ["profileOrder", "cvpProfileOrder"] as const) {
+    const order = settings[key]
+    if (order?.some(id => names.has(id))) update[key] = order.filter(id => !names.has(id))
   }
+  if (settings.cvpActiveProfile !== undefined && names.has(settings.cvpActiveProfile)) update.cvpActiveProfile = undefined
   return update
 }
+
+type RemovalSettingKey = "activeProfile" | "profileOrder" | "cvpProfileOrder" | "cvpActiveProfile"
 
 export interface ApplyProfileRemoveOptions {
   /** Directory holding per-profile credential dirs. Defaults to the real one. */
@@ -199,6 +203,8 @@ function applyProfileRemoveLocked(id: string, options: ApplyProfileRemoveOptions
   const settings = profileRemovalSettings(plan.removed, plan.profiles, {
     activeProfile: getSetting("activeProfile"),
     profileOrder: getSetting("profileOrder"),
+    cvpProfileOrder: getSetting("cvpProfileOrder"),
+    cvpActiveProfile: getSetting("cvpActiveProfile"),
   })
   if (Object.keys(settings).length > 0) saveSettings(settings)
 

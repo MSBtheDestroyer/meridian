@@ -147,7 +147,7 @@ import { resolveReachabilityThresholds } from "./upstreamReachabilityConfig"
 import type { AnthropicSseEvent } from "./openai"
 import { translateOpenAiToAnthropic, translateAnthropicToOpenAi, buildModelList, createSseTranslator, translateAnthropicSseError } from "./openai"
 import { clearAccountModels, fetchAccountModels, toAccountModelList, type AccountModel } from "./accountModels"
-import { cvpAccessFor, cvpReadingBody, cvpAccessOn, cvpActive, cyberVerificationField, cyberVerificationOf, forgetCvpAccess, normalizeCvpModel, parseRoutingRequirements, recordCvpReading, recordCvpRefusal, ROUTING_REQUIRE_HEADER, type CyberVerificationField } from "./cvpAccess"
+import { cvpAccessFor, cvpReadingBody, cvpAccessOn, cvpActive, cyberVerificationField, cyberVerificationOf, forgetCvpAccess, normalizeCvpModel, parseRoutingRequirements, recordCvpReading, routingRequireOf, recordCvpRefusal, ROUTING_REQUIRE_HEADER, type CyberVerificationField } from "./cvpAccess"
 import { normalizeJcodeSessionId } from "./adapters/jcode"
 import { extractLettaConversationId, LETTA_CONVERSATION_HEADER } from "./adapters/letta"
 import { isClaudeCodeClient } from "./adapters/claudecode"
@@ -1264,6 +1264,14 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // a pin, the supervisor's only keeps unpinned work away.
   const userRoutingExcludedProfileIds = () => parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles"))
   const managedRoutingExcludedProfileIds = () => parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles"))
+  // `x-meridian-require: cvp` work answers to the cybersec switcher's managed
+  // list instead of the general one: the two switchers own separate lists, so
+  // an account rested from general work can still take cvp work.
+  const cvpManagedExcludedProfileIds = () => parseRoutingExcludedProfiles(getSetting("cvpManagedExcludedProfiles"))
+  const cvpExcludedProfileIdsFor = (profiles: readonly ProfileConfig[]) => canonicalRoutingExcludedProfileIds(
+    profiles,
+    mergeRoutingExcludedProfiles(userRoutingExcludedProfileIds(), cvpManagedExcludedProfileIds()),
+  )
   // Held profiles (`routingHeldProfiles`, supervisor-owned): out of every
   // unpinned pick and every warm, yet served when a request pins one - the
   // account a measured run spends alone.
@@ -1284,11 +1292,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
    * it use, which is a capacity wait; a pool the user's own list empties is a
    * configuration error.
    */
-  const someOutOnlyByManagedExclusion = (): boolean => {
+  const someOutOnlyByManagedExclusion = (managed: readonly string[] = managedRoutingExcludedProfileIds()): boolean => {
     const profiles = getEffectiveProfiles(finalConfig.profiles)
     const manual = new Set(canonicalRoutingExcludedProfileIds(profiles, parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles"))))
     const held = new Set(routingHeldProfileIdsFor(profiles))
-    return canonicalRoutingExcludedProfileIds(profiles, parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")))
+    return canonicalRoutingExcludedProfileIds(profiles, managed)
       .some(id => !manual.has(id) && !held.has(id) && profiles.some(p => p.id === id))
   }
 
@@ -1909,6 +1917,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return Array.isArray(setting) && setting.length > 0 ? setting : undefined
   }
 
+  /** The order `x-meridian-require: cvp` work walks: its own, else the pool order. */
+  function cvpProfileOrderSetting(): string[] | undefined {
+    const setting = parseRoutingExcludedProfiles(getSetting("cvpProfileOrder"))
+    return setting.length > 0 ? setting : priorityProfileOrderSetting()
+  }
+
   /** Already-observed weekly usage for one profile: never fetches. */
   function weeklyUsageReadings(profileId: string): WeeklyUsageReading[] {
     const readings: WeeklyUsageReading[] = []
@@ -2122,8 +2136,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     extraUsageOff?: (id: string) => boolean
     /** The request requires CVP access this profile's map does not show. */
     noCvp?: (id: string) => boolean
+    /** The exclusions that applied when they are not the general ones (cvp work). */
+    excluded?: readonly string[]
   }): NoRoutableProfile[] {
-    const excluded = new Set(routingExcludedProfileIds())
+    const excluded = new Set(input.excluded ?? routingExcludedProfileIds())
     const held = new Set(routingHeldProfileIds())
     const now = Date.now()
     const benchedUntil = new Map(priorityExhaustion.snapshot().map(e => [e.id, e.until]))
@@ -2827,6 +2843,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     options: HandleMessagesOptions,
   ) => {
     const requestStartAt = requestMeta.queueEnteredAt
+    const routingRequire = routingRequireOf(c.req.header(ROUTING_REQUIRE_HEADER))
     const requestSignal = options.turnWatchdogSignal
       ? AbortSignal.any([c.req.raw.signal, options.turnWatchdogSignal])
       : c.req.raw.signal
@@ -3262,47 +3279,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           ? c.req.header("x-meridian-profile")
           : undefined
         const requestedProfileId = options.forcedProfileId || warmProfileId || c.req.header("x-meridian-profile") || undefined
-        const routingAccess = evaluateRoutingProfileAccess({
-          profiles: getEffectiveProfiles(finalConfig.profiles),
-          defaultProfile: finalConfig.defaultProfile,
-          purpose: warmProfileId ? "warm" : "work",
-          explicitProfileId: requestedProfileId,
-          excludedProfileIds: userRoutingExcludedProfileIds(),
-          managedExcludedProfileIds: managedRoutingExcludedProfileIds(),
-          heldProfileIds: routingHeldProfileIds(),
-        })
-        switch (routingAccess.access.kind) {
-          case "explicit_excluded":
-            return profileExcludedResponse(routingAccess.access.profileId)
-          case "explicit_held":
-            return profileHeldResponse(routingAccess.access.profileId)
-          case "no_eligible_profiles": {
-            if (!someOutOnlyByManagedExclusion()) return noEligibleProfilesResponse()
-            claudeLog("routing.managed_exclusion_refused", { routing: routingMode })
-            const reserves = usageReserves()
-            return noRoutableAccountResponse(noRoutableAccount({
-              requestId: requestMeta.requestId,
-              sessionKey: null,
-              routing: routingMode,
-              lead: "every profile is excluded from work routing",
-              reason: "excluded",
-              lastTried: null,
-              profiles: unroutableProfiles({
-                modelFamily: claudeModelFamily(typeof body.model === "string" ? body.model : "sonnet"),
-                reserveHold: id => claudeReserveHold(id, reserves),
-              }),
-            }))
-          }
-          case "allowed":
-            break
-          default: {
-            const exhaustive: never = routingAccess.access
-            return exhaustive
-          }
-        }
         // `x-meridian-require: cvp` limits unpinned work to accounts whose CVP
-        // map shows access on the requested model. A pin, a warm and a
-        // priority hop (whose candidates were already chosen) are exempt.
+        // map shows access on the requested model, in the cvp order behind the
+        // cvp pointer, past the cvp managed list. A pin, a warm and a priority
+        // hop (whose candidates were already chosen) are exempt.
         const requirements = parseRoutingRequirements(c.req.header(ROUTING_REQUIRE_HEADER))
         if (requirements.unknown.length > 0) {
           return c.json({
@@ -3313,6 +3293,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const cvpModel = typeof body.model === "string" ? body.model : ""
         const requireCvp = requirements.cvp && !warmProfileId && !options.forcedProfileId && !c.req.header("x-meridian-profile")
         const lacksCvp = requireCvp ? (id: string) => !cvpActive(id, cvpModel) : undefined
+        // What took a profile out of this request's routing, when cvp work's
+        // own list applies instead of the general managed one.
+        const cvpExcluded = requireCvp ? cvpExcludedProfileIdsFor(getEffectiveProfiles(finalConfig.profiles)) : undefined
         const refuseNoCvp = (sessionKey: string | null, profiles: NoRoutableProfile[]): Response => {
           claudeLog("routing.no_cvp", { model: normalizeCvpModel(cvpModel), routing: routingMode })
           return noRoutableAccountResponse(noRoutableAccount({
@@ -3325,11 +3308,53 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             profiles,
           }))
         }
+        const routingAccess = evaluateRoutingProfileAccess({
+          profiles: getEffectiveProfiles(finalConfig.profiles),
+          defaultProfile: finalConfig.defaultProfile,
+          purpose: warmProfileId ? "warm" : "work",
+          explicitProfileId: requestedProfileId,
+          excludedProfileIds: userRoutingExcludedProfileIds(),
+          managedExcludedProfileIds: requireCvp ? cvpManagedExcludedProfileIds() : managedRoutingExcludedProfileIds(),
+          heldProfileIds: routingHeldProfileIds(),
+        })
+        switch (routingAccess.access.kind) {
+          case "explicit_excluded":
+            return profileExcludedResponse(routingAccess.access.profileId)
+          case "explicit_held":
+            return profileHeldResponse(routingAccess.access.profileId)
+          case "no_eligible_profiles": {
+            if (!someOutOnlyByManagedExclusion(requireCvp ? cvpManagedExcludedProfileIds() : undefined)) return noEligibleProfilesResponse()
+            claudeLog("routing.managed_exclusion_refused", { routing: routingMode })
+            const reserves = usageReserves()
+            return noRoutableAccountResponse(noRoutableAccount({
+              requestId: requestMeta.requestId,
+              sessionKey: null,
+              routing: routingMode,
+              lead: "every profile is excluded from work routing",
+              reason: "excluded",
+              lastTried: null,
+              profiles: unroutableProfiles({
+                modelFamily: claudeModelFamily(typeof body.model === "string" ? body.model : "sonnet"),
+                reserveHold: id => claudeReserveHold(id, reserves),
+                excluded: cvpExcluded,
+              }),
+            }))
+          }
+          case "allowed":
+            break
+          default: {
+            const exhaustive: never = routingAccess.access
+            return exhaustive
+          }
+        }
         // Priority mode (opt-in): unpinned requests are dispatched across the
         if (isPoolRouting(routingMode) && !options.forcedProfileId && !c.req.header("x-meridian-profile")) {
           const effectivePool = getEffectiveProfiles(finalConfig.profiles)
           if (effectivePool.length > 1) {
-            const { order: configuredOrder, unknown: notClaude } = resolvePriorityOrder(effectivePool.map(p => p.id), priorityProfileOrderSetting())
+            const { order: configuredOrder, unknown: notClaude } = resolvePriorityOrder(
+              effectivePool.map(p => p.id),
+              requireCvp ? cvpProfileOrderSetting() : priorityProfileOrderSetting(),
+            )
             // The saved order lists ChatGPT seats as well; those are not typos.
             const unknown = notClaude.filter(id => !chatGptProfiles?.resolve(id))
             if (unknown.length > 0) claudeLog("priority.unknown_order_ids", { unknown })
@@ -3342,6 +3367,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 modelFamily: poolModelFamily,
                 reserveHold: id => claudeReserveHold(id, reserves),
                 noCvp: lacksCvp,
+                excluded: cvpExcluded,
               }))
             }
             // Upstream's opt-in weekly reserve (#1484) passes a holding profile
@@ -3366,7 +3392,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             const unavailable = (id: string) => benched(id) || weeklyHolds.has(id) || heldBy(id) !== null
             const extraUsagePolicy = getClaudeExtraUsagePolicy(process.env.MERIDIAN_CLAUDE_EXTRA_USAGE ?? getSetting("claudeExtraUsage"))
             const extraUsageOff = (id: string) => extraUsagePolicy === "never" && profileDrawsExtraUsage(id)
-            const describeUnroutable = () => unroutableProfiles({ modelFamily, reserveHold: heldBy, weeklyHolds, extraUsageOff, noCvp: lacksCvp })
+            const describeUnroutable = () => unroutableProfiles({ modelFamily, reserveHold: heldBy, weeklyHolds, extraUsageOff, noCvp: lacksCvp, excluded: cvpExcluded })
             const extraUsage = orderForExtraUsage(
               allReserveHeld ? eligibleOrder : routable,
               extraUsagePolicy,
@@ -3534,10 +3560,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               }
               let candidates: string[]
               if (routingMode === ACTIVE_PRIORITY) {
-                const pointerId = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile).id
-                // An active profile without the required CVP access is no head:
-                // chooseActivePriorityCandidates would put it first anyway.
-                const activeId = lacksCvp?.(pointerId) ? order[0]! : pointerId
+                // cvp work is led by the cvp pointer, never the general one, and
+                // only while it qualifies: chooseActivePriorityCandidates would
+                // put any head first, eligible or not.
+                const cvpPointer = getSetting("cvpActiveProfile")
+                const activeId = requireCvp
+                  ? (cvpPointer !== undefined && order.includes(cvpPointer) ? cvpPointer : order[0]!)
+                  : resolveProfile(finalConfig.profiles, finalConfig.defaultProfile).id
                 candidates = retainOnlyProfile
                   ? [retainOnlyProfile]
                   : [
@@ -3668,25 +3697,35 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, next, stickyOptions)
           }
         }
-        // Outside pool routing, work that requires CVP access goes to the
-        // first profile in active+priority order whose map shows it and whose
-        // usage reserve does not hold it back.
-        if (lacksCvp?.(profile.id)) {
+        // Outside pool routing, work that requires CVP access goes to the cvp
+        // pointer, else the first in the cvp order, whose map shows it and
+        // whose usage reserve does not hold it back. Sticky routing keeps its
+        // hashed profile while that one qualifies.
+        if (lacksCvp) {
           const reserves = usageReserves()
           const now = Date.now()
-          const activeId = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile).id
-          const ordered = [...new Set([activeId, ...resolvePriorityOrder([...eligibleProfileIds], priorityProfileOrderSetting()).order])]
-            .filter(id => eligibleProfileIds.size === 0 || eligibleProfileIds.has(id))
-          const next = ordered.find(id => !lacksCvp(id) && claudeReserveHold(id, reserves, now) === null)
+          const qualifies = (id: string) => !lacksCvp(id)
+            && (eligibleProfileIds.size === 0 || eligibleProfileIds.has(id))
+            && claudeReserveHold(id, reserves, now) === null
+          const cvpPointer = getSetting("cvpActiveProfile")
+          const ordered = [...new Set([
+            ...(routingMode === "sticky" ? [profile.id] : []),
+            ...(cvpPointer !== undefined ? [cvpPointer] : []),
+            ...resolvePriorityOrder([...eligibleProfileIds], cvpProfileOrderSetting()).order,
+          ])]
+          const next = ordered.find(qualifies)
           if (next === undefined) {
             return refuseNoCvp(null, unroutableProfiles({
               modelFamily: claudeModelFamily(cvpModel || "sonnet"),
               reserveHold: id => claudeReserveHold(id, reserves, now),
               noCvp: lacksCvp,
+              excluded: cvpExcluded,
             }))
           }
-          claudeLog("routing.cvp", { from: profile.id, to: next })
-          profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, next, stickyOptions)
+          if (next !== profile.id) {
+            claudeLog("routing.cvp", { from: profile.id, to: next })
+            profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, next, stickyOptions)
+          }
         }
         // Also identifies failure telemetry; priority retries resolve each account here.
         resolvedProfileId = profile.id
@@ -4484,6 +4523,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           const conflictQueueWaitMs = totalQueueWaitMs(requestMeta)
           telemetryStore.record({
             requestId: requestMeta.requestId,
+            routingRequire,
             timestamp: Date.now(),
             adapter: adapter.name,
             model,
@@ -6558,6 +6598,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           if (!warmProfileId) noteClaudeServed(profile.id, requestMeta.requestId, attributedRoutingMode)
           telemetryStore.record({
             requestId: requestMeta.requestId,
+            routingRequire,
             timestamp: Date.now(),
             adapter: adapter.name,
             profileId: profile.id,
@@ -7183,7 +7224,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               const totalMs = Date.now() - requestStartAt
               const queueWaitMs = totalQueueWaitMs(requestMeta)
               observeStreamFailure(() => telemetryStore.record({
-                requestId: requestMeta.requestId, timestamp: Date.now(), adapter: adapter.name,
+                requestId: requestMeta.requestId, timestamp: Date.now(), adapter: adapter.name, routingRequire,
                 profileId: profile.id, routeKind, routeGroupId, routeAttempt, requestSource, model,
                 requestModel: body.model || undefined, resolvedModel: resolvedHaikuModel(), mode: "stream", isResume,
                 isPassthrough: passthrough, hasDeferredTools, toolCount, lineageType,
@@ -8778,6 +8819,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 if (!warmProfileId) noteClaudeServed(profile.id, requestMeta.requestId, attributedRoutingMode)
                 telemetryStore.record({
                   requestId: requestMeta.requestId,
+                  routingRequire,
                   timestamp: Date.now(),
                   adapter: adapter.name,
             profileId: profile.id,
@@ -9327,6 +9369,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 if (!warmProfileId) noteClaudeServed(profile.id, requestMeta.requestId, attributedRoutingMode)
                 telemetryStore.record({
                   requestId: requestMeta.requestId,
+                  routingRequire,
                   timestamp: Date.now(),
                   adapter: adapter.name,
                   profileId: profile.id,
@@ -9479,6 +9522,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 if (!warmProfileId) noteClaudeServed(profile.id, requestMeta.requestId, attributedRoutingMode)
                 telemetryStore.record({
                   requestId: requestMeta.requestId,
+                  routingRequire,
                   timestamp: Date.now(),
                   adapter: adapter.name,
                   profileId: profile.id,
@@ -9556,6 +9600,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               const streamErrQueueWaitMs = totalQueueWaitMs(requestMeta)
               telemetryStore.record({
                 requestId: requestMeta.requestId,
+                routingRequire,
                 timestamp: Date.now(),
                 adapter: adapter.name,
                 profileId: profile.id,
@@ -9799,6 +9844,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const errorTotalMs = Date.now() - requestStartAt
         telemetryStore.record({
           requestId: requestMeta.requestId,
+          routingRequire,
           timestamp: Date.now(),
           adapter: adapter.name,
           profileId: attributedProfileId ?? resolvedProfileId,
@@ -10139,6 +10185,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               requestId,
               timestamp: Date.now(),
               adapter: adapter.name,
+              routingRequire: routingRequireOf(c.req.header(ROUTING_REQUIRE_HEADER)),
               model: "unknown",
               requestModel: undefined,
               mode: "non-stream",
@@ -10323,8 +10370,19 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     spent: (profileId) => spentProfiles.get(profileId),
     freeSeatOrder: () => getChatGptFeatures().freeSeatOrder,
   }) : undefined
+  const claudeProfileIds = (): string[] => listProfiles(finalConfig.profiles, finalConfig.defaultProfile).map(p => p.id)
+  /** Per model, the profiles whose CVP map shows active access, in `order`. */
+  const cvpHoldersByModel = (order: readonly string[]): Record<string, string[]> => {
+    const holders: Record<string, string[]> = {}
+    for (const id of order) {
+      for (const entry of cvpAccessFor(id)) {
+        if (entry.type === "active") (holders[entry.model] ??= []).push(id)
+      }
+    }
+    return holders
+  }
   const orderableProfileIds = (): string[] => [
-    ...listProfiles(finalConfig.profiles, finalConfig.defaultProfile).map(p => p.id),
+    ...claudeProfileIds(),
     ...(chatGptProfiles?.profiles().map(p => p.id) ?? []),
   ]
 
@@ -10756,6 +10814,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // still take precedence when set (reported so the UI can say so).
   app.get("/settings/api/routing", (c) => {
     const profileIds = orderableProfileIds()
+    const cvpEffectiveOrder = resolvePriorityOrder(claudeProfileIds(), cvpProfileOrderSetting()).order
     return c.json({
       routing: getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing")),
       modes: ROUTING_MODES,
@@ -10764,9 +10823,16 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       routingManagedExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")),
       routingHeldProfiles: configuredRoutingHeldProfileIds(),
       usageReserves: usageReserves(),
+      // The cybersec switcher's half: what it saved, what `x-meridian-require:
+      // cvp` work walks, and who holds access on each model in that order.
+      cvpProfileOrder: parseRoutingExcludedProfiles(getSetting("cvpProfileOrder")),
+      cvpEffectiveProfileOrder: cvpEffectiveOrder,
+      cvpActiveProfile: getSetting("cvpActiveProfile") ?? null,
+      cvpManagedExcludedProfiles: cvpManagedExcludedProfileIds(),
+      cvpHolders: cvpHoldersByModel(cvpEffectiveOrder),
       // What a supervisor may rely on this build doing; read rather than
       // guessed from a version, which forks share.
-      capabilities: ["managed-exclusion-no-routable", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing"],
+      capabilities: ["managed-exclusion-no-routable", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order"],
       profiles: profileIds,
       saved: {
         routing: getSetting("routing") ?? null,
@@ -10792,6 +10858,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       routingManagedExcludedProfiles?: unknown
       routingHeldProfiles?: unknown
       usageReserves?: unknown
+      cvpProfileOrder?: unknown
+      cvpActiveProfile?: unknown
+      cvpManagedExcludedProfiles?: unknown
     }
     try { body = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
     // One form submits routing, order and exclusions together, so a later
@@ -10840,6 +10909,29 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const unknown = Object.keys(parsed.value).filter(id => !known.has(id))
       if (unknown.length > 0) return c.json({ error: `Unknown profiles: ${unknown.join(", ")}` }, 400)
       updates.usageReserves = parsed.value
+    }
+    // The cybersec switcher's settings name Claude profiles only: cvp work
+    // never reaches a ChatGPT seat.
+    if (body.cvpProfileOrder !== undefined) {
+      if (!Array.isArray(body.cvpProfileOrder) || body.cvpProfileOrder.some(x => typeof x !== "string")) {
+        return c.json({ error: "cvpProfileOrder must be an array of Claude profile ids" }, 400)
+      }
+      const known = new Set(claudeProfileIds())
+      const unknown = (body.cvpProfileOrder as string[]).filter(id => !known.has(id))
+      if (unknown.length > 0) return c.json({ error: `Unknown Claude profiles: ${unknown.join(", ")}` }, 400)
+      updates.cvpProfileOrder = parseRoutingExcludedProfiles(body.cvpProfileOrder)
+    }
+    if (body.cvpActiveProfile !== undefined) {
+      if (body.cvpActiveProfile !== null && (typeof body.cvpActiveProfile !== "string" || !claudeProfileIds().includes(body.cvpActiveProfile))) {
+        return c.json({ error: "cvpActiveProfile must be a Claude profile id or null" }, 400)
+      }
+      updates.cvpActiveProfile = body.cvpActiveProfile ?? undefined
+    }
+    if (body.cvpManagedExcludedProfiles !== undefined) {
+      if (!Array.isArray(body.cvpManagedExcludedProfiles) || body.cvpManagedExcludedProfiles.some(profileId => typeof profileId !== "string")) {
+        return c.json({ error: "cvpManagedExcludedProfiles must be an array of profile ids" }, 400)
+      }
+      updates.cvpManagedExcludedProfiles = parseRoutingExcludedProfiles(body.cvpManagedExcludedProfiles)
     }
     if (Object.keys(updates).length > 0) saveSettings(updates)
     if (body.routingExcludedProfiles !== undefined || body.routingManagedExcludedProfiles !== undefined || body.routingHeldProfiles !== undefined) {
@@ -13164,9 +13256,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
     if (requirements.cvp) {
       const effective = getEffectiveProfiles(finalConfig.profiles)
-      const unavailable = new Set(routingUnavailableProfileIdsFor(effective))
-      const activeId = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile).id
-      const candidates = [...new Set([activeId, ...resolvePriorityOrder(effective.map(p => p.id), priorityProfileOrderSetting()).order])]
+      const unavailable = new Set([...cvpExcludedProfileIdsFor(effective), ...routingHeldProfileIdsFor(effective)])
+      const cvpPointer = getSetting("cvpActiveProfile")
+      const candidates = [...new Set([
+        ...(cvpPointer !== undefined ? [cvpPointer] : []),
+        ...resolvePriorityOrder(effective.map(p => p.id), cvpProfileOrderSetting()).order,
+      ])]
         .filter(id => (effective.length === 0 || effective.some(p => p.id === id)) && !unavailable.has(id))
       const listed = new Map<string, Record<string, unknown> & { cvp_profiles: string[] }>()
       for (const id of candidates) {

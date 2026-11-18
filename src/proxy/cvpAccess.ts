@@ -254,9 +254,19 @@ const KNOWN_REQUIREMENTS = new Set(["cvp"])
  * this build does not know is returned in `unknown`, so the caller can refuse
  * it rather than route as if it had been met.
  */
-export function parseRoutingRequirements(header: string | undefined): { cvp: boolean; unknown: string[] } {
-  const tokens = (header ?? "").split(",").map(token => token.trim().toLowerCase()).filter(Boolean)
-  return { cvp: tokens.includes("cvp"), unknown: tokens.filter(token => !KNOWN_REQUIREMENTS.has(token)) }
+export function parseRoutingRequirements(header: string | undefined): { cvp: boolean; known: string[]; unknown: string[] } {
+  const tokens = [...new Set((header ?? "").split(",").map(token => token.trim().toLowerCase()).filter(Boolean))]
+  return {
+    cvp: tokens.includes("cvp"),
+    known: tokens.filter(token => KNOWN_REQUIREMENTS.has(token)),
+    unknown: tokens.filter(token => !KNOWN_REQUIREMENTS.has(token)),
+  }
+}
+
+/** The requirements a request carried, as telemetry records them; absent when none. */
+export function routingRequireOf(header: string | undefined): string[] | undefined {
+  const { known } = parseRoutingRequirements(header)
+  return known.length > 0 ? known : undefined
 }
 
 /** Forget a profile's map: a new login may be another account. */

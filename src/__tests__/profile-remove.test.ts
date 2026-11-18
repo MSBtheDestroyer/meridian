@@ -82,6 +82,16 @@ describe("profileRemovalSettings", () => {
     )).toEqual({ profileOrder: ["personal"] })
   })
 
+  test("drops the profile from the cvp order and clears a cvp pointer naming it", () => {
+    const update = profileRemovalSettings(
+      { id: "employer", aliases: ["work"] },
+      [{ id: "personal" }],
+      { activeProfile: "personal", cvpProfileOrder: ["work", "personal"], cvpActiveProfile: "work" },
+    )
+    expect(update).toEqual({ cvpProfileOrder: ["personal"] })
+    expect("cvpActiveProfile" in update).toBe(true)
+  })
+
   test("returns nothing when no setting names the profile", () => {
     expect(profileRemovalSettings({ id: "work" }, [{ id: "personal" }], { activeProfile: "personal", profileOrder: ["personal"] })).toEqual({})
   })

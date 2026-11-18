@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS metrics (
   route_refused_bucket TEXT,
   reasoning_output_tokens INTEGER,
   fallback_from_model  TEXT,
-  resolved_model       TEXT
+  resolved_model       TEXT,
+  routing_require      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_ts    ON metrics(timestamp);
 CREATE INDEX IF NOT EXISTS idx_metrics_model ON metrics(model);
@@ -74,6 +75,7 @@ const METRICS_MIGRATIONS = [
   "ALTER TABLE metrics ADD COLUMN reasoning_output_tokens INTEGER",
   "ALTER TABLE metrics ADD COLUMN fallback_from_model TEXT",
   "ALTER TABLE metrics ADD COLUMN resolved_model TEXT",
+  "ALTER TABLE metrics ADD COLUMN routing_require TEXT",
 ]
 
 const LOGS_SCHEMA = `
@@ -143,7 +145,7 @@ class SqliteTelemetryStore implements ITelemetryStore {
         input_tokens, output_tokens, cache_read_input_tokens,
         cache_creation_input_tokens, cache_hit_rate, profile_id, envelope_violations,
         route_kind, route_group_id, route_attempt, route_refused_bucket,
-        reasoning_output_tokens, fallback_from_model
+        reasoning_output_tokens, fallback_from_model, routing_require
       ) VALUES (
         @requestId, @timestamp, @adapter, @requestSource, @model, @requestModel, @resolvedModel, @mode,
         @isResume, @isPassthrough, @lineageType,
@@ -154,7 +156,7 @@ class SqliteTelemetryStore implements ITelemetryStore {
         @inputTokens, @outputTokens, @cacheReadInputTokens,
         @cacheCreationInputTokens, @cacheHitRate, @profileId, @envelopeViolations,
         @routeKind, @routeGroupId, @routeAttempt, @routeRefusedBucket,
-        @reasoningOutputTokens, @fallbackFromModel
+        @reasoningOutputTokens, @fallbackFromModel, @routingRequire
       )
     `)
 
@@ -212,6 +214,7 @@ class SqliteTelemetryStore implements ITelemetryStore {
         routeRefusedBucket: metric.routeRefusedBucket ?? null,
         reasoningOutputTokens: metric.reasoningOutputTokens ?? null,
         fallbackFromModel: metric.fallbackFromModel ?? null,
+        routingRequire: metric.routingRequire && metric.routingRequire.length > 0 ? JSON.stringify(metric.routingRequire) : null,
       })
     } catch (err) {
       console.error("[telemetry] SQLite write failed, skipping:", err)
@@ -399,7 +402,7 @@ class SqliteDiagnosticLogStore implements IDiagnosticLogStore {
   }
 }
 
-function parseEnvelopeViolations(raw: unknown): string[] | undefined {
+function parseStringList(raw: unknown): string[] | undefined {
   if (typeof raw !== "string" || raw.length === 0) return undefined
   try {
     const parsed = JSON.parse(raw)
@@ -446,13 +449,14 @@ function rowToMetric(r: Record<string, unknown>): RequestMetric {
     cacheCreationInputTokens: (r.cache_creation_input_tokens as number) ?? undefined,
     cacheHitRate: (r.cache_hit_rate as number) ?? undefined,
     profileId: (r.profile_id as string) ?? undefined,
-    envelopeViolations: parseEnvelopeViolations(r.envelope_violations),
+    envelopeViolations: parseStringList(r.envelope_violations),
     routeKind: (r.route_kind as RequestMetric["routeKind"]) ?? undefined,
     routeGroupId: (r.route_group_id as string) ?? undefined,
     routeAttempt: (r.route_attempt as number) ?? undefined,
     routeRefusedBucket: (r.route_refused_bucket as string) ?? undefined,
     reasoningOutputTokens: (r.reasoning_output_tokens as number) ?? undefined,
     fallbackFromModel: (r.fallback_from_model as string) ?? undefined,
+    routingRequire: parseStringList(r.routing_require),
   }
 }
 

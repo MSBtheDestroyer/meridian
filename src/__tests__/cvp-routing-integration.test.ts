@@ -13,11 +13,13 @@ import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
 
 let served: string[] = []
 let refuseWith: unknown = undefined
+let failTokens = new Set<string>()
 
 installSdkMock(() => ({
   query: (params: any) => {
     const token = params.options?.env?.CLAUDE_CODE_OAUTH_TOKEN ?? "none"
     served.push(token)
+    if (failTokens.has(token)) throw new Error("429 rate limit reached for this account")
     const sessionId = resolveMockSdkSessionId(params.options, "cvp-session")
     return (async function* () {
       const message = assistantMessage([{ type: "text", text: `ok from ${token}` }]) as any
@@ -77,6 +79,7 @@ const savedEnv: Record<string, string | undefined> = {}
 beforeEach(async () => {
   served = []
   refuseWith = undefined
+  failTokens = new Set()
   rmSync(configPath("cvp-access.json"), { force: true })
   resetCvpAccessCacheForTests()
   clearAccountModels()
@@ -84,6 +87,9 @@ beforeEach(async () => {
   resetActiveProfile()
   setSetting("routingExcludedProfiles", [])
   setSetting("routingManagedExcludedProfiles", [])
+  setSetting("cvpProfileOrder", undefined)
+  setSetting("cvpActiveProfile", undefined)
+  setSetting("cvpManagedExcludedProfiles", undefined)
   __setFetchOAuthUsageOverride(async () => null)
   savedEnv.MERIDIAN_ROUTING = process.env.MERIDIAN_ROUTING
   savedEnv.MERIDIAN_PROFILE_ORDER = process.env.MERIDIAN_PROFILE_ORDER
@@ -314,9 +320,233 @@ describe("refusals teach the map", () => {
   })
 })
 
-describe("GET /settings/api/routing", () => {
-  it("advertises cvp-routing", async () => {
-    const body = await (await app().fetch(new Request("http://localhost/settings/api/routing"))).json() as { capabilities?: string[] }
-    expect(body.capabilities).toContain("cvp-routing")
+const OPUS_ONLY = [{ id: "claude-opus-5-5", badge: DEFENSE }]
+
+async function putRouting(target: TestApp, body: Record<string, unknown>) {
+  return target.fetch(new Request("http://localhost/settings/api/routing", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }))
+}
+
+interface CvpRoutingSettings {
+  capabilities: string[]
+  profileOrder: string[]
+  cvpProfileOrder: string[]
+  cvpEffectiveProfileOrder: string[]
+  cvpActiveProfile: string | null
+  cvpManagedExcludedProfiles: string[]
+  cvpHolders: Record<string, string[]>
+}
+
+async function routingSettings(target: TestApp): Promise<CvpRoutingSettings> {
+  const response = await target.fetch(new Request("http://localhost/settings/api/routing"))
+  expect(response.status).toBe(200)
+  return await response.json() as CvpRoutingSettings
+}
+
+describe("the cvp order and active pointer", () => {
+  it("orders cvp work by cvpProfileOrder while unflagged work keeps profileOrder", async () => {
+    const server = app()
+    await postReading(server, "team", OPUS_ONLY)
+    await postReading(server, "team2", OPUS_ONLY)
+    await setActive(server, "max")
+    expect((await putRouting(server, { cvpProfileOrder: ["team2", "team", "max"] })).status).toBe(200)
+
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(200)
+    expect((await message(server)).status).toBe(200)
+
+    expect(served).toEqual(["token-team2", "token-max"])
+  })
+
+  it("falls back to profileOrder when cvpProfileOrder is empty", async () => {
+    setSetting("cvpProfileOrder", [])
+    const server = app()
+    await postReading(server, "team", OPUS_ONLY)
+    await postReading(server, "team2", OPUS_ONLY)
+
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(200)
+    expect(served).toEqual(["token-team"])
+  })
+
+  it("leads with cvpActiveProfile, not the general active profile", async () => {
+    const server = app()
+    await postReading(server, "team", OPUS_ONLY)
+    await postReading(server, "team2", OPUS_ONLY)
+    await setActive(server, "team")
+    expect((await putRouting(server, { cvpActiveProfile: "team2" })).status).toBe(200)
+
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(200)
+    expect((await message(server)).status).toBe(200)
+
+    expect(served).toEqual(["token-team2", "token-team"])
+  })
+
+  it("never lets the general active profile lead cvp work", async () => {
+    const server = app()
+    await postReading(server, "team", OPUS_ONLY)
+    await postReading(server, "team2", OPUS_ONLY)
+    await setActive(server, "team2")
+
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(200)
+    expect(served).toEqual(["token-team"])
+  })
+
+  it("passes over a cvpActiveProfile without access on the requested model", async () => {
+    const server = app()
+    await postReading(server, "team", TEAM_READING)
+    await postReading(server, "team2", OPUS_ONLY)
+    setSetting("cvpActiveProfile", "team2")
+
+    expect((await message(server, { "x-meridian-require": "cvp" }, "claude-mythos-5-2")).status).toBe(200)
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(200)
+
+    expect(served).toEqual(["token-team", "token-team2"])
+  })
+
+  it("fails over only within the profiles holding access", async () => {
+    const server = app()
+    await postReading(server, "team", OPUS_ONLY)
+    await postReading(server, "team2", OPUS_ONLY)
+    setSetting("cvpActiveProfile", "team2")
+    failTokens = new Set(["token-team2"])
+
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(200)
+    // A profile may be retried before failover; the order of accounts is what counts.
+    expect([...new Set(served)]).toEqual(["token-team2", "token-team"])
+  })
+
+  it("steers active routing by the cvp order and pointer too", async () => {
+    process.env.MERIDIAN_ROUTING = "active"
+    const server = app()
+    await postReading(server, "team", OPUS_ONLY)
+    await postReading(server, "team2", OPUS_ONLY)
+    setSetting("cvpProfileOrder", ["team2", "team"])
+
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(200)
+    setSetting("cvpActiveProfile", "team")
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(200)
+    expect((await message(server)).status).toBe(200)
+
+    expect(served).toEqual(["token-team2", "token-team", "token-max"])
+  })
+})
+
+describe("cvpManagedExcludedProfiles", () => {
+  it("keeps cvp work on an account the general managed list excludes", async () => {
+    setSetting("routingManagedExcludedProfiles", ["team"])
+    const server = app()
+    await postReading(server, "team", OPUS_ONLY)
+
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(200)
+    expect((await models(server, { "x-meridian-require": "cvp" })).data.map(m => [m.id, m.cvp_profiles])).toEqual([["claude-opus-5-5", ["team"]]])
+    expect(served).toEqual(["token-team"])
+  })
+
+  it("takes accounts out of cvp work only, leaving unflagged work alone", async () => {
+    setSetting("cvpManagedExcludedProfiles", ["team", "max"])
+    const server = app()
+    await postReading(server, "team", OPUS_ONLY)
+    await postReading(server, "team2", OPUS_ONLY)
+    setSetting("cvpActiveProfile", "team")
+
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(200)
+    expect((await message(server)).status).toBe(200)
+    expect((await models(server, { "x-meridian-require": "cvp" })).data.map(m => [m.id, m.cvp_profiles])).toEqual([["claude-opus-5-5", ["team2"]]])
+
+    expect(served).toEqual(["token-team2", "token-max"])
+  })
+
+  it("refuses unsent with no_cvp when it leaves no account holding access", async () => {
+    setSetting("cvpManagedExcludedProfiles", ["team"])
+    const server = app()
+    await postReading(server, "team", OPUS_ONLY)
+
+    const response = await message(server, { "x-meridian-require": "cvp" })
+
+    expect(response.status).toBe(429)
+    const body = await response.json() as { error: { code: string; profiles: Array<{ id: string; reason: string }> } }
+    expect(body.error.code).toBe("no_routable_account")
+    expect(body.error.profiles.map(p => [p.id, p.reason])).toEqual([["max", "no_cvp"], ["team", "excluded"], ["team2", "no_cvp"]])
+    expect(served).toEqual([])
+  })
+
+  it("still yields to the user's own exclusions", async () => {
+    setSetting("routingExcludedProfiles", ["team"])
+    const server = app()
+    await postReading(server, "team", OPUS_ONLY)
+    await postReading(server, "team2", OPUS_ONLY)
+    setSetting("cvpActiveProfile", "team")
+
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(200)
+    expect(served).toEqual(["token-team2"])
+  })
+})
+
+describe("telemetry", () => {
+  it("records the parsed requirement as routingRequire, and nothing without the header", async () => {
+    const server = app()
+    await postReading(server, "team", OPUS_ONLY)
+    const since = Date.now()
+
+    expect((await message(server, { "x-meridian-require": " CVP " })).status).toBe(200)
+    expect((await message(server)).status).toBe(200)
+
+    const rows = await (await server.fetch(new Request(`http://localhost/telemetry/requests?limit=10&since=${since}`))).json() as Array<{ profileId?: string; routingRequire?: string[] }>
+    expect(rows.map(row => [row.profileId, row.routingRequire])).toEqual([["max", undefined], ["team", ["cvp"]]])
+  })
+})
+
+describe("GET/PUT /settings/api/routing", () => {
+  it("advertises cvp-routing and cvp-order beside the existing capabilities", async () => {
+    const body = await routingSettings(app())
+    expect(body.capabilities).toEqual(expect.arrayContaining(["managed-exclusion-no-routable", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order"]))
+  })
+
+  it("reports nothing saved as empty, with the effective order falling back to profileOrder", async () => {
+    const body = await routingSettings(app())
+    expect(body.cvpProfileOrder).toEqual([])
+    expect(body.cvpEffectiveProfileOrder).toEqual(["max", "team", "team2"])
+    expect(body.cvpActiveProfile).toBeNull()
+    expect(body.cvpManagedExcludedProfiles).toEqual([])
+    expect(body.cvpHolders).toEqual({})
+  })
+
+  it("saves and reports the cvp order, pointer, managed list and per-model holders", async () => {
+    const server = app()
+    await postReading(server, "team", TEAM_READING)
+    await postReading(server, "team2", OPUS_ONLY)
+
+    const put = await putRouting(server, { cvpProfileOrder: ["team2", "team"], cvpActiveProfile: "team", cvpManagedExcludedProfiles: ["max", "max"] })
+    expect(put.status).toBe(200)
+
+    const body = await routingSettings(server)
+    expect(body.cvpProfileOrder).toEqual(["team2", "team"])
+    expect(body.cvpEffectiveProfileOrder).toEqual(["team2", "team", "max"])
+    expect(body.cvpActiveProfile).toBe("team")
+    expect(body.cvpManagedExcludedProfiles).toEqual(["max"])
+    expect(body.cvpHolders).toEqual({ "claude-opus-5-5": ["team2", "team"], "claude-mythos-5-2": ["team"] })
+    expect(body.profileOrder).toEqual(["max", "team", "team2"])
+
+    expect((await putRouting(server, { cvpActiveProfile: null, cvpProfileOrder: [] })).status).toBe(200)
+    const cleared = await routingSettings(server)
+    expect(cleared.cvpActiveProfile).toBeNull()
+    expect(cleared.cvpProfileOrder).toEqual([])
+    expect(cleared.cvpManagedExcludedProfiles).toEqual(["max"])
+  })
+
+  it("refuses unknown or malformed cvp fields without writing any of them", async () => {
+    const server = app()
+    expect((await putRouting(server, { cvpProfileOrder: ["team", "nobody"] })).status).toBe(400)
+    expect((await putRouting(server, { cvpProfileOrder: "team" })).status).toBe(400)
+    expect((await putRouting(server, { cvpActiveProfile: "nobody" })).status).toBe(400)
+    expect((await putRouting(server, { cvpActiveProfile: 3 })).status).toBe(400)
+    expect((await putRouting(server, { cvpManagedExcludedProfiles: [1] })).status).toBe(400)
+    expect((await putRouting(server, { cvpActiveProfile: "team", cvpProfileOrder: ["nobody"] })).status).toBe(400)
+
+    const body = await routingSettings(server)
+    expect(body.cvpActiveProfile).toBeNull()
+    expect(body.cvpProfileOrder).toEqual([])
   })
 })

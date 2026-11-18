@@ -191,21 +191,43 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   Meridian sign-in forgets the profile's map, since it may be another
   account; a token refresh does not. `/profiles/list` lists each profile's
   map as `cvpAccess`.
-- **`x-meridian-require: cvp` routes unpinned work to CVP access.** Under pool
-  routing the candidate order is cut to profiles whose map shows `active`
-  access on the requested model before any other rule runs; the active
-  profile heads it only when it qualifies, and a retained route that does not
-  is refused. Under `active` and `sticky`, a resolved profile without access
-  is replaced by the first in active+priority order that has it and is not
-  reserve-held. With none, the request is refused unsent with
+- **`x-meridian-require: cvp` routes unpinned work to CVP access, in its own
+  order.** Two switchers run side by side: the general one owns
+  `activeProfile`, `profileOrder` and `routingManagedExcludedProfiles`, a
+  cybersec one owns `cvpActiveProfile`, `cvpProfileOrder` and
+  `cvpManagedExcludedProfiles`. cvp work walks `cvpProfileOrder` (empty or
+  unset: the pool order), skips the user's `routingExcludedProfiles`, the held
+  profiles and `cvpManagedExcludedProfiles` but not
+  `routingManagedExcludedProfiles` (an account rested from general work may
+  still take cvp work), and is cut to profiles whose map shows `active` access
+  on the requested model before any other rule runs. `cvpActiveProfile` heads
+  it when it qualifies, else the first that does; the general active profile
+  never heads cvp work. Reserve, weekly, bench and Extra Usage skips apply and
+  failover stays in that set; a retained route that does not qualify is
+  refused. Under `active` and `sticky` a resolved profile without access (or
+  outside that set) is replaced by `cvpActiveProfile`, else the first in the
+  cvp order, that qualifies and is not reserve-held; sticky keeps its hashed
+  profile while it qualifies. Unflagged work reads none of the three cvp
+  settings. A profile out by an exclusion reports reason `excluded`. With none, the request is refused unsent with
   `no_routable_account` and reason `no_cvp` (null `resets_at`: waiting will
   not grant access). Pins, warms and priority hops are exempt; an unknown
   requirement token is 400, so a newer client's requirement is never routed
   as if met. `GET /v1/models` with the header lists only models with access:
   a pinned account's own, or unpinned every reachable account's, each with
   `cvp_profiles` in that order; every pinned entry the map knows carries
-  `cyber_verification`. `GET /settings/api/routing` lists `cvp-routing` in
-  `capabilities`.
+  `cyber_verification`. `GET /settings/api/routing` lists `cvp-routing` and
+  `cvp-order` in `capabilities` and reports `cvpProfileOrder` (as saved, `[]`
+  when unset), `cvpEffectiveProfileOrder` (what cvp work walks),
+  `cvpActiveProfile` (`null` when unset), `cvpManagedExcludedProfiles` and
+  `cvpHolders` (per normalized model, the profiles whose map shows `active`
+  access, in the effective order, exclusions not applied). `PUT` takes each
+  independently, atomically with the rest of the body: the order and the
+  pointer name Claude profiles only (400 otherwise; `null` clears the pointer,
+  `[]` the order), the managed list any strings. A rename rewrites the order
+  and pointer, a removal drops the profile from them. They are an instance's
+  own and `meridian instance import` leaves them behind, as it does every
+  Claude-profile setting. Telemetry rows record the known tokens a request
+  named as `routingRequire` (absent without the header).
 - **One incident per outage.** The first `pool_exhausted` event on
   `/profiles/events` since a Claude account last served work opens an
   incident `inc_<epoch ms>_<seq>` (that event's own `at` and `seq`); every

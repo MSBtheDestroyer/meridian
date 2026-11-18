@@ -133,9 +133,9 @@ describe("persistence", () => {
 
 describe("x-meridian-require", () => {
   it("parses cvp and reports unknown requirements", () => {
-    expect(parseRoutingRequirements(undefined)).toEqual({ cvp: false, unknown: [] })
-    expect(parseRoutingRequirements(" CVP ")).toEqual({ cvp: true, unknown: [] })
-    expect(parseRoutingRequirements("cvp, zdr")).toEqual({ cvp: true, unknown: ["zdr"] })
+    expect(parseRoutingRequirements(undefined)).toEqual({ cvp: false, known: [], unknown: [] })
+    expect(parseRoutingRequirements(" CVP ")).toEqual({ cvp: true, known: ["cvp"], unknown: [] })
+    expect(parseRoutingRequirements("cvp, zdr")).toEqual({ cvp: true, known: ["cvp"], unknown: ["zdr"] })
   })
 
   it("normalizes model ids the same on every side", () => {

@@ -88,6 +88,10 @@ export interface RequestMetric {
    *  computed for it. */
   routeRefusedBucket?: string
 
+  /** The known requirements the request's `x-meridian-require` header named
+   *  (e.g. `["cvp"]`). Absent when it carried none. */
+  routingRequire?: string[]
+
   /** Correlates the internal hops of ONE client request. Priority routing
    *  re-enters the proxy once per candidate account, so a failover writes
    *  several rows; they share this id (the outer request's id). Absent on
