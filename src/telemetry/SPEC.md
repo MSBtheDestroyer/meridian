@@ -82,6 +82,24 @@ Record what Meridian did and show it to the operator:
   timed polls, and `visibilitychange` refreshes the page as soon as it is
   shown again.
 
+- **Free resets are counted from Meridian's own reading** (`freeResets.ts`).
+  Each Claude entry of `/v1/usage/quota/all` carries the provider's
+  `bankedResets`, which Meridian reads per profile with that profile's
+  credentials; neither page asks anyone else. One view feeds both pages:
+  resets on unexpired grants are *available*, and those on grants the
+  provider marks `usableNow`, unpaused and already started are *usable*. A
+  card on `/` shows a "resets" row (count, how many are usable, the soonest
+  expiry) and never redeems. `/profiles` shows a "Free resets" block with a
+  "Redeem one" button only while a usable grant has an id: the provider's
+  `nextGrantId` when it is usable, else the usable grant expiring soonest. The
+  button acts only after a confirmation and posts that grant to
+  `POST /v1/usage/quota/reset` with a fresh `requestId`; nothing redeems on
+  its own. The poll is held while a redeem is in flight, and the outcome stays
+  in the block for two minutes so the poll that follows does not wipe it.
+  The route clears the profile's cached usage after a reset, so the next read
+  of `/v1/usage/quota/all` (the page's refresh, or Vibeterm's re-check) shows
+  the new state.
+
 - **Keepalive beats are not requests.** Rows with
   `requestSource: "cache-keepalive"` answered no client, so `computeSummary`
   (both stores), the route summary and Prometheus request series exclude

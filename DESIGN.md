@@ -155,6 +155,12 @@ at its provider, so card CSS never names one.
   are the last good read) is the badge's tooltip on hover or keyboard focus,
   hung across the card over the figures; the card does not carry it
   permanently.
+- **Free resets:** a Claude account with banked resets shows their count in
+  green while one can be redeemed, and in `--muted` while the provider holds
+  all of them back, beside how many are usable and the soonest expiry. On `/`
+  it is a "resets" row under the usage figures; on `/profiles` it is a block
+  below them with a small blue "Redeem one" button, which asks for
+  confirmation first and shows the outcome in the block.
 - **Needs a login:** a red border, the same for every provider, and a
   needs-login badge. An active card keeps its brand ring outside the red.
 - **Controls stay blue:** buttons, links, focus rings, drag handles and drop

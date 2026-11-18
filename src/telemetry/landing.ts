@@ -16,6 +16,7 @@ import { profileProvidersCss, profileProvidersJs } from "./profileProviders"
 import { profileLoginStatesCss, profileLoginStatesJs } from "./profileLoginStates"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "./profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT, isUnusableJs } from "./profileSpent"
+import { freeResetView } from "./freeResets"
 import { domPatchJs } from "./domPatch"
 import { profileCardStatusCss, profileCardStatusJs } from "./profileCardStatus"
 import { textSelectionJs } from "./textSelection"
@@ -249,6 +250,9 @@ export const landingHtml = `<!DOCTYPE html>
   .credits-row .w-credits.serving { color: var(--yellow); }
   .credits-row .w-credits-note { color: var(--muted); font-size: 11px; text-align: right; min-width: 0; overflow-wrap: anywhere; }
   .credits-row .w-credits-note.credits-pace { flex: 1; text-align: left; }
+  /* Banked free resets: green while one can be redeemed, muted while all are held back. */
+  .resets-row .w-credits { color: var(--green); }
+  .resets-row.held .w-credits { color: var(--muted); }
   .pool-chip.on-credits, .pool-chip.reserved { color: var(--yellow); background: rgba(210,153,34,0.15); }
 
   /* Traffic strip — one compact surface */
@@ -336,6 +340,8 @@ var GENERAL_WINDOW_TYPES=${JSON.stringify(GENERAL_WINDOW_TYPES)};
 var FADE_FROM=${FADE_FROM};
 var SPENT_AT=${SPENT_AT};
 ${isUnusableJs}
+// Shared with /profiles (freeResets.ts), so both pages count an account's resets alike.
+var freeResetView=${freeResetView.toString()};
 function generalUtilization(windows,provider){
   var everyWindow=provider==='chatgpt';
   var worst=null;
@@ -651,6 +657,11 @@ function profileSection(q,s,pl,h){
       +'<span class="w-credits-note">'+esc(credits.serving?'serving on credits':credits.policy||credits.note)+'</span></div>'
       +(credits.pace?'<div class="usage-row credits-row" title="'+esc(credits.pace.title)+'">'
         +'<span class="w-credits-note credits-pace">'+esc(credits.pace.text)+'</span></div>':'');
+    // Redeeming one is deliberate and lives on /profiles; the card only counts them.
+    var resets=chat?null:freeResetView(quota.bankedResets,Date.now());
+    if(resets)rows+='<div class="usage-row credits-row resets-row'+(resets.usable>0?'':' held')+'" title="'+esc(resets.title)+'"><span class="w-label">resets</span>'
+      +'<span class="w-credits">'+esc(resets.value)+'</span>'
+      +'<span class="w-credits-note">'+esc(resets.note)+'</span></div>';
     var isPriority=pl&&pl.routing==='priority';
     // active+priority keeps the active profile meaningful - switching it is how
     // you move traffic, so the card stays clickable, unlike in pure priority.
