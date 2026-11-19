@@ -3,9 +3,8 @@
  *
  * - `activate(id, done)` switches to it. When Meridian refuses, the shared
  *   dialog (dialog.ts) says why and who keeps the profile out, from the
- *   `refusal` the route answers with, and offers what may be done: "Activate
- *   anyway" while forcing is allowed, "Release and switch" when another
- *   profile is forced, else where the forcing setting lives.
+ *   `refusal` the route answers with, and offers the applicable retry:
+ *   force, release, or both. Each retry retains the consent already given.
  * - `release(done)` ends a forced profile.
  * - `refreshProfile(id, done)` re-reads what Meridian can about the profile
  *   now (`POST /profiles/:id/refresh`: login, usage, model list, and where
@@ -28,8 +27,8 @@ var meridianProfileActions = (function () {
   }
   function refreshHeader() { if (window.meridianHeaderRefresh) window.meridianHeaderRefresh(); }
 
-  async function activate(id, done, extra) {
-    var r = await post('/profiles/active', Object.assign({ profile: id }, extra || {}));
+  async function activate(id, done, consent = {}) {
+    var r = await post('/profiles/active', Object.assign({ profile: id }, consent));
     if (r.ok && r.data && r.data.success) {
       if (r.data.forced) meridianDialog.toast(id + ' is forced active until ' + new Date(r.data.forced.until).toLocaleTimeString(), 'ok');
       refreshHeader();
@@ -44,23 +43,30 @@ var meridianProfileActions = (function () {
     }
     var actions = [{ label: 'Close', value: null }];
     var link = null;
-    if (refusal.forceAllowed) actions.push({ label: 'Activate anyway', value: 'force', kind: 'danger' });
-    else if (refusal.kind === 'forced_elsewhere') actions.push({ label: 'Release and switch', value: 'release', kind: 'primary' });
-    else if (refusal.forceable) link = { href: '/settings#routing-force', text: 'Open Settings, Routing' };
+    var forced = refusal.forced;
+    if (refusal.kind === 'forced_elsewhere' && refusal.forceAllowed && forced) {
+      if (!consent.force || !consent.releaseForce) actions.push({
+        label: 'Release ' + forced.profile + ' and activate anyway', value: { force: true, releaseForce: true }, kind: 'danger'
+      });
+    } else if (refusal.forceAllowed) {
+      if (!consent.force) actions.push({ label: 'Activate anyway', value: { force: true }, kind: 'danger' });
+    } else if (refusal.kind === 'forced_elsewhere') {
+      if (!consent.releaseForce) actions.push({ label: 'Release and switch', value: { releaseForce: true }, kind: 'primary' });
+    } else if (refusal.forceable) {
+      link = { href: '/settings#routing-force', text: 'Open Settings, Routing' };
+    }
     var choice = await meridianDialog.show({
       title: 'Can\\u2019t activate ' + id,
       tone: 'warn',
       message: refusal.reason,
-      facts: [['Kept out by', refusal.by]].concat(refusal.forced ? [['Forced until', new Date(refusal.forced.until).toLocaleString()]] : []),
+      facts: [['Kept out by', refusal.by]].concat(forced ? [['Forced profile', forced.profile + ' until ' + new Date(forced.until).toLocaleString()]] : []),
       note: refusal.forceNote,
       link: link,
       actions: actions,
       cancelValue: null,
       focus: 0
     });
-    if (choice === 'force') return activate(id, done, { force: true });
-    if (choice === 'release') return activate(id, done, { releaseForce: true });
-    return false;
+    return choice ? activate(id, done, Object.assign({}, consent, choice)) : false;
   }
 
   async function release(done) {
