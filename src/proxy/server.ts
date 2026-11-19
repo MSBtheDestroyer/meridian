@@ -213,7 +213,7 @@ import { organizationNames, organizationNeedsRefresh, organizationRecordCurrent,
 import { findDuplicateProfiles, type IdentifiedProfile } from "./duplicateProfiles"
 import { ProfileFactsRefresh } from "./profileFactsRefresh"
 import { describeActivationRefusal, forcedProfileFor, liveForcedProfile, parseRoutingManagedReasons, withoutForcedProfile, type ActivationRefusal, type ActivationRefusalKind, type ForcedProfile } from "./forcedProfile"
-import { UsageRefreshGate, openedWindowTypes } from "./usageRefresh"
+import { UsageRefreshGate, claudeRefreshNote, openedWindowTypes } from "./usageRefresh"
 import {
   getRoutingMode,
   classifyRouteKind,
@@ -12202,7 +12202,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       return c.json({
         profile: seat.id,
         refreshed,
-        note: refreshed ? usageRefreshedNote(entry!.fetchedAt) : "ChatGPT did not answer with new figures; the last reading stays.",
+        note: refreshed ? "Usage re-read just now." : "ChatGPT did not answer with new figures; the last reading stays.",
         usage: entry,
       })
     }
@@ -12229,13 +12229,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return c.json({
       profile: requested,
       refreshed: fresh,
-      note: fresh
-        ? usageRefreshedNote(result.snapshot!.fetchedAt)
-        : result.error === "rate_limited"
-          ? "Anthropic is rate limiting usage reads for this account; the last reading stays until the cooldown ends."
-          : result.error === "no_token"
-            ? "No usable login to read usage with; sign this profile in again."
-            : "Anthropic did not answer with new figures; the last reading stays.",
+      note: claudeRefreshNote({ fresh, error: result.error, failureReason: result.failure?.reason ?? null }),
       usage: { ...toUsageEntry(result), spent: spentProfiles.get(requested) ?? null },
     })
   })
@@ -12247,9 +12241,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       retryAfterMs,
     }), { status: 429, headers: { "Content-Type": "application/json", "Retry-After": String(seconds) } })
   }
-  function usageRefreshedNote(fetchedAt: number | null): string {
-    return fetchedAt ? "Usage re-read just now." : "Usage re-read."
-  }
+
 
   // A claude.ai model-selector reading of one Claude profile's account, from
   // something holding that account's claude.ai session (cvpAccess.ts): the

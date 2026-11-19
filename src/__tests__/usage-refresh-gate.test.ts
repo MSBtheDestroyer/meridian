@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { USAGE_REFRESH_MIN_INTERVAL_MS, UsageRefreshGate, openedWindowTypes } from "../proxy/usageRefresh"
+import { USAGE_REFRESH_MIN_INTERVAL_MS, UsageRefreshGate, claudeRefreshNote, openedWindowTypes } from "../proxy/usageRefresh"
 
 describe("UsageRefreshGate", () => {
   it("lets one refresh per key through per interval", () => {
@@ -31,5 +31,25 @@ describe("openedWindowTypes", () => {
       { type: "seven_day_opus", utilization: null },
       { type: "seven_day_sonnet", utilization: 0.99 },
     ])).toEqual(["five_hour", "seven_day_sonnet"])
+  })
+})
+
+describe("claudeRefreshNote", () => {
+  it("names the 429 cooldown when a stale reading stood in for the read", () => {
+    // A rate-limited read inside the stale window answers error null with the
+    // old snapshot; only the failure record says why.
+    expect(claudeRefreshNote({ fresh: false, error: null, failureReason: "rate_limited" })).toContain("rate limiting")
+  })
+
+  it("asks for a login only when the token is missing", () => {
+    expect(claudeRefreshNote({ fresh: false, error: "no_token", failureReason: "no_token" })).toContain("sign this profile in")
+  })
+
+  it("says the figures are new when they are", () => {
+    expect(claudeRefreshNote({ fresh: true, error: null, failureReason: null })).toBe("Usage re-read just now.")
+  })
+
+  it("falls back to the last reading for any other failure", () => {
+    expect(claudeRefreshNote({ fresh: false, error: null, failureReason: "upstream_error" })).toContain("last reading stays")
   })
 })
