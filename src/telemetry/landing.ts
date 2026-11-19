@@ -21,6 +21,9 @@ import { domPatchJs } from "./domPatch"
 import { profileCardStatusCss, profileCardStatusJs } from "./profileCardStatus"
 import { ICON_REFRESH_SVG, profileActionsCss, profileActionsJs } from "./profileActions"
 import { textSelectionJs } from "./textSelection"
+import { profileTableCss, profileTableJs } from "./profileTable"
+import { profileTableFactsJs } from "./profileTableFacts"
+import { profileTableRoutingJs } from "./profileTableRouting"
 
 export const landingHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -114,6 +117,7 @@ export const landingHtml = `<!DOCTYPE html>
   ${profileLoginStatesCss}
   ${profileCardStatusCss}
   ${profileActionsCss}
+  ${profileTableCss}
   /* Refresh: a small control at the end of the card's name row. The card
      itself is the switch button, so the click handler lets it opt out. */
   .profile-refresh {
@@ -446,8 +450,12 @@ ${domPatchJs}
 ${profileCardStatusJs}
 ${profileActionsJs}
 ${textSelectionJs}
+${profileTableJs("home")}
+${profileTableFactsJs}
+${profileTableRoutingJs}
 
 var providersPresent=[];
+var lastRouting=null;
 // How many cards the login-state chips count; below two they are not drawn.
 var loginTotal=0;
 
@@ -462,6 +470,7 @@ function cardShown(group,state,updating){
 // page, so a drag still saves their place in the order. A heading shows while
 // any card of its provider does.
 function applyProviderFilter(){
+  if(meridianProfileTable.isTable()&&lastData){render.apply(null,lastData);return}
   var root=document.getElementById('content');
   var cards=root.querySelectorAll('.profile-card[data-group]');
   var groupShown={};var shown=0;
@@ -612,7 +621,8 @@ function profileSection(q,s,pl,h){
     var quota=quotaByProfile[p.id]||{};
     return computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,provider:p.entry&&p.entry.provider}).fraction;
   }
-  profs=sortProfilesForView(profs,viewSort,spentOf);
+  var tableMode=meridianProfileTable.isTable();
+  if(!tableMode)profs=sortProfilesForView(profs,viewSort,spentOf);
   // One grid, a group per provider. Grouping keeps the order each card
   // arrived in, so the view sort above applies within every group.
   var groups=meridianProviders.group(profs,function(p){return meridianProviders.providerOf(p.entry||p)});
@@ -633,6 +643,7 @@ function profileSection(q,s,pl,h){
   for(var g=0;g<slots.length;g++)if(cardShown(slots[g].provider,loginStates[g],updatingOf(slots[g].item))){groupShown[slots[g].provider]=true;anyCardShown=true}
   var reorderable=multi&&!meridianReorder.envPinned()&&viewSort==='configured';
   var cards='';
+  var tableRows=[];
   var shown=[];
   var pos=0;
   for(var i=0;i<slots.length;i++){
@@ -640,7 +651,7 @@ function profileSection(q,s,pl,h){
     var update=updateOf(slot.item);
     var updating=!!(update&&update.state==='updating');
     var cardHidden=!cardShown(slot.provider,loginStates[i],updating);
-    if(grouped&&slot.place===0)cards+=meridianProviders.headingHtml(slot.group,!groupShown[slot.provider]);
+    if(!tableMode&&grouped&&slot.place===0)cards+=meridianProviders.headingHtml(slot.group,!groupShown[slot.provider]);
     var p=slot.item;var cost=profileCost(byProfile,p);
     var chat=isChatGptProfile(p.entry);
     var quota=quotaByProfile[p.id]||{};
@@ -648,6 +659,40 @@ function profileSection(q,s,pl,h){
     var spend=computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,provider:p.entry&&p.entry.provider});
     if(!p.configured&&wins.length===0&&!cost)continue;
     shown.push(p);
+    var isPriority=pl&&pl.routing==='priority';
+    var follow=pl&&pl.follow;
+    // A ChatGPT seat has an active pointer of its own that neither priority
+    // routing nor follow mode takes over, so it is switchable in every mode.
+    var switchable=multi&&p.configured&&!p.isActive&&(chat||(!isPriority&&!follow));
+    var showsActive=p.isActive&&!(isPriority&&!chat);
+    var credits=chat?codexCreditsView(quota.credits,quota):null;
+    var resets=chat?null:freeResetView(quota.bankedResets,Date.now(),quota);
+    var sp=spentByProfile[p.id];
+    if(tableMode){
+      var entry=p.entry||p;
+      var exhausted=(pl?.exhausted||[]).find(function(e){return e.id===p.id});
+      var spentLabel=sp?'Out of '+(sp.diagnosis?.bucket?winLabel(sp.diagnosis.bucket):'its limit')
+        :exhausted?(exhausted.reason==='billing_error'?'Subscription refused':exhausted.reason==='requires_reauth'?'Token refused':'Exhausted')
+        :spend.reason==='usage'?'Spent':null;
+      var spentDetail=sp?[(sp.diagnosis?.rationale||''),sp.until?'Back '+resetIn(sp.until):'','Usage is the last successful read'].filter(Boolean).join(' · ')
+        :exhausted?.until&&exhausted.reason!=='billing_error'?'Retry '+resetIn(exhausted.until):null;
+      var routingDetail=meridianTableRouting(entry,quota,lastRouting);
+      var freeRoute=chat?profileFacts(entry).find(function(f){return f.label==='Routing'}):null;
+      if(freeRoute)routingDetail=[routingDetail,freeRoute.value].filter(Boolean).join('; ');
+      var name=p.label||p.id;
+      var cells=meridianTableFacts({profile:entry,quota:quota,name:name,provider:slot.provider,
+        login:p.configured?loginStates[i]:h?.auth?.loggedIn?'authenticated':null,active:showsActive,forced:entry.forced,
+        resetView:resets,spentLabel:spentLabel,spentDetail:spentDetail,routingDetail:routingDetail});
+      if(p.configured)cells.name.html='<a href="'+esc(profileHref(p.id))+'">'+esc(name)+'</a>';
+      if(cost)cells.cost={value:cost.estimatedUsd,html:esc(usd(cost.estimatedUsd))+'<span class="profile-table-note">'+cost.requests+' requests · 24h</span>'};
+      if(credits)cells.credits={value:quota.credits?.balance??credits.value,html:esc(credits.value)+'<span class="profile-table-note">'
+        +esc(credits.serving?'Serving on credits':credits.policy||credits.note)+'</span>'};
+      if(chat&&typeof entry.resets?.available==='number')cells.chatgptReset={value:entry.resets.available,html:esc(formatResets(entry.resets,Date.now()))};
+      tableRows.push({id:p.id,hidden:cardHidden,cells:cells,
+        actionsHtml:(switchable?'<button type="button" data-table-activate="'+esc(p.id)+'" aria-label="Activate '+esc(name)+'">Activate</button>':'')+refreshButton(p),
+        detailHtml:refreshOutcome(p.id)+meridianCardStatus.updateHtml(update)});
+      continue;
+    }
     var rows='';
     for(var j=0;j<wins.length;j++){
       var w=wins[j];var pct=Math.round(w.utilization*100);
@@ -676,23 +721,16 @@ function profileSection(q,s,pl,h){
       rows='<div class="no-usage">'+(gap?'no reading \u2014 '+esc(gap):'no usage data yet')+'</div>';
     }
     // The same facts as the /profiles card's credits block, from the same view.
-    var credits=chat?codexCreditsView(quota.credits,quota):null;
     if(credits)rows+='<div class="usage-row credits-row" title="'+esc(credits.note)+'"><span class="w-label">credits</span>'
       +'<span class="w-credits'+(credits.serving?' serving':'')+'">'+esc(credits.value)+'</span>'
       +'<span class="w-credits-note">'+esc(credits.serving?'serving on credits':credits.policy||credits.note)+'</span></div>'
       +(credits.pace?'<div class="usage-row credits-row" title="'+esc(credits.pace.title)+'">'
         +'<span class="w-credits-note credits-pace">'+esc(credits.pace.text)+'</span></div>':'');
     // Redeeming one is deliberate and lives on /profiles; the card only counts them.
-    if(!chat)rows+=freeResetRows(freeResetView(quota.bankedResets,Date.now(),quota));
-    var isPriority=pl&&pl.routing==='priority';
+    if(!chat)rows+=freeResetRows(resets);
     // active+priority keeps the active profile meaningful - switching it is how
     // you move traffic, so the card stays clickable, unlike in pure priority.
     var isActivePriority=pl&&pl.routing==='active+priority';
-    var follow=pl&&pl.follow;
-    // A ChatGPT seat has an active pointer of its own that neither priority
-    // routing nor follow mode takes over, so it is switchable in every mode.
-    var switchable=multi&&p.configured&&!p.isActive&&(chat||(!isPriority&&!follow));
-    var showsActive=p.isActive&&!(isPriority&&!chat);
     var badge='';
     var cardStrip=showsActive?'<div class="card-strip">Active</div>':switchable?'<div class="card-strip strip-hint">Click to activate</div>':'';
     if(follow&&p.isActive&&!chat)badge+=' <span class="pool-chip">'+(follow.activeProfile?'following '+esc(follow.url):'local — '+esc(follow.url)+' unreachable')+(follow.stale?' · stale':'')+'</span>';
@@ -724,7 +762,6 @@ function profileSection(q,s,pl,h){
     if(credits&&credits.serving)badge+=' <span class="pool-chip on-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
     var rsv=quota.reserve;
     if(rsv&&rsv.held)badge+=' <span class="pool-chip reserved" title="'+esc((rsv.reason||'over its allowance')+(rsv.opensAt!=null&&rsv.opensAt>Date.now()?' · opens '+resetIn(rsv.opensAt):''))+'">held · reserve</span>';
-    var sp=spentByProfile[p.id];
     if(sp){\n      var spBucket=(sp.diagnosis&&sp.diagnosis.bucket)?winLabel(sp.diagnosis.bucket):'its limit';
       var spGuess=(sp.diagnosis&&sp.diagnosis.reported)?'':' (guess)';
       var spWhy=(sp.diagnosis&&sp.diagnosis.rationale)||'';
@@ -767,13 +804,14 @@ function profileSection(q,s,pl,h){
       +meridianCardStatus.updateHtml(update)+rows+'</div>';
     if(p.configured)pos++;
   }
-  if(!cards)return {html:'',shown:shown};
-  return {shown:shown,html:'<div class="section"><div class="section-head"><div class="section-title">'+(profs.length===1?'Account':'Accounts')+'</div>'+sortTabs(profs.length)+'</div>'
+  if(!cards&&!tableRows.length)return {html:'',shown:shown};
+  return {shown:shown,html:'<div class="section" data-key="accounts"><div class="section-head"><div class="section-title">'+(profs.length===1?'Account':'Accounts')+'</div>'+(!tableMode?sortTabs(profs.length):'')+'</div>'
+    +meridianProfileTable.toolbarHtml()
     +'<div class="chip-row">'+meridianProviders.chipsHtml(groups)+meridianLoginStates.chipsHtml(meridianLoginStates.counts(loginStates),loginTotal)+'</div>'
-    +(multi?meridianReorder.noteHtml(reorderable,configured.some(isChatGptProfile),grouped):'')
+    +(multi&&!tableMode?meridianReorder.noteHtml(reorderable,configured.some(isChatGptProfile),grouped):'')
     +(grouped?meridianProviders.noneShownHtml(meridianProviders.anyShown(providersPresent)):'')
     +(loginTotal>1?meridianLoginStates.noneShownHtml(!meridianProviders.anyShown(providersPresent)||anyCardShown):'')
-    +'<div class="profile-grid">'+cards+'</div></div>'};
+    +(tableMode?(anyCardShown?meridianProfileTable.tableHtml(tableRows):''):'<div class="profile-grid">'+cards+'</div>')+'</div>'};
 }
 
 function strip(items){
@@ -795,6 +833,7 @@ async function refresh(){
       fetch('/settings/api/routing').then(r=>r.json()).catch(function(){return null})
     ]);
     if(infoPopOpen())return;
+    if(routing&&!routing.error)lastRouting=routing;
     meridianReorder.adopt(routing);
     render(health,stats,quota,profiles);
   }catch(e){if(!infoPopOpen())document.getElementById('content').innerHTML='<div style="color:var(--red);padding:40px;text-align:center">Could not connect</div>'}
@@ -875,6 +914,8 @@ document.getElementById('content').addEventListener('click',function(e){
   if(onHandle(e))return;
   var refreshBtn=e.target.closest('.profile-refresh');
   if(refreshBtn){if(!refreshBtn.disabled)refreshProfile(refreshBtn.dataset.refresh);return}
+  var activate=e.target.closest('[data-table-activate]');
+  if(activate){switchProfile(activate.dataset.tableActivate);return}
   // The card is itself the switch button, so the icon inside one has to opt
   // out of it or reading an account would move all traffic to that account.
   if(e.target.closest('.prof-info, .spent-tip'))return;
@@ -896,10 +937,11 @@ document.getElementById('content').addEventListener('keydown',function(e){
   if(card&&card.dataset.profile){e.preventDefault();switchProfile(card.dataset.profile)}
 });
 viewSort=readStoredSort()||viewSort;
+meridianProfileTable.init(document.getElementById('content'),function(){if(lastData)render.apply(null,lastData)});
 meridianReorder.init({onSaved:refresh});
 refresh();
 function pollRefresh(){
-  if(document.visibilityState!=='visible'||meridianReorder.dragging()||infoPopOpen()||meridianProfileActions.busy())return;
+  if(document.visibilityState!=='visible'||meridianReorder.dragging()||meridianProfileTable.dragging()||infoPopOpen()||meridianProfileActions.busy())return;
   refresh();
 }
 setInterval(pollRefresh,10000);

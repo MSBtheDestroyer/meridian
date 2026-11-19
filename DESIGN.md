@@ -259,6 +259,8 @@ account card on the home page (or the Profiles page). The header chip only
 *shows* the active profile. After any state mutation, call
 `window.meridianHeaderRefresh()` so the chip updates immediately.
 
+**Layout: profile table.** The Tiles / Table control and column settings stay in the page flow. The table's own labeled region scrolls horizontally when columns do not fit; the page scrolls vertically as before. The home preset is for comparing active accounts and usage; Profiles starts with more account facts and management controls.
+
 ## 5. Typography & numbers
 
 - **UI stack:** `-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif`
@@ -291,6 +293,7 @@ account card on the home page (or the Profiles page). The header chip only
 - **Tabs:** muted text, active = accent text + 2px accent underline.
 - **Tables:** inside a `--surface` card; uppercase micro-label headers on
   `--bg`; row hover = faint blue tint.
+- **Profile table:** Tiles stays the default. Table shows one row per account, prioritizing identity, activation and login, then quota and reset times. Sort by a column header or set the precedence and direction of multiple columns under Columns. Drag columns or use their move buttons, hide or show fields, and reset to the page preset. Each page remembers its view, visible columns, column order and sort separately in the browser. Sorting never changes routing order. Missing readings do not look like zero and sort last. Full and Fable resets have separate columns. An always-visible Actions column reuses the tile actions and confirmations.
 - **Inline code chip:** mono, `--surface`/`--bg` fill, 1px border, radius
   4–5px, **violet text** (`--accent2`).
 - **Empty states:** calm centered `--muted` text in a card — never red.

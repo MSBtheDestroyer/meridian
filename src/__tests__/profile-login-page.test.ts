@@ -113,7 +113,8 @@ function renderCards(profiles: Array<Record<string, unknown>>, quota: Array<Reco
   const isUnusable = profilePageHtml.match(/^function isUnusable\(p\)\{.*\}$/m)?.[0]
   if (!isUnusable) throw new Error("Missing rendered page function isUnusable")
   const none = () => ""
-  runInNewContext([profileFactsJs, profileProvidersJs, profileLoginStatesJs, profileCardStatusJs, isUnusable, pageFunction("render"), "render(data, quota);"].join("\n"), {
+  const markup = ["renderProfileEditButtons", "renderProfileConfirmation", "render"].map(pageFunction)
+  runInNewContext([profileFactsJs, profileProvidersJs, profileLoginStatesJs, profileCardStatusJs, isUnusable, ...markup, "render(data, quota);"].join("\n"), {
     data: { profiles }, quota: { profiles: quota },
     document: { getElementById: () => content },
     meridianReorder: { sortProfiles: (list: unknown[]) => list, focusAnchor: none, envPinned: () => true,
@@ -123,10 +124,11 @@ function renderCards(profiles: Array<Record<string, unknown>>, quota: Array<Reco
     loginHrefFor: none, renderUsageSection: none, applyLoginHrefs: none, ensureLoginLinks: none,
     meridianPatch: { html: (target: { innerHTML: string }, markup: string) => { target.innerHTML = markup } },
     loginPanelOpen: () => false, lastProfilesRequestedAt: null, updatePollTimer: null,
-    afterRender: none, loginSlot: () => null, activeLogin: null, editingProfile: null, renameError: null,
+    afterRender: none, loginSlot: () => null, activeLogin: null, activeChatGptRelogin: null, editingProfile: null, renameError: null,
     removingProfile: null, removeError: null, renderProviderChips: none, renderLoginChips: none, providersPresent: [],
     chatGptOwnerInfo: null, renderAccessNote: none, renderLoginRows: none, PROFILE_INPUT_ATTRS: "",
     meridianProfileActions: { refreshing: () => false, outcomeHtml: none },
+    meridianProfileTable: { isTable: () => false },
     ICON_PENCIL: "", ICON_CHECK: "", ICON_X: "", ICON_TRASH: "", ICON_REFRESH: "",
   })
   const cards = content.innerHTML.split(/<div class="profile-card(?=[ "])/).slice(1)
