@@ -12294,55 +12294,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return claim.ok ? read() : Promise.resolve(tooSoonPart(label, claim.retryAfterMs))
   }
 
-  app.post("/profiles/:id/refresh", async (c) => {
-    if (!isSameOriginRequest(c.req.raw)) {
-      return c.json({ code: "forbidden_origin", error: "Cross-origin profile refreshes are not allowed" }, 403)
-    }
-    const requested = c.req.param("id")
-    const seat = chatGptProfiles?.resolve(requested)
-    if (seat && chatGptProfiles) {
-      // A seat's login is what its usage read just found of its token.
-      const usage = await gated("chatgpt", "Usage", async () => {
-        const read = await readSeatUsageNow(seat.id)
-        return { state: read.state, note: read.note }
-      })
-      const listed = chatGptProfiles.listEntries().find(entry => entry.id === seat.id)
-      const login = listed
-        ? seatLoginPart({ loggedIn: listed.loggedIn, tokenState: listed.tokenState, email: listed.email })
-        : { state: "failed" as const, note: "Meridian no longer lists this seat." }
-      return c.json({ profile: seat.id, parts: { login, usage } })
-    }
-    const target = claudeRefreshTarget(requested)
-    if (target instanceof Response) return target
-    const subscription = target.account.type === "claude-max"
-    let login: RefreshPart
-    let needsLogin = false
-    let accountMoved = false
-    if (target.account.type === "api") {
-      login = { state: "unavailable", note: "This profile uses an API key; there is no login to re-read." }
-    } else {
-      login = await gated(`login:${target.id}`, "The login", async () => {
-        const rechecked = await recheckClaudeLogin(target)
-        needsLogin = rechecked.needsLogin
-        accountMoved = rechecked.accountChanged
-        return rechecked.part
-      })
-    }
-    const [usage, models] = await Promise.all([
-      !subscription
-        ? Promise.resolve<RefreshPart>({ state: "unavailable", note: "This profile signs in with an API key or a fixed token; Meridian reads usage only for a subscription login." })
-        : needsLogin ? Promise.resolve(SKIPPED_WITHOUT_LOGIN)
-        : gated(target.id, "Usage", async () => {
-            const read = await readClaudeUsageNow(target)
-            return { state: read.state, note: read.note }
-          }),
-      needsLogin ? Promise.resolve(SKIPPED_WITHOUT_LOGIN) : gated(`models:${target.id}`, "The model list", () => relistClaudeModels(target.account)),
-    ])
-    const cvp = subscription ? cvpPart({ lastClaudeAiReadingAt: lastClaudeAiReadingAt(target.id), forgotten: accountMoved }, Date.now()) : undefined
-    claudeLog("profile.refreshed", { profile: target.id, login: login.state, usage: usage.state, models: models.state })
-    return c.json({ profile: target.id, parts: { login, usage, models, ...(cvp ? { cvp } : {}) } })
-  })
-
   app.post("/profiles/:id/usage/refresh", async (c) => {
     if (!isSameOriginRequest(c.req.raw)) {
       return c.json({ code: "forbidden_origin", error: "Cross-origin usage refreshes are not allowed" }, 403)
@@ -12799,6 +12750,58 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const chatGptSeat = chatGptProfiles?.resolve(body.profile)
     if (!chatGptSeat) return c.json({ error: `No ChatGPT seat is called "${body.profile}".`, code: "unknown_profile" }, 404)
     return removeChatGptSeat(c, chatGptSeat)
+  })
+
+  // Registered after the literal /profiles/chatgpt/* routes: Hono answers
+  // with the first match, so before them "chatgpt" would be taken for a
+  // profile id and seat renewal (POST /profiles/chatgpt/refresh) would 404.
+  app.post("/profiles/:id/refresh", async (c) => {
+    if (!isSameOriginRequest(c.req.raw)) {
+      return c.json({ code: "forbidden_origin", error: "Cross-origin profile refreshes are not allowed" }, 403)
+    }
+    const requested = c.req.param("id")
+    const seat = chatGptProfiles?.resolve(requested)
+    if (seat && chatGptProfiles) {
+      // A seat's login is what its usage read just found of its token.
+      const usage = await gated("chatgpt", "Usage", async () => {
+        const read = await readSeatUsageNow(seat.id)
+        return { state: read.state, note: read.note }
+      })
+      const listed = chatGptProfiles.listEntries().find(entry => entry.id === seat.id)
+      const login = listed
+        ? seatLoginPart({ loggedIn: listed.loggedIn, tokenState: listed.tokenState, email: listed.email })
+        : { state: "failed" as const, note: "Meridian no longer lists this seat." }
+      return c.json({ profile: seat.id, parts: { login, usage } })
+    }
+    const target = claudeRefreshTarget(requested)
+    if (target instanceof Response) return target
+    const subscription = target.account.type === "claude-max"
+    let login: RefreshPart
+    let needsLogin = false
+    let accountMoved = false
+    if (target.account.type === "api") {
+      login = { state: "unavailable", note: "This profile uses an API key; there is no login to re-read." }
+    } else {
+      login = await gated(`login:${target.id}`, "The login", async () => {
+        const rechecked = await recheckClaudeLogin(target)
+        needsLogin = rechecked.needsLogin
+        accountMoved = rechecked.accountChanged
+        return rechecked.part
+      })
+    }
+    const [usage, models] = await Promise.all([
+      !subscription
+        ? Promise.resolve<RefreshPart>({ state: "unavailable", note: "This profile signs in with an API key or a fixed token; Meridian reads usage only for a subscription login." })
+        : needsLogin ? Promise.resolve(SKIPPED_WITHOUT_LOGIN)
+        : gated(target.id, "Usage", async () => {
+            const read = await readClaudeUsageNow(target)
+            return { state: read.state, note: read.note }
+          }),
+      needsLogin ? Promise.resolve(SKIPPED_WITHOUT_LOGIN) : gated(`models:${target.id}`, "The model list", () => relistClaudeModels(target.account)),
+    ])
+    const cvp = subscription ? cvpPart({ lastClaudeAiReadingAt: lastClaudeAiReadingAt(target.id), forgotten: accountMoved }, Date.now()) : undefined
+    claudeLog("profile.refreshed", { profile: target.id, login: login.state, usage: usage.state, models: models.state })
+    return c.json({ profile: target.id, parts: { login, usage, models, ...(cvp ? { cvp } : {}) } })
   })
 
   // A Claude profile is removed the way `meridian profile remove` removes it
