@@ -559,7 +559,7 @@ function profileCost(byProfile,p){
   return sum;
 }
 
-function infoIcon(entry,type){
+function infoFacts(entry){
   var facts=profileFacts(entry);
   var rows='';
   for(var i=0;i<facts.length;i++){
@@ -571,11 +571,15 @@ function infoIcon(entry,type){
     rows+='<span class="prof-pop-label">'+esc(f.label)+'</span>'
       +'<span class="prof-pop-value'+tone+'"'+title+'>'+esc(f.value)+cached+explanation+'</span>';
   }
+  return rows;
+}
+
+function infoIcon(entry,type){
   return '<span class="prof-info">'
     +'<span class="prof-info-dot" tabindex="0" role="button" aria-label="Details for '+esc(entry.id)+'">i</span>'
     +'<span class="prof-pop" role="tooltip">'
     +'<span class="prof-pop-type">'+esc(type||'claude-max')+'</span>'
-    +'<span class="prof-pop-grid">'+rows+'</span>'
+    +'<span class="prof-pop-grid">'+infoFacts(entry)+'</span>'
     +'<a class="prof-pop-link" href="'+esc(profileHref(entry.id))+'">Open in Profiles \\u2192</a>'
     +'</span></span>';
 }
@@ -685,12 +689,19 @@ function profileSection(q,s,pl,h){
         resetView:resets,spentLabel:spentLabel,spentDetail:spentDetail,routingDetail:routingDetail});
       if(p.configured)cells.name.html='<a href="'+esc(profileHref(p.id))+'">'+esc(name)+'</a>';
       if(cost)cells.cost={value:cost.estimatedUsd,html:esc(usd(cost.estimatedUsd))+'<span class="profile-table-note">'+cost.requests+' requests · 24h</span>'};
-      if(credits)cells.credits={value:quota.credits?.balance??credits.value,html:esc(credits.value)+'<span class="profile-table-note">'
+      if(credits)cells.credits={value:quota.credits?.unlimited?null:quota.credits?.balance??null,html:esc(credits.value)+'<span class="profile-table-note">'
         +esc(credits.serving?'Serving on credits':credits.policy||credits.note)+'</span>'};
       if(chat&&typeof entry.resets?.available==='number')cells.chatgptReset={value:entry.resets.available,html:esc(formatResets(entry.resets,Date.now()))};
+      var detailsId='table-account-'+p.id;
+      var details=document.getElementById(detailsId);
+      var otherWindows=wins.filter(function(w){return w.type!=='five_hour'&&w.type!=='seven_day'}).map(function(w){
+        return '<div>'+esc(winLabel(w.type))+' · '+Math.round(w.utilization*100)+'%'+(w.resetsAt?' · '+esc(resetIn(w.resetsAt)):'')+'</div>';
+      }).join('');
       tableRows.push({id:p.id,hidden:cardHidden,cells:cells,
         actionsHtml:(switchable?'<button type="button" data-table-activate="'+esc(p.id)+'" aria-label="Activate '+esc(name)+'">Activate</button>':'')+refreshButton(p),
-        detailHtml:refreshOutcome(p.id)+meridianCardStatus.updateHtml(update)});
+        detailHtml:refreshOutcome(p.id)+meridianCardStatus.updateHtml(update)
+          +(p.entry||otherWindows?'<details id="'+esc(detailsId)+'"'+(details?.open?' open':'')+'><summary>Account details</summary>'
+            +(p.entry?'<span class="prof-pop-grid">'+infoFacts(p.entry)+'</span>':'')+otherWindows+'</details>':'')});
       continue;
     }
     var rows='';
@@ -832,11 +843,11 @@ async function refresh(){
       fetch('/profiles/list').then(r=>r.json()).catch(function(){return null}),
       fetch('/settings/api/routing').then(r=>r.json()).catch(function(){return null})
     ]);
-    if(infoPopOpen())return;
+    if(infoPopOpen()||meridianProfileTable.dragging())return;
     if(routing&&!routing.error)lastRouting=routing;
     meridianReorder.adopt(routing);
     render(health,stats,quota,profiles);
-  }catch(e){if(!infoPopOpen())document.getElementById('content').innerHTML='<div style="color:var(--red);padding:40px;text-align:center">Could not connect</div>'}
+  }catch(e){if(!infoPopOpen()&&!meridianProfileTable.dragging())document.getElementById('content').innerHTML='<div style="color:var(--red);padding:40px;text-align:center">Could not connect</div>'}
 }
 
 function tokens(v){if(v==null)return '—';if(v>=1e6)return (v/1e6).toFixed(1)+'M';if(v>=1e3)return (v/1e3).toFixed(1)+'k';return String(v)}

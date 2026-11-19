@@ -28,7 +28,7 @@ const presets = {
 export function profileTableJs(page: Page): string {
   return `
 var meridianProfileTable = (function () {
-  const columns = new Map(${JSON.stringify(catalog)});
+  const columns = new Map(${JSON.stringify(page === "profiles" ? catalog.filter(([id]) => id !== "cost") : catalog)});
   const ids = Array.from(columns.keys());
   const preset = ${JSON.stringify(presets[page])};
   const storageKey = ${JSON.stringify(`meridian.profileTable.${page}`)};

@@ -40,6 +40,8 @@ export const profileTableCss = `
 .profile-table-actions{min-inline-size:9em}
 .profile-table-actions>*{max-inline-size:100%}
 .profile-table-detail:not(:empty){min-inline-size:min(16rem,66vw);margin-block-start:8px;white-space:normal;overflow-wrap:anywhere}
+.profile-table-detail summary{color:var(--accent);cursor:pointer}
+.profile-table-detail summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .profile-table .profile-table-empty td{text-align:center;color:var(--muted)}
 .profile-table tbody:has(>tr[data-profile-row]:not([hidden]))>.profile-table-empty{display:none}
 .profile-table-sr{position:absolute;inline-size:1px;block-size:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}

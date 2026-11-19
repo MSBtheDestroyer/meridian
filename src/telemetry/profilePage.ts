@@ -1210,7 +1210,7 @@ function renderUsageSection(profileQuota, p) {
 // block offers its own redeem only while the view names a grant of that kind,
 // and the click only acts after a confirmation naming the kind and the grant.
 // A redeem's outcome stays in the block of the kind it was for.
-function renderFreeResets(resets, p, actionsOnly) {
+function renderFreeResets(resets, p) {
   var outcome = resetOutcomes[p.id];
   if (outcome && Date.now() - outcome.at > 120000) outcome = null;
   function said(label) {
@@ -1228,7 +1228,6 @@ function renderFreeResets(resets, p, actionsOnly) {
         + '" data-usable="' + g.usable + '" onclick="redeemFreeReset(this)"'
         + (redeemingReset ? ' disabled' : '') + '>' + esc('Redeem ' + g.shortName) + '</button>'
       : '';
-    if (actionsOnly) return button + (mine ? said(g.name) : '');
     return '<div class="usage-extra free-resets' + (g.muted ? ' held' : '') + '" title="' + attr(g.title) + '">'
       +   '<div class="usage-extra-row">'
       +     '<span class="usage-label">' + esc(g.name) + '</span>'
@@ -1373,7 +1372,7 @@ function render(data, quotaData, viewOnly) {
       cells.name = { value: p.id, html: nameLink + duplicate };
       const credits = isChatGptProfile(p) && q && codexCreditsView(q.credits, q);
       if (credits) {
-        cells.credits = { value: q.credits?.balance ?? credits.value, html: esc(credits.value) + '<span class="profile-table-note">'
+        cells.credits = { value: q.credits?.unlimited ? null : q.credits?.balance ?? null, html: esc(credits.value) + '<span class="profile-table-note">'
           + esc([credits.note, credits.policy, credits.pace && credits.pace.text].filter(Boolean).join(' · ')) + '</span>' };
       }
       if (isChatGptProfile(p) && typeof p.resets?.available === 'number') {
@@ -1381,7 +1380,6 @@ function render(data, quotaData, viewOnly) {
       }
       const activate = isActive ? '' : '<button type="button" class="switch-btn switch-to" aria-label="Activate ' + attr(p.id)
         + '" onclick="switchProfile(' + attr(JSON.stringify(p.id)) + ')">Activate</button>';
-      const resetActions = renderFreeResets(resets, p, true);
       tableRows.push({
         id: p.id, anchorId: profileAnchorElementId(p.id), cells: cells,
         actionsHtml: '<div class="profile-row-actions provider-' + attr(slot.provider) + '">' + activate
@@ -1391,7 +1389,7 @@ function render(data, quotaData, viewOnly) {
           + feedback + loginHtml
           + tableDetails('account', p.id, 'Account details', '<div class="profile-details">' + factRows(profileFacts(p)) + '</div>'
             + (p.loggedIn ? '' : renderAccessNote(p)) + renderLoginRows(p, true)
-            + (resetActions ? '<div class="profile-row-actions">' + resetActions + '</div>' : '')) + '</div>'
+            + renderUsageSection(q, p)) + '</div>'
       });
       continue;
     }

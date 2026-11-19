@@ -9,7 +9,7 @@ import { providerPageHtml } from "../telemetry/providerPage"
 // lapses. Run each page's actual poll function against a fixture document
 // instead of restating its condition.
 function pageFunction(html: string, name: string): string {
-  const source = html.match(new RegExp(`^function ${name}\\(\\)[^]*?^\\}`, "m"))?.[0]
+  const source = html.match(new RegExp(`^(?:async )?function ${name}\\(\\)[^]*?^\\}`, "m"))?.[0]
   if (!source) throw new Error(`Missing rendered page function ${name}`)
   return source
 }
@@ -66,6 +66,24 @@ test("profilePageHtml holds its poll while a free reset is being redeemed", () =
   }
   runInNewContext(`${pageFunction(profilePageHtml, "pollRefresh")}\npollRefresh();`, fixture)
   expect(fixture.refreshes).toBe(0)
+})
+
+test("an in-flight Home refresh failure does not replace the table during a column drag", async () => {
+  const health = Promise.withResolvers<Response>()
+  let dragging = false
+  const content = { innerHTML: '<div draggable="true">Name</div>' }
+  const running = runInNewContext(`${pageFunction(landingHtml, "refresh")}\nrefresh();`, {
+    infoPopOpen: () => false,
+    meridianProfileTable: { dragging: () => dragging },
+    document: { getElementById: () => content },
+    fetch: (path: string) => path === "/health" ? health.promise : Promise.resolve(Response.json({})),
+  })
+
+  dragging = true
+  health.reject(new Error("connection dropped"))
+  await running
+
+  expect(content.innerHTML).toBe('<div draggable="true">Name</div>')
 })
 
 // The refresh redraws the card itself when its read ends; a poll landing in
