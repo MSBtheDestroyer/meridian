@@ -9,10 +9,11 @@ export const profileTableCss = `
 .profile-table-sort-label{flex:1;padding-inline:4px;font-size:13px}
 .profile-table-sort-key button[data-profile-table-control^="sort-direction:"]{min-inline-size:7em}
 .profile-table-column[data-drop-target]{background:color-mix(in srgb,var(--accent) 12%,var(--surface));border-color:var(--accent)}
-.profile-table-toolbar button,.profile-table-sort{font:inherit;font-size:12px;color:var(--accent);cursor:pointer;min-block-size:32px}
-.profile-table-toolbar button{padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface2)}
+.profile-table-toolbar button,.profile-table-sort,.profile-table-actions [data-table-activate]{font:inherit;font-size:12px;color:var(--accent);cursor:pointer;min-block-size:32px}
+.profile-table-toolbar button,.profile-table-actions [data-table-activate]{padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface2)}
+.profile-table-actions [data-table-activate]{border-color:var(--accent)}
 .profile-table-toolbar button[aria-pressed=true],.profile-table-toolbar button[aria-expanded=true]{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,var(--surface2))}
-.profile-table-toolbar button:not(:disabled):hover,.profile-table-sort:hover{background:color-mix(in srgb,var(--accent) 15%,var(--surface2))}
+.profile-table-toolbar button:not(:disabled):hover,.profile-table-sort:hover,.profile-table-actions [data-table-activate]:hover{background:color-mix(in srgb,var(--accent) 15%,var(--surface2))}
 .profile-table-toolbar button:disabled{color:var(--muted);cursor:default;opacity:.55}
 .profile-table-toolbar .profile-table-column-toggle{flex:1;text-align:start;overflow-wrap:anywhere}
 .profile-table-column-toggle span{color:var(--muted);margin-inline-start:4px}
@@ -46,7 +47,7 @@ export const profileTableCss = `
 .profile-table tbody:has(>tr[data-profile-row]:not([hidden]))>.profile-table-empty{display:none}
 .profile-table-sr{position:absolute;inline-size:1px;block-size:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
 @media (pointer:coarse){
-  .profile-table-toolbar button,.profile-table-sort{min-block-size:44px;min-inline-size:44px}
+  .profile-table-toolbar button,.profile-table-sort,.profile-table-actions [data-table-activate]{min-block-size:44px;min-inline-size:44px}
   .profile-table-toolbar .profile-table-move{min-inline-size:44px}
   .profile-table-grip{display:none}
 }
