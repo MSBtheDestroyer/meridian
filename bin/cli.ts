@@ -420,16 +420,13 @@ export async function runCli(
       }
     } catch { /* non-fatal */ }
 
+    const { enableDiskProfileDiscovery, initializeConfiguredForcedActiveProfile, usesDefaultAuthContext } = await import("../src/proxy/profiles")
     // Enable disk auto-discovery when no MERIDIAN_PROFILES env var is set.
     // This lets `meridian profile add` work without restarting the server.
-    if (!profiles) {
-      const { enableDiskProfileDiscovery } = await import("../src/proxy/profiles")
-      enableDiskProfileDiscovery()
-    }
+    if (!profiles) enableDiskProfileDiscovery()
 
     // Pre-flight auth check — runs the resolved Claude binary's auth-status
     // subcommand. Independent of whether `claude` is on PATH (#478).
-    const { usesDefaultAuthContext } = await import("../src/proxy/profiles")
     if (usesDefaultAuthContext(profiles, defaultProfile)) {
       try {
         const { stdout } = await runAuthCheck()
@@ -445,6 +442,7 @@ export async function runCli(
         console.error("\x1b[33m⚠ Could not verify Claude auth status. If requests fail, run: claude login\x1b[0m")
       }
     }
+    if (profiles) initializeConfiguredForcedActiveProfile(profiles)
   }
 
   const { enableOrganizationLookup } = await import("../src/proxy/organizationName")
