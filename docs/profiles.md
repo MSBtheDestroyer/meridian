@@ -322,7 +322,9 @@ Unlike `routingExcludedProfiles`, which refuses pinned work and still allows war
 
 ### Forcing a forbidden profile
 
-Settings, Routing, **Allow forcing a forbidden profile** (off by default) lets you activate a Claude profile that a supervisor keeps out of work, through its managed exclusions, its held list or a usage reserve. The refusal dialog then offers **Activate anyway**. The profile stays active for up to five hours, or until you release it (the release link on its card, the Release button beside the setting, or switching with "Release and switch"); meanwhile the supervisor's lists still name it but do not move work or the pointer off it, and a switch to another profile is refused with `profile_forced`. Your own exclusion list and a missing login are never forced past. Turning the setting off ends a force in effect.
+Settings, Routing, **Allow forcing a forbidden profile** (off by default) lets you activate a Claude profile that a supervisor keeps out of work, through its managed exclusions, its held list or a usage reserve. The refusal dialog then offers **Activate anyway**. The profile stays active for up to five hours; meanwhile the supervisor's lists still name it but do not move work or the pointer off it. You can release it using the link on its card or the Release button beside the setting. Your own exclusion list and a missing login are never forced past. Turning the setting off ends a force in effect.
+
+A switch away from a forced profile is refused with `profile_forced`. The dialog offers **Release and switch** when it asks you only to release the current profile. If it also asks you to force the target profile, one button, **Release &lt;profile&gt; and activate anyway**, confirms both actions. If the blockers appear in separate dialogs, the page remembers what you already approved for that switch. Meridian releases only the forced profile shown in the dialog, and only if the switch succeeds.
 
 ### Refreshing a profile
 

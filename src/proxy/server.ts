@@ -30,6 +30,7 @@ import { cors } from "hono/cors"
 import { stream } from "hono/streaming"
 import { serve, createAdaptorServer } from "@hono/node-server"
 import { getConnInfo } from "@hono/node-server/conninfo"
+import { z } from "zod"
 import { socketActivationFd, parseIdleExitSeconds, isModelRequestPath } from "./socketActivation"
 import type { Server } from "node:http"
 import { hostname } from "node:os"
@@ -12011,7 +12012,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // Every refusal of `POST /profiles/active` carries `refusal`: who keeps the
   // profile out and why, in words, and whether "Allow forcing a forbidden
   // profile" can override it (forcedProfile.ts).
-  const activationRefusal = (kind: ActivationRefusalKind, profile: string, extra?: { detail?: string; seat?: boolean }): ActivationRefusal =>
+  const activationRefusal = (kind: ActivationRefusalKind, profile: string, extra?: {
+    readonly detail?: string
+    readonly seat?: boolean
+    readonly forced?: ForcedProfile | null
+    readonly targetBlocker?: ActivationRefusal
+  }): ActivationRefusal =>
     describeActivationRefusal({
       kind,
       profile,
@@ -12019,10 +12025,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       supervisorReason: kind === "managed_excluded" || kind === "held"
         ? parseRoutingManagedReasons(getSetting("routingManagedReasons"))[profile]
         : undefined,
-      forced: liveForced() ?? undefined,
       ...extra,
+      forced: (extra?.forced === undefined ? liveForced() : extra.forced) ?? undefined,
     })
 
+  const releaseForceForSchema = z.object({ profile: z.string().min(1), forcedAt: z.number() }).optional()
   app.post("/profiles/active", async (c) => {
     // A ChatGPT seat has its own pointer, which follow mode does not follow,
     // so it is decided before the Claude checks below. Hono memoizes the
@@ -12078,9 +12085,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         refusal: activationRefusal("following", typeof requested === "string" ? requested : "", { detail: error }),
       }, 409)
     }
-    let body: { profile?: string; force?: unknown; releaseForce?: unknown }
+    let body: { readonly profile?: string; readonly force?: unknown; readonly releaseForce?: unknown; readonly releaseForceFor?: unknown }
     try {
-      body = await c.req.json() as { profile?: string; force?: unknown; releaseForce?: unknown }
+      body = await c.req.json<typeof body>()
     } catch {
       return c.json({ error: "Invalid JSON in request body" }, 400)
     }
@@ -12095,68 +12102,85 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       return c.json({ error: `Unknown profile: ${body.profile}. Available: ${effective.map(p => p.id).join(", ")}` }, 400)
     }
     const requested = body.profile
-    const forced = liveForced()
-    // A forced profile stays active until released: nothing, a supervisor's
-    // switcher included, moves the pointer off it without saying so.
-    if (forced && forced.profile !== requested && body.releaseForce !== true) {
-      const refusal = activationRefusal("forced_elsewhere", requested)
-      return c.json({ error: refusal.reason, code: "profile_forced", forced, refusal }, 409)
+    const releaseTarget = releaseForceForSchema.safeParse(body.releaseForceFor)
+    if (!releaseTarget.success) {
+      return c.json({ error: "releaseForceFor must contain a non-empty profile and a finite forcedAt number" }, 400)
     }
-    const effectiveProfiles = getEffectiveProfiles(finalConfig.profiles)
-    if (canonicalRoutingExcludedProfileIds(effectiveProfiles, userRoutingExcludedProfileIds()).includes(requested)) {
-      return profileExcludedResponse(requested, { refusal: activationRefusal("excluded", requested) })
-    }
-    // What a supervisor keeps out, which the user may force past. The pointer
-    // would otherwise name a profile no work can reach: refused, so the switch
-    // is seen not to happen. A supervisor lifting a reserve on purpose writes
-    // the reserves without it first.
-    const reserveHold = claudeReserveHold(requested, usageReserves())
-    const blocker: { readonly refusal: ActivationRefusal; readonly respond: (refusal: ActivationRefusal) => Response } | null =
-      canonicalRoutingExcludedProfileIds(effectiveProfiles, managedRoutingExcludedProfileIds()).includes(requested)
-        ? { refusal: activationRefusal("managed_excluded", requested), respond: refusal => profileExcludedResponse(requested, { refusal }) }
-        : routingHeldProfileIds().includes(requested)
-          ? { refusal: activationRefusal("held", requested), respond: refusal => profileHeldResponse(requested, { refusal }) }
-          : reserveHold
-            ? (() => {
-                const error = heldMessage(requested, reserveHold)
-                return { refusal: activationRefusal("usage_reserve", requested, { detail: error }), respond: (refusal: ActivationRefusal) => c.json({ error, code: "usage_reserve", refusal }, 409) }
-              })()
-            : null
-    const forcing = blocker !== null && body.force === true
-    // A page on another site must not force an account past its supervisor.
-    if (forcing && !isSameOriginRequest(c.req.raw)) {
-      return c.json({ code: "forbidden_origin", error: "Forcing a profile requires a same-origin request" }, 403)
-    }
-    if (blocker && !(forcing && blocker.refusal.forceAllowed)) {
-      if (forcing && blocker.refusal.forceable) {
-        return c.json({
-          error: "Forcing a forbidden profile is off. Turn on Settings, Routing, \"Allow forcing a forbidden profile\" to activate it anyway.",
-          code: "force_disabled",
-          refusal: blocker.refusal,
-        }, 409)
+    const releaseForceFor = releaseTarget.data
+    const checkActivation = (): { readonly response: Response } | {
+      readonly forced: ForcedProfile | null
+      readonly forcePast: ActivationRefusal | null
+    } => {
+      const forced = liveForced()
+      const releaseAuthorized = body.releaseForce === true && (
+        !releaseForceFor || (forced?.profile === releaseForceFor.profile && forced.forcedAt === releaseForceFor.forcedAt)
+      )
+      const releaseRequired = forced && forced.profile !== requested && !releaseAuthorized ? forced : null
+      const effectiveProfiles = getEffectiveProfiles(finalConfig.profiles)
+      const excluded = canonicalRoutingExcludedProfileIds(effectiveProfiles, userRoutingExcludedProfileIds()).includes(requested)
+      const checkSupervisor = !excluded && (!releaseRequired || getSetting("allowForcingForbiddenProfile") === true)
+      const blocker: { readonly refusal: ActivationRefusal; readonly respond: (refusal: ActivationRefusal) => Response } | null =
+        !checkSupervisor ? null
+          : canonicalRoutingExcludedProfileIds(effectiveProfiles, managedRoutingExcludedProfileIds()).includes(requested)
+            ? { refusal: activationRefusal("managed_excluded", requested, { forced }), respond: refusal => profileExcludedResponse(requested, { refusal }) }
+            : routingHeldProfileIdsFor(effectiveProfiles).includes(requested)
+              ? { refusal: activationRefusal("held", requested, { forced }), respond: refusal => profileHeldResponse(requested, { refusal }) }
+              : (() => {
+                  const reserveHold = claudeReserveHold(requested, usageReserves())
+                  if (!reserveHold) return null
+                  const error = heldMessage(requested, reserveHold)
+                  return { refusal: activationRefusal("usage_reserve", requested, { detail: error, forced }), respond: (refusal: ActivationRefusal) => c.json({ error, code: "usage_reserve", refusal }, 409) }
+                })()
+      if (releaseRequired) {
+        const refusal = activationRefusal("forced_elsewhere", requested, { forced: releaseRequired, targetBlocker: blocker?.refusal })
+        return { response: c.json({ error: refusal.reason, code: "profile_forced", forced: releaseRequired, refusal }, 409) }
       }
-      return blocker.respond(blocker.refusal)
+      if (excluded) {
+        return { response: profileExcludedResponse(requested, { refusal: activationRefusal("excluded", requested, { forced }) }) }
+      }
+      const forcing = blocker !== null && body.force === true
+      // A page on another site must not force an account past its supervisor.
+      if (forcing && !isSameOriginRequest(c.req.raw)) {
+        return { response: c.json({ code: "forbidden_origin", error: "Forcing a profile requires a same-origin request" }, 403) }
+      }
+      if (blocker && !(forcing && blocker.refusal.forceAllowed)) {
+        if (forcing && blocker.refusal.forceable) {
+          return { response: c.json({
+            error: "Forcing a forbidden profile is off. Turn on Settings, Routing, \"Allow forcing a forbidden profile\" to activate it anyway.",
+            code: "force_disabled",
+            refusal: blocker.refusal,
+          }, 409) }
+        }
+        return { response: blocker.respond(blocker.refusal) }
+      }
+      return { forced, forcePast: forcing ? blocker.refusal : null }
     }
+    const beforeAuth = checkActivation()
+    if ("response" in beforeAuth) return beforeAuth.response
     const target = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, requested)
     const auth = await reconcileClaudeProfileAuth(await getInstanceAuthStatus(target.id, target.env), target)
+    const decision = checkActivation()
+    if ("response" in decision) return decision.response
+    const { forced, forcePast } = decision
     if (auth?.loggedIn === false) {
       const error = `Profile "${target.id}" needs a login before it can be activated`
-      return c.json({ error, code: "needs_login", refusal: activationRefusal("needs_login", target.id, { detail: error }) }, 409)
+      return c.json({ error, code: "needs_login", refusal: activationRefusal("needs_login", target.id, { detail: error, forced }) }, 409)
     }
     const previousProfile = getActiveProfileId() ?? null
     setActiveProfile(requested)
     // The force follows the pointer: set for a forced switch, kept while the
     // forced profile is activated again, ended by a switch away from it.
-    let forcedNow: ForcedProfile | null = forced && forced.profile === requested ? forced : null
-    if (forcing) {
+    const releasedForce = forced?.profile === requested ? null : forced
+    let forcedNow = releasedForce ? null : forced
+    if (forcePast) {
       forcedNow = forcedProfileFor(requested, Date.now())
       setSetting("forcedActiveProfile", forcedNow)
-      claudeLog("profile.forced", { profile: requested, refusal: blocker.refusal.kind, until: forcedNow.until })
-      plog(`[PROXY] Profile ${requested} forced active past ${blocker.refusal.kind} until ${new Date(forcedNow.until).toISOString()}`)
-    } else if (forced && forced.profile !== requested) {
+      claudeLog("profile.forced", { profile: requested, refusal: forcePast.kind, until: forcedNow.until })
+      plog(`[PROXY] Profile ${requested} forced active past ${forcePast.kind} until ${new Date(forcedNow.until).toISOString()}`)
+    } else if (releasedForce) {
       setSetting("forcedActiveProfile", undefined)
-      claudeLog("profile.force_released", { profile: forced.profile, source: "switch" })
     }
+    if (releasedForce) claudeLog("profile.force_released", { profile: releasedForce.profile, source: "switch" })
     scheduleForcedExpiry()
     // Session mappings are NOT cleared. Their keys are already scoped by
     // profile, so the new profile can never resume a session started under

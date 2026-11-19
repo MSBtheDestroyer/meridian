@@ -155,7 +155,7 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   characters each) beside its lists; it is shown, verbatim, when someone tries
   to activate that profile. Every refusal of `POST /profiles/active` carries
   `refusal {kind, profile, by, reason, forceable, forceAllowed, forceNote,
-  forced?}` beside its existing fields; `kind` is `managed_excluded`,
+  forced?, releaseAndForce?}` beside its existing fields; `kind` is `managed_excluded`,
   `excluded`, `held`, `usage_reserve`, `needs_login`, `following` or
   `forced_elsewhere`. With `allowForcingForbiddenProfile` on (a boolean set
   through `PUT /settings/api/routing`, same-origin only, off by default),
@@ -169,9 +169,9 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   `routingHeldProfiles` and its usage reserve everywhere they are judged (the
   pointer reconcile, unpinned dispatch, failover), while the lists themselves
   keep what the supervisor wrote; `cvpManagedExcludedProfiles` is untouched.
-  A switch to another profile answers 409 `profile_forced` unless it carries
-  `releaseForce: true`, which ends the force with the switch. The force also
-  ends at `until`, on `POST /profiles/forced/release`, and when the setting is
+  A switch away from a live force without `releaseForce: true` answers 409 `profile_forced` (`refusal.kind: "forced_elsewhere"`, with `forceable` and `forceAllowed` both false). If the target is also blocked only by a supervisor exclusion, hold or usage reserve and forcing is enabled, the same refusal names both reasons, includes the source force in `refusal.forced`, and adds `releaseAndForce: true`, even on a `force: true` request. Confirming that combined action sends `releaseForce: true` and `force: true` together in a same-origin request.
+  Release consent can also carry `releaseForceFor: {profile, forcedAt}` from the displayed force. A supplied value must contain a non-empty profile string and a finite timestamp number or the Claude switch returns 400. With `releaseForce: true`, the pair must match the live force on another profile both before and after the auth check; a mismatch returns a fresh 409 `profile_forced` describing that force. If no force stands in the way, activation continues under the ordinary rules. Omitting `releaseForceFor` retains the plain boolean behavior. The route changes the pointer and releases or replaces the old force only after the login and current policy checks pass; a refused switch leaves both unchanged.
+  The force also ends at `until`, on `POST /profiles/forced/release`, and when the setting is
   turned off; each puts the ordinary rules back at once, so the pointer moves
   off a profile the supervisor still keeps out. `GET /settings/api/routing`
   reports `allowForcingForbiddenProfile`, `routingManagedReasons` and

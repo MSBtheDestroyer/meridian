@@ -14,6 +14,7 @@ import { installMcpToolsMock } from "./mcpToolsMock"
 import { installModelsMock } from "./modelsMock"
 
 let queryTokens: Array<string | undefined> = []
+let onAuthRead: ((profile?: string) => void) | undefined
 
 installSdkMock(() => ({
   query: (params: { prompt: unknown; options?: { env?: Record<string, string> } }) => {
@@ -36,7 +37,10 @@ installMcpToolsMock(() => ({
 }))
 
 installModelsMock(() => ({
-  getClaudeAuthStatusAsync: async () => ({ loggedIn: true, subscriptionType: "max" }),
+  getClaudeAuthStatusAsync: async (profile?: string) => {
+    onAuthRead?.(profile)
+    return { loggedIn: true, subscriptionType: "max" }
+  },
 }))
 
 const designDir = mkdtempSync(join(tmpdir(), "meridian-force-activation-"))
@@ -74,10 +78,10 @@ function app() {
   return createProxyServer({ port: 0, host: "127.0.0.1", profiles: PROFILES, defaultProfile: "own" }).app
 }
 
-async function activate(target: ReturnType<typeof app>, body: Record<string, unknown>): Promise<{ status: number; body: ActivationReply }> {
+async function activate(target: ReturnType<typeof app>, body: Record<string, unknown>, origin?: string): Promise<{ status: number; body: ActivationReply }> {
   const res = await target.fetch(new Request("http://localhost/profiles/active", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(origin ? { origin } : {}) },
     body: JSON.stringify(body),
   }))
   return { status: res.status, body: await res.json() as ActivationReply }
@@ -117,6 +121,7 @@ beforeEach(async () => {
 })
 
 afterEach(() => {
+  onAuthRead = undefined
   resetSettings()
   resetActiveProfile()
 })
@@ -225,6 +230,68 @@ describe("activating a forbidden profile", () => {
     expect(released.status).toBe(200)
     expect(getActiveProfileId()).toBe("own")
     expect((await routing(target)).forcedActiveProfile).toBeNull()
+  })
+
+  describe("switching from a forced profile to a managed-excluded profile", () => {
+    async function prepareSwitch() {
+      setSetting("routingManagedExcludedProfiles", ["loaner-bob"])
+      setSetting("allowForcingForbiddenProfile", true)
+      const target = app()
+      const initial = await activate(target, { profile: "loaner-bob", force: true })
+      expect(initial.status).toBe(200)
+      const originalForce = initial.body.forced
+      if (!originalForce) throw new TypeError("Expected a force record from activation")
+      expect(originalForce.profile).toBe("loaner-bob")
+      expect(Number.isFinite(originalForce.forcedAt) && Number.isFinite(originalForce.until)).toBe(true)
+      setSetting("routingManagedExcludedProfiles", ["loaner-bob", "own"])
+      return { target, originalForce }
+    }
+
+    it("offers release and force together and accepts both flags on retry", async () => {
+      const { target, originalForce: { profile, forcedAt } } = await prepareSwitch()
+      const initial = await activate(target, { profile: "own" })
+      const forceOnly = await activate(target, { profile: "own", force: true })
+      const switched = await activate(target, { profile: "own", releaseForce: true, force: true, releaseForceFor: { profile, forcedAt } })
+
+      expect(switched).toMatchObject({ status: 200, body: { activeProfile: "own", forced: { profile: "own" } } })
+      expect(getActiveProfileId()).toBe("own")
+      expect((await routing(target)).forcedActiveProfile).toEqual(switched.body.forced)
+      const combined = { status: 409, body: { code: "profile_forced", refusal: { kind: "forced_elsewhere", forceAllowed: false, releaseAndForce: true, forced: { profile, forcedAt } } } }
+      expect([initial, forceOnly]).toMatchObject([combined, combined])
+    })
+
+    it.each([
+      { cause: "personal exclusion", excluded: true, expected: { status: 409, body: { refusal: { kind: "excluded", forceable: false } } } },
+      { cause: "cross-origin request", origin: "https://evil.example", expected: { status: 403, body: { code: "forbidden_origin" } } },
+      { cause: "stale confirmation", stale: true, expected: { status: 409, body: { code: "profile_forced", refusal: { kind: "forced_elsewhere", releaseAndForce: true } } } },
+    ])("keeps the active profile and current force record after a refused combined retry ($cause)", async ({ origin, excluded, stale, expected }) => {
+      const { target, originalForce } = await prepareSwitch()
+      const { profile, forcedAt, until } = originalForce
+      const currentForce = stale ? { profile, forcedAt: forcedAt + 1, until: until + 1 } : originalForce
+      if (stale) setSetting("forcedActiveProfile", currentForce)
+      if (excluded) setSetting("routingExcludedProfiles", ["own"])
+
+      const refused = await activate(target, { profile: "own", releaseForce: true, force: true, releaseForceFor: { profile, forcedAt } }, origin)
+
+      expect(refused).toMatchObject(expected)
+      if (stale) expect(refused.body.refusal?.forced).toEqual(currentForce)
+      expect(getActiveProfileId()).toBe("loaner-bob")
+      expect((await routing(target)).forcedActiveProfile).toEqual(currentForce)
+    })
+
+    it("will not release a force renewed while it checks the target login", async () => {
+      const { target, originalForce: { profile, forcedAt, until } } = await prepareSwitch()
+      const renewedForce = { profile, forcedAt: forcedAt + 1, until: until + 1 }
+      onAuthRead = id => {
+        if (id === "own") setSetting("forcedActiveProfile", renewedForce)
+      }
+
+      const refused = await activate(target, { profile: "own", releaseForce: true, force: true, releaseForceFor: { profile, forcedAt } })
+
+      expect(refused).toMatchObject({ status: 409, body: { code: "profile_forced", refusal: { releaseAndForce: true, forced: renewedForce } } })
+      expect(getActiveProfileId()).toBe("loaner-bob")
+      expect((await routing(target)).forcedActiveProfile).toEqual(renewedForce)
+    })
   })
 
   it("release puts the ordinary rules back at once", async () => {

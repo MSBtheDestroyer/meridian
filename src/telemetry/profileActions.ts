@@ -44,14 +44,23 @@ var meridianProfileActions = (function () {
     var actions = [{ label: 'Close', value: null }];
     var link = null;
     var forced = refusal.forced;
-    if (refusal.kind === 'forced_elsewhere' && refusal.forceAllowed && forced) {
-      if (!consent.force || !consent.releaseForce) actions.push({
-        label: 'Release ' + forced.profile + ' and activate anyway', value: { force: true, releaseForce: true }, kind: 'danger'
-      });
+    if (refusal.kind === 'forced_elsewhere') {
+      var releaseForceFor = forced && forced.profile && Number.isFinite(forced.forcedAt)
+        ? { profile: forced.profile, forcedAt: forced.forcedAt } : undefined;
+      var submitted = consent.releaseForceFor;
+      var releaseSent = consent.releaseForce && (!releaseForceFor || (submitted
+        && submitted.profile === releaseForceFor.profile && submitted.forcedAt === releaseForceFor.forcedAt));
+      var release = { releaseForce: true, releaseForceFor: releaseForceFor };
+      if (refusal.releaseAndForce === true) {
+        if (!releaseSent || !consent.force) actions.push({
+          label: 'Release' + (forced ? ' ' + forced.profile : '') + ' and activate anyway',
+          value: Object.assign({ force: true }, release), kind: 'danger'
+        });
+      } else if (!releaseSent) {
+        actions.push({ label: 'Release and switch', value: release, kind: 'primary' });
+      }
     } else if (refusal.forceAllowed) {
       if (!consent.force) actions.push({ label: 'Activate anyway', value: { force: true }, kind: 'danger' });
-    } else if (refusal.kind === 'forced_elsewhere') {
-      if (!consent.releaseForce) actions.push({ label: 'Release and switch', value: { releaseForce: true }, kind: 'primary' });
     } else if (refusal.forceable) {
       link = { href: '/settings#routing-force', text: 'Open Settings, Routing' };
     }

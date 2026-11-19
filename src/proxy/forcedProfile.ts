@@ -67,12 +67,13 @@ export interface ActivationRefusal {
   readonly reason: string
   /** Whether "Allow forcing a forbidden profile" can override this refusal. */
   readonly forceable: boolean
-  /** Whether a request with `force: true` would be honoured right now. */
+  /** Whether a request with `force: true` alone can override this refusal. */
   readonly forceAllowed: boolean
   /** What forcing would take, or why it cannot. */
   readonly forceNote: string
-  /** The force standing in the way of this switch. */
+  /** The live force, even when it is not what blocked the switch. */
   readonly forced?: ForcedProfile
+  readonly releaseAndForce?: true
 }
 
 const FORCEABLE: ReadonlySet<ActivationRefusalKind> = new Set(["managed_excluded", "held", "usage_reserve"])
@@ -89,11 +90,13 @@ export function describeActivationRefusal(input: {
   readonly allowForcing: boolean
   readonly seat?: boolean
   readonly forced?: ForcedProfile
+  readonly targetBlocker?: ActivationRefusal
 }): ActivationRefusal {
   const { kind, profile } = input
   const forceable = FORCEABLE.has(kind) && !input.seat
   const forceAllowed = forceable && input.allowForcing
   const base = { kind, profile, forceable, forceAllowed }
+  const forceHours = FORCED_PROFILE_HOLD_MS / 3_600_000
   let by: string
   let reason: string
   switch (kind) {
@@ -122,11 +125,18 @@ export function describeActivationRefusal(input: {
       reason = input.detail ?? "This instance takes its active profile from another Meridian."
       break
     case "forced_elsewhere": {
-      const forced = input.forced
+      const { forced, targetBlocker } = input
       by = "you: another profile is forced active"
-      reason = forced
-        ? `"${forced.profile}" is forced active. Release that force to switch.`
-        : "Another profile is forced active. Release that force to switch."
+      const sourceReason = forced ? `"${forced.profile}" is forced active.` : "Another profile is forced active."
+      if (forced && input.allowForcing && targetBlocker?.forceAllowed) {
+        return {
+          ...base, forced, releaseAndForce: true,
+          by: `${by}; ${targetBlocker.by}`,
+          reason: `${sourceReason} "${profile}" is also blocked: ${targetBlocker.reason}`,
+          forceNote: `Confirming releases the force on "${forced.profile}" and forces "${profile}" active for up to ${forceHours} hours. If the switch fails, the current force stays in place.`,
+        }
+      }
+      reason = `${sourceReason} Release that force to switch.`
       break
     }
   }
@@ -134,7 +144,7 @@ export function describeActivationRefusal(input: {
     reason += " Only a Claude profile can be forced; this is a ChatGPT seat."
   }
   const forceNote = forceAllowed
-    ? `Activate anyway makes "${profile}" the active profile for up to ${FORCED_PROFILE_HOLD_MS / 3_600_000} hours, or until you release it; the supervisor cannot switch away from it meanwhile.`
+    ? `Activate anyway makes "${profile}" the active profile for up to ${forceHours} hours, or until you release it; the supervisor cannot switch away from it meanwhile.`
     : forceable
       ? `Forcing is off. Turn on ${SETTING} to activate it anyway.`
       : kind === "excluded"

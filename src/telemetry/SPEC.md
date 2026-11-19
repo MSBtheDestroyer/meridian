@@ -116,13 +116,7 @@ Record what Meridian did and show it to the operator:
   never shown as `[object Object]`. `no-native-dialogs.test.ts` fails on a
   native dialog call in any served page.
 
-- **A refused switch says why and who.** Activation on `/` and `/profiles`
-  goes through `meridianProfileActions.activate`: a refusal opens the dialog
-  with the route's `refusal` (reason, who keeps the profile out, what forcing
-  would take). It offers "Activate anyway" only when the route says
-  `forceAllowed`, "Release and switch" when another profile is forced, else a
-  link to the setting. A forced card shows a yellow "forced" badge with its
-  expiry and, on `/profiles`, a release link.
+- **A refused switch says why and who.** Activation on `/` and `/profiles` goes through `meridianProfileActions.activate`: a refusal opens a dialog with the route's reason, who keeps the profile out, and what forcing would take. It offers "Activate anyway" when only forcing is needed and allowed, "Release and switch" when the refusal only asks for a release, or one `Release <profile> and activate anyway` button when both are needed and forcing is allowed. When forcing is possible but disabled, the dialog links to the setting. Retries carry consent across separate dialogs for the same switch. Release consent applies only to the force shown in the dialog, and a failed switch does not release it. A forced card shows a yellow "forced" badge with its expiry and, on `/profiles`, a release link.
 
 - **Keepalive beats are not requests.** Rows with
   `requestSource: "cache-keepalive"` answered no client, so `computeSummary`
