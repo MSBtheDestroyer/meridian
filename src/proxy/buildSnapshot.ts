@@ -16,7 +16,11 @@ export function gitOutput(root: string, args: readonly string[], timeout = 2000)
   // KILL rather than its default TERM: a TERM-resistant Git must not extend the
   // deadline and its eventual clean exit must not turn ETIMEDOUT into success.
   // This is not a process-tree or real-time scheduling guarantee.
-  const result = spawnSync("git", ["-C", root, ...args], { encoding: "utf8", timeout, killSignal: "SIGKILL", maxBuffer: 2 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] })
+  // GIT_OPTIONAL_LOCKS=0 (`--no-optional-locks`): `status` would otherwise
+  // write a refreshed index under .git/index.lock, and a Git killed mid-write
+  // leaves that lock behind, failing every later pull or merge in the
+  // checkout. These reads write nothing.
+  const result = spawnSync("git", ["-C", root, ...args], { encoding: "utf8", timeout, killSignal: "SIGKILL", maxBuffer: 2 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } })
   if (result.error || result.status !== 0) throw new BuildProvenanceError("git")
   return result.stdout.trimEnd()
 }
