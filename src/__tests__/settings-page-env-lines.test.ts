@@ -49,9 +49,10 @@ function pageLoaders(app: TestApp, cards: Map<string, StubElement>): PageLoaders
       return element
     },
   }
-  const fetch = (url: string) => app.fetch(new Request(`http://localhost${url}`))
-  const build = new Function("document", "fetch", `${script}\nreturn { loadTelemetry, loadUpdates, loadRouting, loadTranscripts };`)
-  return build(document, fetch) as PageLoaders
+  const location = new URL("http://localhost/settings")
+  const fetch = (url: string) => app.fetch(new Request(new URL(url, location).href))
+  const build = new Function("document", "fetch", "location", `${script}\nreturn { loadTelemetry, loadUpdates, loadRouting, loadTranscripts };`)
+  return build(document, fetch, location) as PageLoaders
 }
 
 /** The text of every env-override line in a card's markup. */

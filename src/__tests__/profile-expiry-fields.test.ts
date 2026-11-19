@@ -186,9 +186,9 @@ if (!isScenario(arg)) {
     const { resetActiveProfile } = await import("../proxy/profiles")
     const expiryFields = ["refreshTokenExpiresAt", "daysUntilRenewal", "renewalRequiredSoon", "accessTokenExpiresAt"] as const
     const historyFields = ["authObtainedAt", "authObtainedVia", "lastRefreshAt", "firstUnauthedAt", "unauthedReason"] as const
-    // Duplicate-account and post-sign-in status, reported for every profile
-    // (owner-approved 2026-10-26, #1446; see the API contract).
-    const statusFields = ["duplicateOf", "duplicateBasis", "factsRefresh"] as const
+    // Duplicate-account, post-sign-in and forced-activation status (see the API
+    // contract), reported for every profile.
+    const statusFields = ["duplicateOf", "duplicateBasis", "factsRefresh", "forced"] as const
     const baseFields = [
       "id", "type", "isActive", "email", "subscriptionType", "organizationName", "cvpAccess", "rateLimitTier",
       "seatTier", "allowance", "allowanceWeight", "planLabel", "accountType", "planName", "loggedIn",
@@ -266,7 +266,7 @@ if (!isScenario(arg)) {
         equal(
           Object.keys(item).sort(),
           [...baseFields, ...expiryFields, ...historyFields, ...statusFields, ...(input.aliases ? ["aliases"] : [])].sort(),
-          "Profile response changed fields beyond the expiry and login-history additions",
+          "Profile response field set changed",
         )
         equal(item.type, input.type ?? "claude-max", "Existing profile type changed")
         equal(item.isActive, i === 0, "Existing active-profile flag changed")
@@ -300,14 +300,14 @@ if (!isScenario(arg)) {
         profile("shared-b", shared.dir),
         profile("default", defaultStore.dir),
       ]
-      // Build the server first: construction reads the clock too, and only the
-      // listing's own reads should see the advancing clock.
+      // Advance time during credential enrichment, after the response clock
+      // was captured, without depending on how often routing reads the clock.
       const app = open(profiles)
-      let nowCalls = 0
-      clockSpy.mockImplementation(() => (nowCalls++ === 0 ? clock : clock + 10 * DAY))
+      clockSpy.mockClear()
+      clockSpy.mockImplementation(() => (requestedStores.length === 0 ? clock : clock + 10 * DAY))
       const items = await list(app, profiles)
+      check(clockSpy.mock.results.some(result => result.value === clock + 10 * DAY), "Profile enrichment did not read the advanced clock")
       clockSpy.mockReturnValue(clock)
-      check(nowCalls > 1, "Multiple-profile listing did not advance the synthetic clock after capturing response time")
       facts(items[0]!, clock + 9 * DAY, clock + HOUR)
       facts(items[1]!, clock + 2 * DAY, clock + 2 * HOUR)
       facts(items[2]!, clock + 2 * DAY, clock + 2 * HOUR)
