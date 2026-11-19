@@ -26,6 +26,10 @@ const fableGrant = (id: string, pct: number | undefined, over: Record<string, un
   kind: "fable", providerType: "full", clears: ["seven_day_overage_included"], givesBackWeekly: true,
   description: "Fable launch grant", ...(pct === undefined ? {} : { percentUsed: { seven_day_overage_included: pct } }), ...over,
 })
+/** As Anthropic reported a Team seat's Fable grant on 2026-11-19: it also clears the 5-hour window, never `seven_day`. */
+const teamFableGrant = (pct: number) => fableGrant("launch-2610-fable", pct, {
+  clears: ["five_hour", "seven_day_overage_included"], percentUsed: { five_hour: 80, seven_day_overage_included: pct },
+})
 
 /** As Anthropic reported DH Sub #1 on 2026-11-19: a whole-week grant and three Fable launch grants with no Fable usage. */
 const SUB1 = {
@@ -87,6 +91,20 @@ describe("freeResetView groups resets by what they clear", () => {
     expect(fable.muted).toBe(false)
     expect(fable.note).toBe("all usable now \u00b7 Fable 28% used \u00b7 next expires in 12d")
     expect(groupOf(view, "full").grantId).toBe("full-reset-2611")
+  })
+
+  it("says the 5-hour window clears only when the offered grant's scope lists it, and offers no Fable reset without Fable usage", () => {
+    const team = groupOf(freeResetView({ ...SUB1, grants: [teamFableGrant(27.5)] }, NOW, LIVE), "fable")
+    expect([team.grantId, team.clearsFiveHour]).toEqual(["launch-2610-fable", true])
+    expect(team.title).toContain("gives back only Fable usage to the weekly allowance")
+    expect(team.title).toContain("It also clears the 5-hour window.")
+    const personal = freeResetView({ ...SUB1, grants: [fullGrant(), fableGrant("launch-2610-fable", 27.5)] }, NOW, LIVE)
+    for (const kind of ["full", "fable"]) {
+      expect(groupOf(personal, kind).clearsFiveHour).toBe(false)
+      expect(groupOf(personal, kind).title).not.toContain("5-hour")
+    }
+    const idle = groupOf(freeResetView({ ...SUB1, grants: [teamFableGrant(0)] }, NOW, LIVE), "fable")
+    expect([idle.grantId, idle.muted, idle.reason]).toEqual([null, true, "no Fable usage to give back right now"])
   })
 
   it("takes the provider's next grant only within its own kind", () => {
@@ -315,6 +333,7 @@ describe("/profiles draws one block per kind", () => {
     expect(ask.message).toContain("\u201cFable launch grant (launch-2610-fable)\u201d")
     expect(ask.message).toContain("gives back only this account\u2019s Fable usage (now 28% used)")
     expect(ask.message).not.toContain("clears this account\u2019s weekly usage")
+    expect(ask.message).not.toContain("5-hour")
     expect(ask.message).toContain("It cannot be undone.")
     expect(ask.message).not.toContain("rate limited")
     expect(ask.confirmText).toBe("Redeem Fable reset")
@@ -330,8 +349,23 @@ describe("/profiles draws one block per kind", () => {
     expect(ask.title).toBe("Redeem a full reset on DH Sub #1 now?")
     expect(ask.message).toContain("\u201cWhole-week grant (full-reset-2611)\u201d")
     expect(ask.message).toContain("clears this account\u2019s weekly usage")
+    expect(ask.message).not.toContain("5-hour")
     expect(ask.message).not.toContain("rate limited")
     expect(page.posted.map(p => p.grantId)).toEqual(["full-reset-2611"])
+  })
+
+  it("adds the 5-hour window to a confirmation only when the spent grant's scope lists it", async () => {
+    const teamFull = fullGrant({ id: "team-full", clears: ["five_hour", "seven_day", "seven_day_overage_included"] })
+    const page = profilesPage()
+    const buttons = buttonsIn(page.render({ ...SUB1, nextGrantId: null, grants: [teamFull, teamFableGrant(27.5)] }))
+    expect(buttons.map(b => [b.attrs["data-grant"], b.attrs["data-clears-five-hour"]])).toEqual([["team-full", "true"], ["launch-2610-fable", "true"]])
+    for (const b of buttons) await page.redeem(b.attrs)
+    const [full, fable] = page.asked.map(a => String(a.message))
+    expect(full).toContain("clears this account\u2019s weekly usage right away. It also clears the 5-hour window.")
+    expect(fable).toContain("gives back only this account\u2019s Fable usage (now 28% used) to its weekly allowance")
+    expect(fable).toContain("It also clears the 5-hour window.")
+    expect(fable).not.toContain("clears this account\u2019s weekly usage")
+    expect(page.posted.map(p => p.grantId)).toEqual(["team-full", "launch-2610-fable"])
   })
 
   it("sends nothing when the confirmation is declined", async () => {

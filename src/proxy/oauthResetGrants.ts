@@ -55,7 +55,8 @@ export function parseResetGrantMetadata(grant: object, id: string | null): OAuth
   if (clears?.includes("seven_day") || (scopeMissing && id === "full-reset-2611" && givesBackWeekly !== true)) {
     kind = "full"
   } else if (id !== null && FABLE_LAUNCH_GRANTS.has(id) && givesBackWeekly !== false
-    && (scopeMissing || (clears?.length === 1 && clears[0] === "seven_day_overage_included"))) {
+    && (scopeMissing || (clears?.includes("seven_day_overage_included")
+      && clears.every(window => window === "seven_day_overage_included" || window === "five_hour")))) {
     kind = "fable"
   }
 

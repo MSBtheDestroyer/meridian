@@ -167,7 +167,8 @@ at its provider, so card CSS never names one.
   `/profiles` each kind is a block below them; a kind that can be redeemed
   carries its own small blue "Redeem full reset" / "Redeem Fable reset"
   button. The confirmation names the kind, the grant and only that kind's
-  effect, and the outcome is shown in that kind's block.
+  effect, adding "It also clears the 5-hour window." only when that grant's
+  provider scope lists it, and the outcome is shown in that kind's block.
   - Brief (`/profiles` blocks): primary action is the redeem button of a kind
     that can be redeemed; priorities are the kind's name, its count, then
     why it is or is not offered. Left out on purpose: a combined total, a

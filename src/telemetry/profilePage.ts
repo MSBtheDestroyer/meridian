@@ -1193,6 +1193,7 @@ function renderFreeResets(resets, p) {
       ? '<button type="button" class="switch-btn reset-btn" data-profile="' + attr(p.id) + '" data-name="' + attr(p.label || p.id)
         + '" data-kind="' + attr(g.kind) + '" data-label="' + attr(g.name) + '" data-kind-name="' + attr(g.shortName)
         + '" data-grant="' + attr(g.grantId) + '" data-grant-name="' + attr(g.grantName) + '" data-fable-used="' + attr(g.fableUsed)
+        + '" data-clears-five-hour="' + (g.clearsFiveHour ? 'true' : 'false')
         + '" data-usable="' + g.usable + '" onclick="redeemFreeReset(this)"'
         + (redeemingReset ? ' disabled' : '') + '>' + esc('Redeem ' + g.shortName) + '</button>'
       : '';
@@ -2588,11 +2589,13 @@ async function redeemFreeReset(button) {
   var fableUsed = button.getAttribute('data-fable-used');
   var usable = Number(button.getAttribute('data-usable')) || 0;
   var after = Math.max(0, usable - 1);
-  // Each kind says only what it does: a Fable reset never promises the week back.
-  var effect = kind === 'fable'
+  // Each kind says only what it does: a Fable reset never promises the week back,
+  // and the 5-hour window is named only when the spent grant's scope lists it.
+  var effect = (kind === 'fable'
     ? 'Anthropic gives back only this account\\u2019s Fable usage' + (fableUsed ? ' (now ' + fableUsed + ' used)' : '')
-      + '; the rest of the week\\u2019s usage stays as it is.'
-    : 'Anthropic clears this account\\u2019s weekly usage right away.';
+      + ' to its weekly allowance; the rest of the week\\u2019s usage stays as it is.'
+    : 'Anthropic clears this account\\u2019s weekly usage right away.')
+    + (button.getAttribute('data-clears-five-hour') === 'true' ? ' It also clears the 5-hour window.' : '');
   var go = await meridianDialog.ask({
     title: 'Redeem a ' + noun + ' on ' + button.getAttribute('data-name') + ' now?',
     message: 'This spends \\u201c' + (button.getAttribute('data-grant-name') || grantId) + '\\u201d. ' + effect

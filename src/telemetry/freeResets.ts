@@ -37,6 +37,8 @@ export interface FreeResetGroup {
   readonly grantName: string | null
   /** Fable usage a Fable reset would give back, from a current reading. */
   readonly fableUsed: string | null
+  /** The provider's scope for the grant a redeem spends lists `five_hour` (with no such grant: every grant of this kind does). */
+  readonly clearsFiveHour: boolean
   /** Why Meridian offers no redeem although the provider would allow one. */
   readonly reason: string | null
   /** Drawn in --muted: nothing of this kind can be redeemed from here. */
@@ -61,6 +63,7 @@ export function freeResetView(raw: unknown, nowMs: number, quota?: unknown): Fre
 
   interface Live {
     id: string | null; left: number; expiresAt: number | null; usable: boolean; description: string | null; fablePct: number | null
+    fiveHour: boolean
   }
   interface Bucket { kind: FreeResetKind; key: string; label: string | null; grants: Live[] }
   const text = (v: unknown): string | null => (typeof v === "string" && v.trim().length > 0 ? v.trim() : null)
@@ -72,7 +75,7 @@ export function freeResetView(raw: unknown, nowMs: number, quota?: unknown): Fre
     if (typeof item !== "object" || item === null) continue
     const g = item as {
       id?: unknown; resetsLeft?: unknown; expiresAt?: unknown; startsAt?: unknown; paused?: unknown; usableNow?: unknown
-      kind?: unknown; providerType?: unknown; description?: unknown; percentUsed?: unknown
+      kind?: unknown; providerType?: unknown; description?: unknown; percentUsed?: unknown; clears?: unknown
     }
     if (typeof g.resetsLeft !== "number" || !Number.isSafeInteger(g.resetsLeft) || g.resetsLeft <= 0) continue
     const expiresAt = typeof g.expiresAt === "number" && isFinite(g.expiresAt) ? g.expiresAt : null
@@ -106,6 +109,7 @@ export function freeResetView(raw: unknown, nowMs: number, quota?: unknown): Fre
     }
     bucket.grants.push({
       id, left: g.resetsLeft, expiresAt, description, fablePct: pct(used),
+      fiveHour: Array.isArray(g.clears) && g.clears.includes("five_hour"),
       usable: g.usableNow === true && g.paused !== true && (startsAt === null || startsAt <= nowMs),
     })
   }
@@ -176,8 +180,10 @@ export function freeResetView(raw: unknown, nowMs: number, quota?: unknown): Fre
     const status = usable === 0 ? "none usable now" : usable === available ? "all usable now" : usable + " usable now"
     const expiry = expiresAt === null ? "" : (available === 1 ? "expires in " : "next expires in ") + within(expiresAt - nowMs)
     const held = available - usable
-    const effect = kind === "full" ? " Redeeming one clears this account's weekly usage."
-      : kind === "fable" ? " Redeeming one gives back only Fable usage; the rest of the week's usage stays as it is."
+    const clearsFiveHour = pick !== null ? pick.fiveHour : bucket.grants.every(g => g.fiveHour)
+    const fiveHour = clearsFiveHour ? " It also clears the 5-hour window." : ""
+    const effect = kind === "full" ? " Redeeming one clears this account's weekly usage." + fiveHour
+      : kind === "fable" ? " Redeeming one gives back only Fable usage to the weekly allowance; the rest of the week's usage stays as it is." + fiveHour
       : " Anthropic lists " + (available === 1 ? "it" : "them") + (bucket.label !== null ? " as " + bucket.label : "")
         + ", but Meridian does not know what one clears, so it offers no redeem."
     const parts = [bucket.label, reason ?? status, reason === null && fableUsed !== null ? "Fable " + fableUsed + " used" : null, expiry]
@@ -193,6 +199,7 @@ export function freeResetView(raw: unknown, nowMs: number, quota?: unknown): Fre
       grantId,
       grantName: grantId === null || pick === null ? null : pick.description !== null ? pick.description + " (" + grantId + ")" : grantId,
       fableUsed,
+      clearsFiveHour: kind !== "unknown" && clearsFiveHour,
       reason,
       muted: usable === 0 || reason !== null,
       value: String(available),

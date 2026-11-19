@@ -88,7 +88,11 @@ Record what Meridian did and show it to the operator:
   credentials; neither page asks anyone else. One view feeds both pages, and
   it counts resets **per kind**, because each kind clears something different:
   *Full reset* (`kind: "full"`, the whole week), *Fable reset*
-  (`kind: "fable"`, only Fable usage) and *Unrecognised reset* (anything else).
+  (`kind: "fable"`, only Fable usage back to the weekly allowance, never the
+  week) and *Unrecognised reset* (anything else). Either known kind may also
+  clear the 5-hour window: Meridian says so only when the grant's own `clears`
+  lists `five_hour` (observed on Team grants, not on personal ones), never by
+  guessing from the plan.
   The grant's `kind` decides, never the provider's raw `type` (the observed
   Fable launch grant has `type: "full"`). A reading without `kind` (one taken
   before Meridian read grant scope) labels only the known ids:
@@ -118,7 +122,8 @@ Record what Meridian did and show it to the operator:
   "Redeem full reset" / "Redeem Fable reset" button while that kind offers a
   grant. The button acts only after a confirmation that names the kind, the
   grant (provider label and id) and only that kind's effect (a Fable reset
-  gives back Fable usage and leaves the week as it is), and posts that grant
+  gives back Fable usage and leaves the week as it is), plus the 5-hour window
+  when that grant's scope lists it, and posts that grant
   to `POST /v1/usage/quota/reset` with a fresh `requestId`; nothing redeems
   on its own, and a refusal never falls back to another kind or grant. The
   poll is held while a redeem is in flight, and the outcome stays in the

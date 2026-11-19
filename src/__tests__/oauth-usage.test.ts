@@ -251,15 +251,20 @@ describe("oauthUsage", () => {
   })
 
   test.each([
-    ["Team full grant scope wins over the provider type", { id: "team-grant", type: "full", clears: ["seven_day"] }, "full"],
+    ["a whole-week Team grant that also clears both Fable windows", { id: "team-grant", type: "full", clears: ["five_hour", "seven_day_overage_included", "seven_day"] }, "full"],
     ["the legacy full grant without scope", { id: "full-reset-2611" }, "full"],
     ["the legacy six-month Fable grant without scope", { id: "launch-2610-fable-6mo" }, "fable"],
     ["the twelve-month Fable grant with scope", { id: "launch-2610-fable-12mo", clears: ["seven_day_overage_included"], gives_back_weekly: true }, "fable"],
-    ["an unrelated grant reusing the Fable launch flags", { id: "another-campaign", type: "full", clears: ["seven_day_overage_included"], gives_back_weekly: true }, "unknown"],
+    ["the Team Fable launch grant", { id: "launch-2610-fable", type: "full", clears: ["five_hour", "seven_day_overage_included"], gives_back_weekly: true }, "fable"],
+    ["the six-month Team Fable grant with reversed window order", { id: "launch-2610-fable-6mo", type: "full", clears: ["seven_day_overage_included", "five_hour"], gives_back_weekly: true }, "fable"],
+    ["the twelve-month Team Fable grant with a repeated window", { id: "launch-2610-fable-12mo", type: "full", clears: ["five_hour", "seven_day_overage_included", "five_hour"], gives_back_weekly: true }, "fable"],
+    ["an unrelated grant reusing the Team Fable launch scope and flag", { id: "another-campaign", type: "full", clears: ["five_hour", "seven_day_overage_included"], gives_back_weekly: true }, "unknown"],
+    ["a Fable launch ID with an additional unrelated window", { id: "launch-2610-fable", type: "full", clears: ["five_hour", "seven_day_overage_included", "seven_day_sonnet"], gives_back_weekly: true }, "unknown"],
+    ["a Fable launch ID clearing only the five-hour window", { id: "launch-2610-fable", type: "full", clears: ["five_hour"], gives_back_weekly: true }, "unknown"],
     ["a full provider type without actual scope", { id: "another-campaign", type: "full" }, "unknown"],
     ["an explicit different window on the legacy full grant", { id: "full-reset-2611", clears: ["five_hour"] }, "unknown"],
     ["an explicit empty scope on the legacy Fable grant", { id: "launch-2610-fable", clears: [] }, "unknown"],
-    ["a contradictory weekly flag on the Fable launch grant", { id: "launch-2610-fable", clears: ["seven_day_overage_included"], gives_back_weekly: false }, "unknown"],
+    ["a contradictory weekly flag on the Team Fable launch grant", { id: "launch-2610-fable", clears: ["five_hour", "seven_day_overage_included"], gives_back_weekly: false }, "unknown"],
     ["a malformed scope on the legacy full grant", { id: "full-reset-2611", clears: "seven_day" }, "unknown"],
   ] as const)("normalizes the scope of %s", async (_case, grant, kind) => {
     const result = await fetchOAuthUsage({
