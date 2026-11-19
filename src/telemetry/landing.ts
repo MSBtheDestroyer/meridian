@@ -111,16 +111,14 @@ export const landingHtml = `<!DOCTYPE html>
   ${profileLoginStatesCss}
   ${profileCardStatusCss}
   ${profileActionsCss}
-  /* Refresh usage: a small control at the end of the card's name row. The
-     card itself is the switch button, so the click handler lets it opt out. */
-  .usage-refresh {
+  /* Refresh: a small control at the end of the card's name row. The card
+     itself is the switch button, so the click handler lets it opt out. */
+  .profile-refresh {
     background: var(--bg); color: var(--muted); border: 1px solid var(--border); border-radius: 4px;
     padding: 3px 5px; margin-left: 8px; cursor: pointer; display: inline-flex; align-items: center; flex-shrink: 0; align-self: center;
   }
-  .usage-refresh:hover, .usage-refresh:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
-  @media (max-width: 720px) { .usage-refresh { min-width: 32px; min-height: 32px; justify-content: center; } }
-  .refresh-outcome { font-size: 11px; color: var(--muted); margin-bottom: 6px; overflow-wrap: anywhere; }
-  .refresh-outcome.err { color: var(--red); }
+  .profile-refresh:hover, .profile-refresh:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+  @media (max-width: 720px) { .profile-refresh { min-width: 32px; min-height: 32px; justify-content: center; } }
   /* The name row carries every badge the card can earn - Active, the plan
      chip, pool position, exhausted/refused, needs login, spent - and on a
      narrow card they do not fit beside the cost. The row wraps its badges
@@ -752,7 +750,7 @@ function profileSection(q,s,pl,h){
       +(switchable?' data-profile="'+esc(p.id)+'" role="button" tabindex="0"':'')+'>'
       +cardStrip
       +'<div class="profile-head"><span class="profile-name">'+(draggable?meridianReorder.handleHtml(p.id,pos,slot.place,slot.size):'')+'<span class="prof-dot"></span>'+(p.entry?infoIcon(p.entry,p.type):'')+''+esc(p.label||p.id)+' '+meridianProviders.badgeHtml(slot.provider,'provider-pill')+badge+'</span>'
-      +'<span class="profile-cost">'+usd(cost?cost.estimatedUsd:0)+'</span>'+refreshButton(p,chat)+'</div>'
+      +'<span class="profile-cost">'+usd(cost?cost.estimatedUsd:0)+'</span>'+refreshButton(p)+'</div>'
       +'<div class="profile-sub">'+(cost?cost.requests+' request'+(cost.requests===1?'':'s')+' · est. API value · 24h':'no traffic · 24h')+'</div>'
       +refreshOutcome(p.id)
       +meridianCardStatus.updateHtml(update)+rows+'</div>';
@@ -833,18 +831,14 @@ function render(h,s,q,pl){
 // A refusal opens the shared dialog saying why and who (profileActions.ts).
 function switchProfile(id){return meridianProfileActions.activate(id,refresh)}
 var ICON_REFRESH='${ICON_REFRESH_SVG}';
-// Claude subscription accounts and ChatGPT seats have usage to re-read; an API-key profile has none.
-function refreshButton(p,chat){
-  if(!chat&&(p.type||'claude-max')!=='claude-max')return '';
+// Every profile has something to re-read: a login, usage, its model list.
+function refreshButton(p){
   var busy=meridianProfileActions.refreshing(p.id);
-  return '<button type="button" class="usage-refresh'+(busy?' spinning':'')+'" data-refresh="'+esc(p.id)+'" title="Refresh usage now" aria-label="Refresh usage of '+esc(p.label||p.id)+'"'+(busy?' disabled':'')+'>'+ICON_REFRESH+'</button>';
+  return '<button type="button" class="profile-refresh'+(busy?' spinning':'')+'" data-refresh="'+esc(p.id)+'" title="Refresh this profile: login, usage, models" aria-label="Refresh '+esc(p.label||p.id)+'"'+(busy?' disabled':'')+'>'+ICON_REFRESH+'</button>';
 }
-function refreshOutcome(id){
-  var o=meridianProfileActions.outcome(id);
-  return o?'<div class="refresh-outcome'+(o.ok?'':' err')+'" role="status">'+esc(o.text)+'</div>':'';
-}
-function refreshUsage(id){
-  meridianProfileActions.refreshUsage(id,function(finished){if(finished)return refresh();if(lastData)render.apply(null,lastData)});
+function refreshOutcome(id){return meridianProfileActions.outcomeHtml(id)}
+function refreshProfile(id){
+  meridianProfileActions.refreshProfile(id,function(finished){if(finished)return refresh();if(lastData)render.apply(null,lastData)});
 }
 // The handle sits inside a card that is itself a switch button, so without
 // this every grab of the handle would also change the active account.
@@ -868,8 +862,8 @@ document.getElementById('content').addEventListener('click',function(e){
     return;
   }
   if(onHandle(e))return;
-  var refreshBtn=e.target.closest('.usage-refresh');
-  if(refreshBtn){if(!refreshBtn.disabled)refreshUsage(refreshBtn.dataset.refresh);return}
+  var refreshBtn=e.target.closest('.profile-refresh');
+  if(refreshBtn){if(!refreshBtn.disabled)refreshProfile(refreshBtn.dataset.refresh);return}
   // The card is itself the switch button, so the icon inside one has to opt
   // out of it or reading an account would move all traffic to that account.
   if(e.target.closest('.prof-info, .spent-tip'))return;
@@ -886,7 +880,7 @@ document.getElementById('content').addEventListener('click',function(e){
 document.getElementById('content').addEventListener('keydown',function(e){
   if(e.key!=='Enter'&&e.key!==' ')return;
   if(onHandle(e))return;
-  if(e.target.closest('.prof-info, .spent-tip, .usage-refresh')||e.target.closest('a'))return;
+  if(e.target.closest('.prof-info, .spent-tip, .profile-refresh')||e.target.closest('a'))return;
   var card=e.target.closest('.profile-card.switchable');
   if(card&&card.dataset.profile){e.preventDefault();switchProfile(card.dataset.profile)}
 });

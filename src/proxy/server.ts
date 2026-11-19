@@ -143,14 +143,14 @@ import { buildRuntime } from "./buildRuntime"
 import { checkPluginsNow, getLatestVersion, isUpdateCheckEnabled, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
 import { getPluginUpdates, trackPlugins } from "./pluginUpdateCheck"
 import { createAuthStatusOwner } from "./authStatusOwnership"
-import { mapModelToClaudeModel, claudeModelFamily, type ClaudeModelFamily, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, isExtendedContextKnownUnavailable, subscriptionIncludesExtendedContext } from "./models"
+import { mapModelToClaudeModel, claudeModelFamily, type ClaudeModelFamily, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, recheckClaudeAuthStatus, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, isExtendedContextKnownUnavailable, subscriptionIncludesExtendedContext } from "./models"
 import { livenessReport, readinessReport, renderProbe } from "./probes"
 import { UpstreamReachability, DEFAULT_OVERRIDE_TTL_MS, MAX_OVERRIDE_TTL_MS, unreachableDetail, withReachability } from "./upstreamReachability"
 import { resolveReachabilityThresholds } from "./upstreamReachabilityConfig"
 import type { AnthropicSseEvent } from "./openai"
 import { translateOpenAiToAnthropic, translateAnthropicToOpenAi, buildModelList, createSseTranslator, translateAnthropicSseError } from "./openai"
-import { clearAccountModels, fetchAccountModels, toAccountModelList, type AccountModel } from "./accountModels"
-import { cvpAccessFor, cvpReadingBody, cvpAccessOn, cvpActive, cyberVerificationField, cyberVerificationOf, forgetCvpAccess, normalizeCvpModel, parseRoutingRequirements, recordCvpReading, routingRequireOf, recordCvpRefusal, ROUTING_REQUIRE_HEADER, type CyberVerificationField } from "./cvpAccess"
+import { accountModelsState, clearAccountModels, fetchAccountModels, toAccountModelList, type AccountModel } from "./accountModels"
+import { cvpAccessFor, cvpReadingBody, cvpAccessOn, lastClaudeAiReadingAt, cvpActive, cyberVerificationField, cyberVerificationOf, forgetCvpAccess, normalizeCvpModel, parseRoutingRequirements, recordCvpReading, routingRequireOf, recordCvpRefusal, ROUTING_REQUIRE_HEADER, type CyberVerificationField } from "./cvpAccess"
 import { normalizeJcodeSessionId } from "./adapters/jcode"
 import { extractLettaConversationId, LETTA_CONVERSATION_HEADER } from "./adapters/letta"
 import { isClaudeCodeClient } from "./adapters/claudecode"
@@ -213,7 +213,8 @@ import { organizationNames, organizationNeedsRefresh, organizationRecordCurrent,
 import { findDuplicateProfiles, type IdentifiedProfile } from "./duplicateProfiles"
 import { ProfileFactsRefresh } from "./profileFactsRefresh"
 import { describeActivationRefusal, forcedProfileFor, liveForcedProfile, parseRoutingManagedReasons, withoutForcedProfile, type ActivationRefusal, type ActivationRefusalKind, type ForcedProfile } from "./forcedProfile"
-import { UsageRefreshGate, claudeRefreshNote, openedWindowTypes } from "./usageRefresh"
+import { UsageRefreshGate, claudeRefreshNote, openedWindowTypes, usageReadState } from "./usageRefresh"
+import { SKIPPED_WITHOUT_LOGIN, accountChanged, claudeLoginPart, cvpPart, modelsPart, seatLoginPart, tooSoonPart, type RefreshPart, type RefreshPartState } from "./profileRefresh"
 import {
   getRoutingMode,
   classifyRouteKind,
@@ -10952,7 +10953,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       cvpHolders: cvpHoldersByModel(cvpEffectiveOrder),
       // What a supervisor may rely on this build doing; read rather than
       // guessed from a version, which forks share.
-      capabilities: ["managed-exclusion-no-routable", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order", "forced-active-profile", "managed-exclusion-reasons", "usage-refresh"],
+      capabilities: ["managed-exclusion-no-routable", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order", "forced-active-profile", "managed-exclusion-reasons", "usage-refresh", "profile-refresh"],
       profiles: profileIds,
       saved: {
         routing: getSetting("routing") ?? null,
@@ -12188,14 +12189,160 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return c.json({ success: true, released, activeProfile: getActiveProfileId() ?? null })
   })
 
-  // "Refresh usage" on a card: re-read one profile's usage from its provider
-  // now, for a reset or a top-up made outside Meridian. The forced read
-  // replaces the cached snapshot every reader shares (/v1/usage/quota/all,
-  // reserves, dispatch), and the windows it shows open again clear the
-  // refusals remembered for them the way a redeemed free reset does. The 429
-  // cooldown still applies, and the gate allows one read per profile per
-  // interval however often it is clicked.
+  // Refresh on a card: re-read what Meridian can about one profile now, for a
+  // reset, top-up or re-login made outside Meridian. POST /profiles/:id/refresh
+  // re-checks the login, re-reads usage and re-lists the account's models,
+  // and answers one result per part (profileRefresh.ts); CVP access is never
+  // readable here, so its part says how old claude.ai's last reading is.
+  // POST /profiles/:id/usage/refresh is the usage part alone. Each part has
+  // its own slot in the gate, one read per profile per interval however often
+  // it is clicked; the usage slot is shared by both routes, and the seats
+  // share one because one call reads them all.
   const usageRefreshGate = new UsageRefreshGate()
+
+  interface ClaudeRefreshTarget {
+    readonly id: string
+    readonly account: ResolvedProfile
+    /** No profiles configured: the host's own login, read without a profile id. */
+    readonly singleAccount: boolean
+  }
+
+  function claudeRefreshTarget(requested: string): ClaudeRefreshTarget | Response {
+    const profiles = getEffectiveProfiles(finalConfig.profiles)
+    const profile = profiles.find(p => p.id === requested)
+    if (profile) return { id: requested, account: resolveProfile([profile], profile.id, profile.id), singleAccount: false }
+    if (profiles.length === 0 && requested === "default") {
+      return { id: requested, account: resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, requested), singleAccount: true }
+    }
+    return Response.json({ code: "profile_not_found", error: `Profile "${requested}" does not exist on this Meridian` }, { status: 404 })
+  }
+
+  async function readClaudeUsageNow(target: ClaudeRefreshTarget) {
+    const result = await fetchOAuthUsageResult({
+      profileId: target.singleAccount ? undefined : target.id,
+      claudeConfigDir: target.account.env.CLAUDE_CONFIG_DIR,
+      force: true,
+    })
+    const fresh = result.snapshot !== null && result.snapshot.stale !== true
+    if (fresh) clearResetProfileHealth(target.id, openedWindowTypes(result.snapshot!.windows))
+    claudeLog("usage.refresh_requested", { profile: target.id, refreshed: fresh, error: result.error })
+    const read = { fresh, error: result.error, failureReason: result.failure?.reason ?? null, hadReading: (result.snapshot ?? result.lastGood) !== null }
+    return {
+      refreshed: fresh,
+      state: usageReadState(read) as RefreshPartState,
+      note: claudeRefreshNote(read),
+      usage: { ...toUsageEntry(result), spent: spentProfiles.get(target.id) ?? null },
+    }
+  }
+
+  async function readSeatUsageNow(seatProfileId: string) {
+    await refreshChatGptUsage(true)
+    const entry = chatGptProfiles?.quotaEntries().find(e => e.id === seatProfileId) ?? null
+    const refreshed = !!entry && !entry.error && !entry.stale && entry.fetchedAt !== null
+    const note = refreshed ? "Usage re-read just now."
+      : entry?.fetchedAt != null ? "ChatGPT did not answer with new figures; the last reading stays."
+      : "ChatGPT did not answer with figures, and Meridian has no reading of this seat yet."
+    return { refreshed, state: (refreshed ? "fresh" : "failed") as RefreshPartState, note, usage: entry }
+  }
+
+  // The login part: `claude auth status` again, waited for; the stored
+  // credential read the way /profiles/list reads it; and the account read
+  // again, so a login that now holds another account drops what Meridian
+  // knew about the previous one before the other parts read it afresh.
+  async function recheckClaudeLogin(target: ClaudeRefreshTarget) {
+    const { account } = target
+    const authKey = target.id !== "default" ? target.id : undefined
+    const auth = await authOwner.run(() => recheckClaudeAuthStatus(authKey, Object.keys(account.env).length > 0 ? account.env : undefined))
+    const store = credentialStoreForProfile(account)
+    const stored = store ? await readStoredCredentialSnapshot(store) : undefined
+    const presence = stored?.presence ?? "unknown"
+    const lifecycle = store && stored
+      ? noteCredentialObserved(store.refreshKey, { presence, refreshTokenExpiresAt: stored.refreshTokenExpiresAt })
+      : undefined
+    const state = profileLoginState({ loggedIn: auth?.loggedIn, presence, firstUnauthedAt: lifecycle?.firstUnauthedAt })
+    let email = auth?.email ?? null
+    let changed = false
+    if (state === "authenticated" && account.type === "claude-max") {
+      const before = organizationNames()[target.id]
+      const record = await refreshOrganizationNow(target.id, { claudeConfigDir: account.env.CLAUDE_CONFIG_DIR })
+      changed = accountChanged(before, record)
+      if (record?.email) email = record.email
+      if (changed) clearSignedInProfileFacts(target.id)
+    }
+    claudeLog("profile.login_rechecked", { profile: target.id, state, accountChanged: changed })
+    return {
+      needsLogin: state === "needs_login",
+      accountChanged: changed,
+      part: claudeLoginPart({ state, checkFailed: getAuthCacheInfo(authKey).isFailure, everAnswered: auth !== null, presence, email, accountChanged: changed }),
+    }
+  }
+
+  async function relistClaudeModels(account: ResolvedProfile): Promise<RefreshPart> {
+    const store = credentialStoreForProfile(account)
+    const models = await fetchAccountModels({
+      cacheKey: account.id,
+      auth: () => resolveDesignAuthHeaders({ designToken: null, profile: account, credentialStore: store, ensureFresh: ensureFreshToken }),
+      ...(store ? { refresh: () => refreshOAuthToken(store) } : {}),
+      force: true,
+    })
+    const state = accountModelsState(account.id)
+    return modelsPart({ count: models?.length ?? null, failure: state.failure, listedAt: state.listedAt }, Date.now())
+  }
+
+  function gated(key: string, label: string, read: () => Promise<RefreshPart>): Promise<RefreshPart> {
+    const claim = usageRefreshGate.claim(key)
+    return claim.ok ? read() : Promise.resolve(tooSoonPart(label, claim.retryAfterMs))
+  }
+
+  app.post("/profiles/:id/refresh", async (c) => {
+    if (!isSameOriginRequest(c.req.raw)) {
+      return c.json({ code: "forbidden_origin", error: "Cross-origin profile refreshes are not allowed" }, 403)
+    }
+    const requested = c.req.param("id")
+    const seat = chatGptProfiles?.resolve(requested)
+    if (seat && chatGptProfiles) {
+      // A seat's login is what its usage read just found of its token.
+      const usage = await gated("chatgpt", "Usage", async () => {
+        const read = await readSeatUsageNow(seat.id)
+        return { state: read.state, note: read.note }
+      })
+      const listed = chatGptProfiles.listEntries().find(entry => entry.id === seat.id)
+      const login = listed
+        ? seatLoginPart({ loggedIn: listed.loggedIn, tokenState: listed.tokenState, email: listed.email })
+        : { state: "failed" as const, note: "Meridian no longer lists this seat." }
+      return c.json({ profile: seat.id, parts: { login, usage } })
+    }
+    const target = claudeRefreshTarget(requested)
+    if (target instanceof Response) return target
+    const subscription = target.account.type === "claude-max"
+    let login: RefreshPart
+    let needsLogin = false
+    let accountMoved = false
+    if (target.account.type === "api") {
+      login = { state: "unavailable", note: "This profile uses an API key; there is no login to re-read." }
+    } else {
+      login = await gated(`login:${target.id}`, "The login", async () => {
+        const rechecked = await recheckClaudeLogin(target)
+        needsLogin = rechecked.needsLogin
+        accountMoved = rechecked.accountChanged
+        return rechecked.part
+      })
+    }
+    const [usage, models] = await Promise.all([
+      !subscription
+        ? Promise.resolve<RefreshPart>({ state: "unavailable", note: "This profile signs in with an API key or a fixed token; Meridian reads usage only for a subscription login." })
+        : needsLogin ? Promise.resolve(SKIPPED_WITHOUT_LOGIN)
+        : gated(target.id, "Usage", async () => {
+            const read = await readClaudeUsageNow(target)
+            return { state: read.state, note: read.note }
+          }),
+      needsLogin ? Promise.resolve(SKIPPED_WITHOUT_LOGIN) : gated(`models:${target.id}`, "The model list", () => relistClaudeModels(target.account)),
+    ])
+    const cvp = subscription ? cvpPart({ lastClaudeAiReadingAt: lastClaudeAiReadingAt(target.id), forgotten: accountMoved }, Date.now()) : undefined
+    claudeLog("profile.refreshed", { profile: target.id, login: login.state, usage: usage.state, models: models.state })
+    return c.json({ profile: target.id, parts: { login, usage, models, ...(cvp ? { cvp } : {}) } })
+  })
+
   app.post("/profiles/:id/usage/refresh", async (c) => {
     if (!isSameOriginRequest(c.req.raw)) {
       return c.json({ code: "forbidden_origin", error: "Cross-origin usage refreshes are not allowed" }, 403)
@@ -12203,45 +12350,20 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const requested = c.req.param("id")
     const seat = chatGptProfiles?.resolve(requested)
     if (seat && chatGptProfiles) {
-      // One usage call reads every seat, so the seats share one slot.
       const claim = usageRefreshGate.claim("chatgpt")
       if (!claim.ok) return usageRefreshTooSoon(seat.id, claim.retryAfterMs)
-      await refreshChatGptUsage(true)
-      const entry = chatGptProfiles.quotaEntries().find(e => e.id === seat.id) ?? null
-      const refreshed = !!entry && !entry.error && !entry.stale && entry.fetchedAt !== null
-      return c.json({
-        profile: seat.id,
-        refreshed,
-        note: refreshed ? "Usage re-read just now." : "ChatGPT did not answer with new figures; the last reading stays.",
-        usage: entry,
-      })
+      const read = await readSeatUsageNow(seat.id)
+      return c.json({ profile: seat.id, refreshed: read.refreshed, note: read.note, usage: read.usage })
     }
-    const profiles = getEffectiveProfiles(finalConfig.profiles)
-    const profile = profiles.find(p => p.id === requested)
-    const singleAccount = profiles.length === 0 && requested === "default"
-    if (!profile && !singleAccount) {
-      return c.json({ code: "profile_not_found", error: `Profile "${requested}" does not exist on this Meridian` }, 404)
-    }
-    const resolved = profile ? resolveProfile([profile], profile.id, profile.id) : undefined
-    if (resolved && resolved.type !== "claude-max") {
+    const target = claudeRefreshTarget(requested)
+    if (target instanceof Response) return target
+    if (target.account.type !== "claude-max") {
       return c.json({ code: "not_oauth", error: `Profile "${requested}" has no subscription usage to read; it uses an API key` }, 400)
     }
     const claim = usageRefreshGate.claim(requested)
     if (!claim.ok) return usageRefreshTooSoon(requested, claim.retryAfterMs)
-    const result = await fetchOAuthUsageResult({
-      profileId: singleAccount ? undefined : requested,
-      claudeConfigDir: resolved?.env.CLAUDE_CONFIG_DIR,
-      force: true,
-    })
-    const fresh = result.snapshot !== null && result.snapshot.stale !== true
-    if (fresh) clearResetProfileHealth(requested, openedWindowTypes(result.snapshot!.windows))
-    claudeLog("usage.refresh_requested", { profile: requested, refreshed: fresh, error: result.error })
-    return c.json({
-      profile: requested,
-      refreshed: fresh,
-      note: claudeRefreshNote({ fresh, error: result.error, failureReason: result.failure?.reason ?? null }),
-      usage: { ...toUsageEntry(result), spent: spentProfiles.get(requested) ?? null },
-    })
+    const read = await readClaudeUsageNow(target)
+    return c.json({ profile: requested, refreshed: read.refreshed, note: read.note, usage: read.usage })
   })
   function usageRefreshTooSoon(profile: string, retryAfterMs: number): Response {
     const seconds = Math.max(1, Math.ceil(retryAfterMs / 1000))
@@ -12251,7 +12373,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       retryAfterMs,
     }), { status: 429, headers: { "Content-Type": "application/json", "Retry-After": String(seconds) } })
   }
-
 
   // A claude.ai model-selector reading of one Claude profile's account, from
   // something holding that account's claude.ai session (cvpAccess.ts): the

@@ -233,6 +233,12 @@ export function cvpAccessOn(profileId: string, model: string, now = Date.now()):
   return { model: id, ...decided, ...(name ? { name } : {}) }
 }
 
+/** When the profile's latest claude.ai reading arrived, whether or not it decides any model now; null when none has. */
+export function lastClaudeAiReadingAt(profileId: string): number | null {
+  const times = Object.values(load().profiles[profileId] ?? {}).flatMap(record => record.claude_ai ? [record.claude_ai.at] : [])
+  return times.length > 0 ? Math.max(...times) : null
+}
+
 /** The `cyber_verification` field of a `/v1/models` entry: an entry without its model. */
 export type CyberVerificationField = Omit<CvpEntry, "model" | "name">
 

@@ -161,12 +161,15 @@ at its provider, so card CSS never names one.
   it is a "resets" row under the usage figures; on `/profiles` it is a block
   below them with a small blue "Redeem one" button, which asks for
   confirmation first and shows the outcome in the block.
-- **Refresh usage:** a small icon button with circular arrows. On
-  `/profiles` it is the first of the card's action icons, before Rename and
-  Remove; on `/` it sits at the end of the name row, after the cost, and
-  clicking it never switches the account. While the read runs it spins
-  (still under reduced motion) and is disabled; the outcome is one muted line
-  on the card for a minute, red when the read did not land.
+- **Refresh:** a small icon button with circular arrows, on every profile
+  card. On `/profiles` it is the first of the card's action icons, before
+  Rename and Remove; on `/` it sits at the end of the name row, after the
+  cost, and clicking it never switches the account. While the reads run it
+  spins (still under reduced motion) and is disabled. The outcome stays on the
+  card for a minute as a short muted list, one line per part (Login, Usage,
+  Models, CVP): the part, its state as a word (green "refreshed", yellow "rate
+  limited", red "failed", muted "skipped" / "not readable here"), then the
+  note. Below 520px the note wraps under the part and state.
 - **Forced:** a profile activated past a supervisor's exclusion carries a
   yellow "forced" badge naming when the force ends, and on `/profiles` a blue
   "release" link beside it. Yellow because it is an override, not a fault.

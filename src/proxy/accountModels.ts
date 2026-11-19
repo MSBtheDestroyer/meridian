@@ -51,8 +51,15 @@ interface CacheEntry {
   readonly at: number
 }
 
+/** Why the last read of a profile's list failed: `no_credential`, `upstream_error` (with its status), `malformed` or `request_failed`. */
+export interface AccountModelsFailure {
+  readonly reason: string
+  readonly status?: number
+}
+
 const cache = new Map<string, CacheEntry>()
 const inflight = new Map<string, Promise<AnthropicModel[] | null>>()
+const failures = new Map<string, AccountModelsFailure>()
 
 export interface FetchAccountModelsOpts {
   /** The profile the list belongs to. */
@@ -63,6 +70,8 @@ export interface FetchAccountModelsOpts {
   readonly refresh?: () => Promise<boolean>
   readonly fetchImpl?: FetchLike
   readonly now?: () => number
+  /** Read past the cache (the card's Refresh). A forced read that fails keeps a list read before. */
+  readonly force?: boolean
 }
 
 /**
@@ -74,12 +83,14 @@ export interface FetchAccountModelsOpts {
 export async function fetchAccountModels(opts: FetchAccountModelsOpts): Promise<AnthropicModel[] | null> {
   const now = opts.now ?? Date.now
   const cached = cache.get(opts.cacheKey)
-  if (cached && now() - cached.at < (cached.models ? ACCOUNT_MODELS_TTL_MS : FAILURE_RETRY_AFTER_MS)) return cached.models
+  if (!opts.force && cached && now() - cached.at < (cached.models ? ACCOUNT_MODELS_TTL_MS : FAILURE_RETRY_AFTER_MS)) return cached.models
   const pending = inflight.get(opts.cacheKey)
   if (pending) return pending
   const request = readModels(opts)
     .then(models => {
-      if (inflight.get(opts.cacheKey) === request) cache.set(opts.cacheKey, { models, at: now() })
+      if (inflight.get(opts.cacheKey) === request && (models || !opts.force || !cache.get(opts.cacheKey)?.models)) {
+        cache.set(opts.cacheKey, { models, at: now() })
+      }
       return models
     })
     .finally(() => {
@@ -91,8 +102,9 @@ export async function fetchAccountModels(opts: FetchAccountModelsOpts): Promise<
 
 async function readModels(opts: FetchAccountModelsOpts): Promise<AnthropicModel[] | null> {
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch
-  const failed = (reason: string, status?: number): null => {
-    claudeLog("account_models.unavailable", { profile: opts.cacheKey, reason, ...(status === undefined ? {} : { status }) })
+  const failed = (reason: string, status?: number, detail?: string): null => {
+    failures.set(opts.cacheKey, status === undefined ? { reason } : { reason, status })
+    claudeLog("account_models.unavailable", { profile: opts.cacheKey, reason: detail ?? reason, ...(status === undefined ? {} : { status }) })
     return null
   }
   try {
@@ -101,16 +113,17 @@ async function readModels(opts: FetchAccountModelsOpts): Promise<AnthropicModel[
     let response = await callModels(auth, fetchImpl)
     if (response.status === 401 && opts.refresh && await opts.refresh()) {
       auth = await opts.auth()
-      if (Object.keys(auth).length === 0) return failed("no_credential_after_refresh")
+      if (Object.keys(auth).length === 0) return failed("no_credential", undefined, "no_credential_after_refresh")
       response = await callModels(auth, fetchImpl)
     }
     if (!response.ok) return failed("upstream_error", response.status)
     const parsed = anthropicModelList.safeParse(await response.json())
     if (!parsed.success) return failed("malformed")
+    failures.delete(opts.cacheKey)
     claudeLog("account_models.read", { profile: opts.cacheKey, count: parsed.data.data.length })
     return parsed.data.data
   } catch (err) {
-    return failed(err instanceof Error ? err.message : String(err))
+    return failed("request_failed", undefined, err instanceof Error ? err.message : String(err))
   }
 }
 
@@ -156,13 +169,21 @@ export function toAccountModelList(
   })
 }
 
+/** When the profile's list in use was read (null when none is), and why the last read failed (null after a success). */
+export function accountModelsState(cacheKey: string): { listedAt: number | null; failure: AccountModelsFailure | null } {
+  const entry = cache.get(cacheKey)
+  return { listedAt: entry?.models ? entry.at : null, failure: failures.get(cacheKey) ?? null }
+}
+
 /** Forget one profile's list (a new login may be another account), or all of them. */
 export function clearAccountModels(cacheKey?: string): void {
   if (cacheKey === undefined) {
     cache.clear()
     inflight.clear()
+    failures.clear()
     return
   }
   cache.delete(cacheKey)
   inflight.delete(cacheKey)
+  failures.delete(cacheKey)
 }

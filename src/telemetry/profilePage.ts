@@ -354,8 +354,7 @@ export const profilePageHtml = `<!DOCTYPE html>
   /* Forced past a supervisor's exclusion: an override, so yellow, with its release beside it. */
   .badge-forced { background: rgba(var(--yellow-rgb),0.15); color: var(--yellow); }
   .forced-release { font-size: 12px; }
-  .usage-refresh-outcome { font-size: 12px; color: var(--muted); margin: -4px 0 10px; overflow-wrap: anywhere; }
-  .usage-refresh-outcome.err { color: var(--red); }
+  .profile-card > .refresh-outcome { font-size: 12px; margin: -4px 0 10px; }
   /* Banked free resets: green while one can be redeemed, muted while all are held back. */
   .usage-extra.free-resets .usage-pct { color: var(--green); }
   .usage-extra.free-resets.held .usage-pct { color: var(--muted); }
@@ -1295,19 +1294,16 @@ function render(data, quotaData) {
         html += '<button type="button" class="link-btn forced-release" onclick="releaseForcedProfile()">release</button>';
       }
       html += "<span class=\\"profile-card-actions\\">";
-      if (hasUsageReading(p)) {
-        var refreshingUsage = meridianProfileActions.refreshing(p.id);
-        html += '<button type="button" class="icon-btn usage-refresh' + (refreshingUsage ? ' spinning' : '') + '" title="Refresh usage now" aria-label="Refresh usage of ' + attr(p.id) + '"'
-          + ' data-profile="' + attr(p.id) + '" onclick="refreshProfileUsage(this.getAttribute(&quot;data-profile&quot;))"' + (refreshingUsage ? ' disabled' : '') + '>' + ICON_REFRESH + '</button>';
-      }
+      var refreshingProfile = meridianProfileActions.refreshing(p.id);
+      html += '<button type="button" class="icon-btn profile-refresh' + (refreshingProfile ? ' spinning' : '') + '" title="Refresh this profile: login, usage, models" aria-label="Refresh ' + attr(p.id) + '"'
+        + ' data-profile="' + attr(p.id) + '" onclick="refreshProfile(this.getAttribute(&quot;data-profile&quot;))"' + (refreshingProfile ? ' disabled' : '') + '>' + ICON_REFRESH + '</button>';
       html += "<button class=\\"icon-btn\\" title=\\"Rename profile\\" onclick=\\"startRename(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_PENCIL + "</button>";
       html += "<button class=\\"icon-btn danger\\" title=\\"" + (isChatGptProfile(p) ? "Remove seat" : "Remove profile") + "\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
       html += "</span>";
     }
     html += '</div>';
     html += meridianCardStatus.updateHtml(update);
-    var usageOutcome = meridianProfileActions.outcome(p.id);
-    if (usageOutcome) html += '<div class="usage-refresh-outcome' + (usageOutcome.ok ? '' : ' err') + '" role="status">' + esc(usageOutcome.text) + '</div>';
+    html += meridianProfileActions.outcomeHtml(p.id);
 
     if (editingProfile === p.id && renameError) {
       html += '<div class="rename-error">' + esc(renameError) + '</div>';
@@ -1553,14 +1549,8 @@ function releaseForcedProfile() {
   return meridianProfileActions.release(refresh);
 }
 
-// Claude subscription accounts and ChatGPT seats have usage to re-read; an
-// API-key profile has none.
-function hasUsageReading(p) {
-  return isChatGptProfile(p) || (p.type || 'claude-max') === 'claude-max';
-}
-
-function refreshProfileUsage(id) {
-  return meridianProfileActions.refreshUsage(id, function (finished) { return finished ? refresh() : redraw(); });
+function refreshProfile(id) {
+  return meridianProfileActions.refreshProfile(id, function (finished) { return finished ? refresh() : redraw(); });
 }
 
 // --- Browser login ---

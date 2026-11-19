@@ -1,7 +1,8 @@
 /**
- * "Refresh usage" on a profile card: the per-profile gate that keeps repeated
- * clicks from reaching the provider more than once per interval, and which
- * windows a fresh reading shows open again.
+ * The usage part of a profile card's Refresh: the per-profile gate that keeps
+ * repeated clicks from reaching the provider more than once per interval
+ * (each refreshed part has its own slot, see profileRefresh.ts), which
+ * windows a fresh reading shows open again, and what the card says.
  *
  * Leaf module: no imports beyond types.
  */
@@ -43,10 +44,28 @@ type UsageReadError = "no_token" | "rate_limited" | "upstream_error"
  * cooldown inside the stale window answers the old snapshot with no error,
  * so the failure record is what says why it did not land.
  */
-export function claudeRefreshNote(read: { readonly fresh: boolean; readonly error: UsageReadError | null; readonly failureReason: UsageReadError | null }): string {
+export function claudeRefreshNote(read: {
+  readonly fresh: boolean
+  readonly error: UsageReadError | null
+  readonly failureReason: UsageReadError | null
+  /** Whether Meridian holds any earlier reading, which is all "the last reading" can mean. */
+  readonly hadReading: boolean
+}): string {
   if (read.fresh) return "Usage re-read just now."
   const why = read.error ?? read.failureReason
-  if (why === "rate_limited") return "Anthropic is rate limiting usage reads for this account; the last reading stays until the cooldown ends."
+  if (why === "rate_limited") {
+    return read.hadReading
+      ? "Anthropic is rate limiting usage reads for this account; the last reading stays until the cooldown ends."
+      : "Anthropic is rate limiting usage reads for this account, and Meridian has no reading of it yet; try again once the cooldown ends."
+  }
   if (why === "no_token") return "No usable login to read usage with; sign this profile in again."
-  return "Anthropic did not answer with new figures; the last reading stays."
+  return read.hadReading
+    ? "Anthropic did not answer with new figures; the last reading stays."
+    : "Anthropic did not answer with figures, and Meridian has no reading of this account yet."
+}
+
+/** Whether a usage refresh landed, was turned away by a rate limit, or failed. */
+export function usageReadState(read: { readonly fresh: boolean; readonly error: UsageReadError | null; readonly failureReason: UsageReadError | null }): "fresh" | "rate_limited" | "failed" {
+  if (read.fresh) return "fresh"
+  return (read.error ?? read.failureReason) === "rate_limited" ? "rate_limited" : "failed"
 }

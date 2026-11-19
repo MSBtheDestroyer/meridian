@@ -7,12 +7,13 @@
  *   anyway" while forcing is allowed, "Release and switch" when another
  *   profile is forced, else where the forcing setting lives.
  * - `release(done)` ends a forced profile.
- * - `refreshUsage(id, done)` re-reads the profile's usage from its provider
- *   now (`POST /profiles/:id/usage/refresh`) and keeps the outcome for the
- *   card to show for a minute; `refreshing(id)` and `outcome(id)` are what a
- *   render reads, `busy()` what a poll checks before redrawing.
+ * - `refreshProfile(id, done)` re-reads what Meridian can about the profile
+ *   now (`POST /profiles/:id/refresh`: login, usage, model list, and where
+ *   CVP access comes from) and keeps the outcome, one line per part, for the
+ *   card to show for a minute; `refreshing(id)` and `outcomeHtml(id)` are
+ *   what a render reads, `busy()` what a poll checks before redrawing.
  *
- * `done` runs after a change so the page redraws; `refreshUsage` also runs
+ * `done` runs after a change so the page redraws; `refreshProfile` also runs
  * it with `false` as the read starts (redraw what you have) and with `true`
  * once it ended (fetch the new figures). The profileCardStatus.ts
  * pattern: one browser-side copy, interpolated as a string into each page.
@@ -72,15 +73,25 @@ var meridianProfileActions = (function () {
   var inflight = Object.create(null);
   var outcomes = Object.create(null);
   var OUTCOME_MS = 60000;
-  async function refreshUsage(id, done) {
+  var PART_LABELS = { login: 'Login', usage: 'Usage', models: 'Models', cvp: 'CVP' };
+  var PART_ORDER = ['login', 'usage', 'models', 'cvp'];
+  async function refreshProfile(id, done) {
     if (inflight[id]) return;
     inflight[id] = true;
     if (done) done(false);
-    var r = await post('/profiles/' + encodeURIComponent(id) + '/usage/refresh');
+    var r = await post('/profiles/' + encodeURIComponent(id) + '/refresh');
     delete inflight[id];
-    var text = r.data && typeof r.data.note === 'string' ? r.data.note
-      : meridianDialog.errorText(r.data, r.status === 0 ? 'Could not reach Meridian.' : 'Meridian refused the refresh (HTTP ' + r.status + ').');
-    outcomes[id] = { ok: r.ok && !!(r.data && r.data.refreshed), text: text, at: Date.now() };
+    var parts = [];
+    var answered = r.ok && r.data && r.data.parts;
+    if (answered) {
+      PART_ORDER.forEach(function (name) {
+        var part = r.data.parts[name];
+        if (part && typeof part.note === 'string') parts.push({ label: PART_LABELS[name], state: part.state, note: part.note });
+      });
+    } else {
+      parts.push({ label: 'Refresh', state: 'failed', note: meridianDialog.errorText(r.data, r.status === 0 ? 'Could not reach Meridian.' : 'Meridian refused the refresh (HTTP ' + r.status + ').') });
+    }
+    outcomes[id] = { parts: parts, at: Date.now() };
     refreshHeader();
     if (done) await done(true);
   }
@@ -91,17 +102,46 @@ var meridianProfileActions = (function () {
     if (o && Date.now() - o.at > OUTCOME_MS) { delete outcomes[id]; o = null; }
     return o || null;
   }
-  return { activate: activate, release: release, refreshUsage: refreshUsage, refreshing: refreshing, busy: busy, outcome: outcome };
+  // The card's inline note: one line per part, its state as a word and a
+  // colour, so a rate limit reads apart from a failure without a dialog.
+  var STATE_WORDS = { fresh: 'refreshed', rate_limited: 'rate limited', failed: 'failed', skipped: 'skipped', unavailable: 'not readable here' };
+  function outcomeHtml(id) {
+    var o = outcome(id);
+    if (!o) return '';
+    var text = function (value) { var d = document.createElement('div'); d.textContent = value; return d.innerHTML; };
+    return '<ul class="refresh-outcome" role="status" aria-label="Refresh outcome">' + o.parts.map(function (part) {
+      var state = STATE_WORDS[part.state] ? part.state : 'failed';
+      return '<li class="refresh-part ' + state + '"><span class="refresh-part-label">' + text(part.label) + '</span>'
+        + '<span class="refresh-part-state">' + text(STATE_WORDS[state]) + '</span>'
+        + '<span class="refresh-part-note">' + text(part.note) + '</span></li>';
+    }).join('') + '</ul>';
+  }
+  return { activate: activate, release: release, refreshProfile: refreshProfile, refreshing: refreshing, busy: busy, outcome: outcome, outcomeHtml: outcomeHtml };
 })();
 `
 
 /** The circular-arrows icon of the refresh button, 14px like the other card icons. */
 export const ICON_REFRESH_SVG = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2.5a5.487 5.487 0 00-4.131 1.869l1.204 1.204A.25.25 0 014.896 6H1.25A.25.25 0 011 5.75V2.104a.25.25 0 01.427-.177l1.38 1.38A7.001 7.001 0 0114.95 7.16a.75.75 0 11-1.49.178A5.501 5.501 0 008 2.5zM1.705 8.005a.75.75 0 01.834.656 5.501 5.501 0 009.592 2.97l-1.204-1.204a.25.25 0 01.177-.427h3.646a.25.25 0 01.25.25v3.646a.25.25 0 01-.427.177l-1.38-1.38A7.001 7.001 0 011.05 8.84a.75.75 0 01.656-.834z"/></svg>'
 
-/** The refresh button's spin while its read runs; still under reduced motion. */
+/**
+ * The refresh button's spin while its reads run (still under reduced motion),
+ * and the per-part outcome under the card's name row: label, state, note on
+ * one line that wraps the note beneath on a narrow card.
+ */
 export const profileActionsCss = `
-  .usage-refresh.spinning svg { animation: usage-refresh-spin 0.9s linear infinite; }
-  @keyframes usage-refresh-spin { to { transform: rotate(360deg); } }
-  @media (prefers-reduced-motion: reduce) { .usage-refresh.spinning svg { animation: none; } }
-  .usage-refresh[disabled] { opacity: 0.6; cursor: progress; }
+  .profile-refresh.spinning svg { animation: profile-refresh-spin 0.9s linear infinite; }
+  @keyframes profile-refresh-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .profile-refresh.spinning svg { animation: none; } }
+  .profile-refresh[disabled] { opacity: 0.6; cursor: progress; }
+  .refresh-outcome { list-style: none; margin: 0 0 8px; padding: 0; font-size: 11px; color: var(--muted); display: grid; gap: 2px; }
+  .refresh-part { display: grid; grid-template-columns: 4.5em 8.5em minmax(0, 1fr); gap: 6px; align-items: baseline; }
+  .refresh-part-label { color: var(--text); }
+  .refresh-part-note { overflow-wrap: anywhere; }
+  .refresh-part.fresh .refresh-part-state { color: var(--green); }
+  .refresh-part.rate_limited .refresh-part-state { color: var(--yellow); }
+  .refresh-part.failed .refresh-part-state { color: var(--red); }
+  @media (max-width: 520px) {
+    .refresh-part { grid-template-columns: auto minmax(0, 1fr); }
+    .refresh-part-note { grid-column: 1 / -1; }
+  }
 `

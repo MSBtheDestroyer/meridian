@@ -100,11 +100,13 @@ Record what Meridian did and show it to the operator:
   of `/v1/usage/quota/all` (the page's refresh, or Vibeterm's re-check) shows
   the new state.
 
-- **Refresh usage is one click per card.** Every Claude subscription card and
-  ChatGPT seat on `/` and `/profiles` carries a refresh icon that posts
-  `POST /profiles/:id/usage/refresh` (`profileActions.ts`). The icon spins and
-  is disabled while the read runs, the poll is held meanwhile, and the
-  outcome (re-read, rate limited, too soon) stays on the card for a minute.
+- **Refresh is one click per card.** Every profile card and ChatGPT seat on
+  `/` and `/profiles` carries a refresh icon that posts
+  `POST /profiles/:id/refresh` (`profileActions.ts`): login, usage, model
+  list, and where CVP access comes from. The icon spins and is disabled while
+  the reads run, the poll is held meanwhile, and the outcome stays on the card
+  for a minute as one inline line per part (`outcomeHtml`): the part, its
+  state in words and colour, and the route's note. Never a dialog.
 
 - **No native dialogs.** No page calls `alert`, `confirm` or `prompt`. The
   shared header carries `window.meridianDialog` (`dialog.ts`): a queued,

@@ -324,9 +324,16 @@ Unlike `routingExcludedProfiles`, which refuses pinned work and still allows war
 
 Settings, Routing, **Allow forcing a forbidden profile** (off by default) lets you activate a Claude profile that a supervisor keeps out of work, through its managed exclusions, its held list or a usage reserve. The refusal dialog then offers **Activate anyway**. The profile stays active for up to five hours, or until you release it (the release link on its card, the Release button beside the setting, or switching with "Release and switch"); meanwhile the supervisor's lists still name it but do not move work or the pointer off it, and a switch to another profile is refused with `profile_forced`. Your own exclusion list and a missing login are never forced past. Turning the setting off ends a force in effect.
 
-### Refreshing usage
+### Refreshing a profile
 
-The refresh icon on each card re-reads that profile's usage from Anthropic (or ChatGPT) right away, for example after a reset made outside Meridian. Routing and reserves see the new figures at once, and refusals the new reading shows are over are cleared. One refresh per profile per 30 seconds; `POST /profiles/<id>/usage/refresh` does the same from a script.
+The refresh icon on each card re-reads what Meridian knows about that profile right away, for example after a reset or a re-login made outside Meridian, and shows one line per part:
+
+- **Login:** asks Claude Code again whether the profile is signed in and which account it holds. If it now holds another account, what Meridian knew about the previous one is dropped first.
+- **Usage:** re-reads usage from Anthropic (or ChatGPT). Routing and reserves see the new figures at once, and refusals the new reading shows are over are cleared.
+- **Models:** re-lists the models the account may use.
+- **CVP:** Meridian cannot read Cyber Verification Program access itself; the line says how old the last claude.ai reading is.
+
+Each part is re-read at most once per profile per 30 seconds. `POST /profiles/<id>/refresh` does the same from a script; `POST /profiles/<id>/usage/refresh` re-reads usage alone.
 
 ### Profile commands
 

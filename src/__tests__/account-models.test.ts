@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "bun:test"
-import { clearAccountModels, fetchAccountModels, toAccountModelList } from "../proxy/accountModels"
+import { accountModelsState, clearAccountModels, fetchAccountModels, toAccountModelList } from "../proxy/accountModels"
 import { buildModelList } from "../proxy/openai"
 
 const MYTHOS = {
@@ -120,6 +120,25 @@ describe("fetchAccountModels", () => {
     expect(await fetchAccountModels({ cacheKey: "team", auth, fetchImpl })).toBeNull()
 
     expect(calls).toHaveLength(1)
+  })
+
+  it("reads past a fresh list when forced, and keeps that list when a forced read fails", async () => {
+    const { calls, fetchImpl } = upstream([ok([SONNET]), ok([MYTHOS, SONNET]), () => new Response("{}", { status: 429 })])
+    const auth = async () => ({ Authorization: "Bearer t" })
+    let now = 1_000
+
+    await fetchAccountModels({ cacheKey: "team", auth, fetchImpl, now: () => now })
+    now = 2_000
+    const forced = await fetchAccountModels({ cacheKey: "team", auth, fetchImpl, now: () => now, force: true })
+    expect(forced?.map(model => model.id)).toEqual(["claude-mythos-5-2", "claude-sonnet-4-6"])
+    expect(accountModelsState("team")).toEqual({ listedAt: 2_000, failure: null })
+
+    now = 3_000
+    expect(await fetchAccountModels({ cacheKey: "team", auth, fetchImpl, now: () => now, force: true })).toBeNull()
+    expect(accountModelsState("team")).toEqual({ listedAt: 2_000, failure: { reason: "upstream_error", status: 429 } })
+    const served = await fetchAccountModels({ cacheKey: "team", auth, fetchImpl, now: () => now })
+    expect(served?.map(model => model.id)).toEqual(["claude-mythos-5-2", "claude-sonnet-4-6"])
+    expect(calls).toHaveLength(3)
   })
 
   it("forgets one profile's list on clear", async () => {

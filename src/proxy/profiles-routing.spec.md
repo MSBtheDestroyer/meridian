@@ -191,7 +191,33 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   `{profile, refreshed, note, usage}`, `usage` in the `/v1/usage/quota/all`
   entry shape; 404 `profile_not_found`, 400 `not_oauth` for an API-key
   profile. `GET /settings/api/routing` lists `usage-refresh` in
-  `capabilities`.
+  `capabilities`. A note never says "the last reading stays" for a profile
+  Meridian holds no reading of: there is none to stay.
+- **Refreshing a profile.** `POST /profiles/:id/refresh` (API key, same-origin
+  browser writes) re-reads everything Meridian can about one profile, for a
+  reset, top-up or re-login made outside it, and answers
+  `{profile, parts: {login, usage, models?, cvp?}}`, each part
+  `{state, note, retryAfterMs?}` with `state` one of `fresh`, `rate_limited`
+  (the provider's limit or the part's own budget), `failed`, `skipped` (the
+  login it needs is gone) or `unavailable` (nothing Meridian can read for it).
+  One endpoint, so the card has one control and one outcome; each part keeps
+  its own 30-second slot, so a part refused as too soon does not hold the
+  others back, and the usage slot is the one `usage/refresh` uses.
+  The login part runs first: `claude auth status` again for that profile only,
+  waited for rather than served from its cache (`recheckClaudeAuthStatus`);
+  the stored credential read as `/profiles/list` reads it; and, signed in,
+  the account read again (`refreshOrganizationNow`). A login that now holds
+  another account drops the previous one's usage, health, model list and CVP
+  map (`clearSignedInProfileFacts`) before the other parts run. With no usable
+  login, usage and models are `skipped`. The models part re-lists the
+  account's `/v1/models` past its ten-minute cache; a failed forced read keeps
+  the list read before and says how old it is. The cvp part is always
+  `unavailable` (see "CVP access is learned, never fetched") and names the age
+  of the last claude.ai reading, which the next one replaces. A ChatGPT seat
+  answers `login` and `usage` from one forced usage call, which is also what
+  says whether its token is accepted. An API-key profile answers `login` and
+  `usage` `unavailable` and re-lists its models. 404 `profile_not_found`;
+  `capabilities` lists `profile-refresh`.
 - **A pinned model list is that account's own.** `GET /v1/models` with
   `x-meridian-profile` naming a Claude profile answers the Claude models
   Anthropic's `GET /v1/models?limit=1000` lists for that profile's own
