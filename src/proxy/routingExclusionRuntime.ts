@@ -109,6 +109,16 @@ export function profileHeldResponse(profileId: string, extra?: Record<string, un
   }), { status: 409, headers: { "Content-Type": "application/json" } })
 }
 
+export function profileNoCvpResponse(profileId: string, model: string): Response {
+  return new Response(JSON.stringify({
+    type: "error",
+    error: {
+      type: "profile_no_cvp",
+      message: `Profile "${profileId}" holds no CVP access on ${model}`,
+    },
+  }), { status: 403, headers: { "Content-Type": "application/json" } })
+}
+
 export function noEligibleProfilesResponse(): Response {
   return new Response(JSON.stringify({
     type: "error",

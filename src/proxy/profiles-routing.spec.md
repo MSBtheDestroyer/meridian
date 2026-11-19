@@ -252,7 +252,10 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   profile while it qualifies. Unflagged work reads none of the three cvp
   settings. A profile out by an exclusion reports reason `excluded`. With none, the request is refused unsent with
   `no_routable_account` and reason `no_cvp` (null `resets_at`: waiting will
-  not grant access). Pins, warms and priority hops are exempt; an unknown
+  not grant access). Pins, warms and priority hops are exempt from that
+  routing, but a pin carrying the header whose account's map shows the model
+  `inactive` is refused unsent with `403 profile_no_cvp` (a profile with no
+  reading for the model is sent, and its refusal teaches the map); an unknown
   requirement token is 400, so a newer client's requirement is never routed
   as if met. `GET /v1/models` with the header lists only models with access:
   a pinned account's own, or unpinned every reachable account's, each with

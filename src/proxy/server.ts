@@ -194,7 +194,7 @@ import { createHookDispatcher, HOOK_EVENTS, HOOK_LIMITS, hookTargetLabel, parseH
 import { createOAuthCallbackRegistry, normalizePublicUrl, requestPublicOrigin } from "./oauthCallbacks"
 import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
 import { filterEligibleProfileIds, mergeRoutingExcludedProfiles, parseRoutingExcludedProfiles } from "./routingExclusions"
-import { canonicalRoutingExcludedProfileIds, evaluateRoutingProfileAccess, noEligibleProfilesResponse, profileExcludedResponse, profileHeldResponse, replacementForExcludedActive } from "./routingExclusionRuntime"
+import { canonicalRoutingExcludedProfileIds, evaluateRoutingProfileAccess, noEligibleProfilesResponse, profileExcludedResponse, profileHeldResponse, profileNoCvpResponse, replacementForExcludedActive } from "./routingExclusionRuntime"
 import {
   describeUsageReserveHold,
   newestClaudeWindows,
@@ -3328,7 +3328,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // `x-meridian-require: cvp` limits unpinned work to accounts whose CVP
         // map shows access on the requested model, in the cvp order behind the
         // cvp pointer, past the cvp managed list. A pin, a warm and a priority
-        // hop (whose candidates were already chosen) are exempt.
+        // hop (whose candidates were already chosen) are exempt from that
+        // routing; a pin is still refused below when its account lacks CVP.
         const requirements = parseRoutingRequirements(c.req.header(ROUTING_REQUIRE_HEADER))
         if (requirements.unknown.length > 0) {
           return c.json({
@@ -3392,6 +3393,15 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             const exhaustive: never = routingAccess.access
             return exhaustive
           }
+        }
+        // A pin carrying the requirement goes to that account, but not when its
+        // map says it lacks CVP on the model: the client asked for CVP work on
+        // that account, and sending it would only get it refused upstream. A
+        // profile with no reading is sent, and its refusal teaches the map.
+        const pinnedForCvp = requirements.cvp && !warmProfileId && !options.forcedProfileId ? c.req.header("x-meridian-profile") : undefined
+        if (pinnedForCvp && cvpModel && cvpAccessOn(pinnedForCvp, cvpModel)?.type === "inactive") {
+          claudeLog("routing.pin_no_cvp", { profile: pinnedForCvp, model: normalizeCvpModel(cvpModel) })
+          return profileNoCvpResponse(pinnedForCvp, normalizeCvpModel(cvpModel))
         }
         // Priority mode (opt-in): unpinned requests are dispatched across the
         if (isPoolRouting(routingMode) && !options.forcedProfileId && !c.req.header("x-meridian-profile")) {

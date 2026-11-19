@@ -278,6 +278,27 @@ describe("x-meridian-require: cvp on /v1/messages", () => {
     expect(served).toEqual(["token-max"])
   })
 
+  it("sends a pin with the requirement to the pinned holder, even past the cvp pointer", async () => {
+    const server = app()
+    await postReading(server, "team", TEAM_READING)
+    await postReading(server, "team2", TEAM_READING)
+
+    expect((await message(server, { "x-meridian-require": "cvp", "x-meridian-profile": "team2" })).status).toBe(200)
+    expect(served).toEqual(["token-team2"])
+  })
+
+  it("refuses a pin with the requirement, unsent, when the pinned profile's map says it lacks CVP on the model", async () => {
+    const server = app()
+    await postReading(server, "team", TEAM_READING)
+
+    const response = await message(server, { "x-meridian-require": "cvp", "x-meridian-profile": "team" }, "claude-fable-5-2")
+    expect(response.status).toBe(403)
+    const body = await response.json() as { error: { type: string; message: string } }
+    expect(body.error.type).toBe("profile_no_cvp")
+    expect(body.error.message).toBe('Profile "team" holds no CVP access on claude-fable-5-2')
+    expect(served).toEqual([])
+  })
+
   it("refuses an unknown requirement", async () => {
     const response = await message(app(), { "x-meridian-require": "zdr" })
     expect(response.status).toBe(400)
