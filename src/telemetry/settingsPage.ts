@@ -545,7 +545,7 @@ async function saveChatGpt(key, value) {
   });
   if (!res.ok) {
     const err = await res.json().catch(function () { return {}; });
-    alert(err.error || 'Failed to save ChatGPT settings');
+    meridianDialog.fail('Could not save the ChatGPT settings', err, 'Meridian refused the change (HTTP ' + res.status + ').');
   } else {
     showSaved();
   }
@@ -687,7 +687,7 @@ async function putPricing(model, rates) {
   });
   if (!res.ok) {
     const err = await res.json().catch(function () { return {}; });
-    alert('Could not save pricing: ' + (err.error || ('HTTP ' + res.status)));
+    meridianDialog.fail('Could not save pricing for ' + model, err, 'Meridian refused the change (HTTP ' + res.status + ').');
     return false;
   }
   showSaved();
@@ -772,8 +772,8 @@ async function addPricingModel() {
   const name = document.getElementById('newModelName').value.trim();
   const inputRate = parseFloat(document.getElementById('newModelInput').value);
   const outputRate = parseFloat(document.getElementById('newModelOutput').value);
-  if (!name) { alert('Enter a model id'); return; }
-  if (!isFinite(inputRate) || !isFinite(outputRate)) { alert('Enter input and output rates (USD per million tokens)'); return; }
+  if (!name) { meridianDialog.tell('Add a model', 'Enter a model id.'); return; }
+  if (!isFinite(inputRate) || !isFinite(outputRate)) { meridianDialog.tell('Add a model', 'Enter input and output rates, in USD per million tokens.'); return; }
   const rates = { inputPerMTok: inputRate, outputPerMTok: outputRate };
   const cacheRead = parseFloat(document.getElementById('newModelCacheRead').value);
   const cacheWrite = parseFloat(document.getElementById('newModelCacheWrite').value);
@@ -787,6 +787,7 @@ async function addPricingModel() {
   }
 }
 
+var routingForceShown = false;
 async function loadRouting() {
   const res = await fetch('/settings/api/routing');
   const cfg = await res.json();
@@ -820,7 +821,53 @@ async function loadRouting() {
         + ' <button data-move="down" data-i="'+i+'" style="background:var(--surface);color:var(--muted);border:1px solid var(--border);border-radius:4px;padding:1px 8px;cursor:pointer"'+(i===cfg.profileOrder.length-1?' disabled':'')+'>&darr;</button>'
         + '</li>').join('')
     + '</ol></div>';
+  // Forcing: the boss may activate a profile a supervisor keeps out of work.
+  var forced = cfg.forcedActiveProfile;
+  h += '<div id="routing-force" style="margin-top:14px">' + settingRowHtml({
+    label: 'Allow forcing a forbidden profile',
+    forId: 'routing-allow-force',
+    controlHtml: '<input type="checkbox" id="routing-allow-force"' + (cfg.allowForcingForbiddenProfile ? ' checked' : '') + '>',
+    desc: 'When a routing supervisor (such as Vibeterm\u2019s fleet policy) keeps a Claude profile out of work, through its managed exclusions, its held list or a usage reserve, '
+      + 'activating that profile on Home or Profiles offers \u201cActivate anyway\u201d. A forced profile stays active for up to five hours, or until you release it, and the supervisor '
+      + 'cannot switch away from it meanwhile. Your own exclusions and a missing login are never forced past. Off by default.',
+    statusHtml: [
+      nowLine(cfg.allowForcingForbiddenProfile ? 'allowed' : 'off'),
+      forced
+        ? 'Forced now: <code>' + telemetryEsc(forced.profile) + '</code> until ' + telemetryEsc(new Date(forced.until).toLocaleString())
+          + ' <button type="button" class="reset-btn" id="routing-release-force">Release</button>'
+        : '',
+    ],
+  }) + '</div>';
   el.innerHTML = h;
+  // The refusal dialog on Home and Profiles links here; the row exists only once loaded.
+  if (location.hash === '#routing-force' && !routingForceShown) {
+    routingForceShown = true;
+    document.getElementById('routing-force').scrollIntoView({ block: 'center' });
+  }
+  document.getElementById('routing-allow-force').addEventListener('change', async (e) => {
+    const box = e.target;
+    box.disabled = true;
+    try {
+      const res = await fetch('/settings/api/routing', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ allowForcingForbiddenProfile: box.checked }) });
+      if (!res.ok) meridianDialog.fail('Could not save the forcing setting', await res.json().catch(() => null), 'Meridian refused the change (HTTP ' + res.status + ').');
+      else showSaved();
+    } catch {
+      meridianDialog.fail('Could not save the forcing setting', null, 'Could not reach Meridian.');
+    }
+    await loadRouting();
+  });
+  const releaseButton = document.getElementById('routing-release-force');
+  if (releaseButton) releaseButton.addEventListener('click', async () => {
+    releaseButton.disabled = true;
+    try {
+      const res = await fetch('/profiles/forced/release', { method: 'POST' });
+      if (!res.ok) meridianDialog.fail('Could not release the forced profile', await res.json().catch(() => null), 'Meridian refused (HTTP ' + res.status + ').');
+      else if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+    } catch {
+      meridianDialog.fail('Could not release the forced profile', null, 'Could not reach Meridian.');
+    }
+    await loadRouting();
+  });
   document.getElementById('routing-mode').addEventListener('change', async (e) => {
     await fetch('/settings/api/routing', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ routing: e.target.value }) });
     await loadRouting();
@@ -963,7 +1010,7 @@ async function putTelemetry(body) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    alert(err.error || 'Failed to save telemetry settings');
+    meridianDialog.fail('Could not save the telemetry settings', err, 'Meridian refused the change (HTTP ' + res.status + ').');
   } else {
     showSaved();
   }
@@ -1002,7 +1049,7 @@ async function putTranscripts(body) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    alert(err.error || 'Failed to save transcript retention');
+    meridianDialog.fail('Could not save transcript retention', err, 'Meridian refused the change (HTTP ' + res.status + ').');
   } else {
     showSaved();
   }
@@ -1069,7 +1116,7 @@ async function putUpdates(checkForUpdates) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    alert(err.error || 'Failed to save update settings');
+    meridianDialog.fail('Could not save the update settings', err, 'Meridian refused the change (HTTP ' + res.status + ').');
   } else {
     showSaved();
     if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
@@ -1154,12 +1201,12 @@ async function putClaudeExecutable(body) {
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      alert(err.error || 'Failed to save the Claude Code executable');
+      meridianDialog.fail('Could not save the Claude Code executable', err, 'Meridian refused the change (HTTP ' + res.status + ').');
     } else {
       showSaved();
     }
   } catch {
-    alert('Failed to save the Claude Code executable');
+    meridianDialog.fail('Could not save the Claude Code executable', null, 'Could not reach Meridian.');
   }
   await loadClaudeExecutable();
 }
@@ -1190,17 +1237,17 @@ async function putHeaderSettings(showHostname) {
     if (!res.ok) {
       checkbox.checked = !showHostname;
       const err = await res.json().catch(() => ({}));
-      alert(err.error || 'Failed to save header settings');
+      meridianDialog.fail('Could not save the header settings', err, 'Meridian refused the change (HTTP ' + res.status + ').');
     } else {
       showSaved();
       if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
     }
   } catch {
     checkbox.checked = !showHostname;
-    alert('Failed to save header settings');
+    meridianDialog.fail('Could not save the header settings', null, 'Could not reach Meridian.');
   } finally {
     try { await loadHeaderSettings(); }
-    catch { alert('Failed to reload header settings'); }
+    catch { meridianDialog.fail('Could not reload the header settings', null, 'Could not reach Meridian.'); }
     checkbox.disabled = false;
   }
 }
@@ -1369,7 +1416,7 @@ async function putLayout(layout) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    alert(err.error || 'Failed to save the layout');
+    meridianDialog.fail('Could not save the layout', err, 'Meridian refused the change (HTTP ' + res.status + ').');
   } else {
     const saved = await res.json();
     if (saved.layout === 'contained') document.documentElement.removeAttribute('data-layout');

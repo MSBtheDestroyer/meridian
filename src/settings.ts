@@ -22,6 +22,7 @@ import type { ClaudeExtraUsagePolicy, PriorityFailbackPolicy } from "./proxy/rou
 import type { UsageReserveMap } from "./proxy/usageReserve"
 import type { ClaudeExecutableMode } from "./proxy/claudeExecutablePreference"
 import type { PageLayout } from "./telemetry/pageLayout"
+import type { ForcedProfile } from "./proxy/forcedProfile"
 
 /**
  * Resolve the settings file path.
@@ -70,6 +71,20 @@ export interface MeridianSettings {
    * `PUT /settings/api/routing`; re-read per request.
    */
   routingHeldProfiles?: string[]
+  /**
+   * Per profile id, why the supervisor keeps it out of work, in its own
+   * words; shown when someone tries to activate it. Written through
+   * `PUT /settings/api/routing` with the lists.
+   */
+  routingManagedReasons?: Record<string, string>
+  /**
+   * The boss's override: `POST /profiles/active` with `force: true` may
+   * activate a Claude profile a supervisor keeps out (managed exclusion, hold
+   * or usage reserve). Off unless switched on in Settings, Routing.
+   */
+  allowForcingForbiddenProfile?: boolean
+  /** The profile forced active and until when (proxy/forcedProfile.ts). */
+  forcedActiveProfile?: ForcedProfile
   /**
    * Per profile id, how far work may take its 5-hour and weekly windows
    * (proxy/usageReserve.ts). Written by a supervisor through

@@ -100,6 +100,28 @@ Record what Meridian did and show it to the operator:
   of `/v1/usage/quota/all` (the page's refresh, or Vibeterm's re-check) shows
   the new state.
 
+- **Refresh usage is one click per card.** Every Claude subscription card and
+  ChatGPT seat on `/` and `/profiles` carries a refresh icon that posts
+  `POST /profiles/:id/usage/refresh` (`profileActions.ts`). The icon spins and
+  is disabled while the read runs, the poll is held meanwhile, and the
+  outcome (re-read, rate limited, too soon) stays on the card for a minute.
+
+- **No native dialogs.** No page calls `alert`, `confirm` or `prompt`. The
+  shared header carries `window.meridianDialog` (`dialog.ts`): a queued,
+  focus-trapped modal and a corner toast, text set with `textContent`. Error
+  replies are read with `dialogErrorText`, which takes both envelopes
+  (`{error: "...", code}` and `{error: {type, message}}`), so an object is
+  never shown as `[object Object]`. `no-native-dialogs.test.ts` fails on a
+  native dialog call in any served page.
+
+- **A refused switch says why and who.** Activation on `/` and `/profiles`
+  goes through `meridianProfileActions.activate`: a refusal opens the dialog
+  with the route's `refusal` (reason, who keeps the profile out, what forcing
+  would take). It offers "Activate anyway" only when the route says
+  `forceAllowed`, "Release and switch" when another profile is forced, else a
+  link to the setting. A forced card shows a yellow "forced" badge with its
+  expiry and, on `/profiles`, a release link.
+
 - **Keepalive beats are not requests.** Rows with
   `requestSource: "cache-keepalive"` answered no client, so `computeSummary`
   (both stores), the route summary and Prometheus request series exclude

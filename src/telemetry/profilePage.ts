@@ -14,6 +14,7 @@ import { isUnusableJs } from "./profileSpent"
 import { WINDOW_LABELS } from "./profileUsage"
 import { domPatchJs } from "./domPatch"
 import { profileCardStatusCss, profileCardStatusJs } from "./profileCardStatus"
+import { ICON_REFRESH_SVG, profileActionsCss, profileActionsJs } from "./profileActions"
 
 /**
  * Every text field on this page names a profile, filters the list or takes a
@@ -110,6 +111,7 @@ export const profilePageHtml = `<!DOCTYPE html>
   ${profileProvidersCss}
   ${profileLoginStatesCss}
   ${profileCardStatusCss}
+  ${profileActionsCss}
   .profile-name { font-size: 16px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; color: inherit; text-decoration: none; }
   a.profile-name:hover { color: var(--accent); }
   .profile-card-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
@@ -349,6 +351,11 @@ export const profilePageHtml = `<!DOCTYPE html>
   .usage-extra.status-high .usage-pct { color: var(--red); }
   .usage-extra .usage-note { font-size: 10px; color: var(--muted); line-height: 1.4; overflow-wrap: anywhere; min-width: 0; }
   .badge-credits { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  /* Forced past a supervisor's exclusion: an override, so yellow, with its release beside it. */
+  .badge-forced { background: rgba(var(--yellow-rgb),0.15); color: var(--yellow); }
+  .forced-release { font-size: 12px; }
+  .usage-refresh-outcome { font-size: 12px; color: var(--muted); margin: -4px 0 10px; overflow-wrap: anywhere; }
+  .usage-refresh-outcome.err { color: var(--red); }
   /* Banked free resets: green while one can be redeemed, muted while all are held back. */
   .usage-extra.free-resets .usage-pct { color: var(--green); }
   .usage-extra.free-resets.held .usage-pct { color: var(--muted); }
@@ -547,6 +554,7 @@ ${profileProvidersJs}
 ${profileLoginStatesJs}
 ${domPatchJs}
 ${profileCardStatusJs}
+${profileActionsJs}
 
 var providersPresent = [];
 // Each card's login state by profile id, and how many cards the login-state
@@ -601,6 +609,7 @@ var removeError = null;
 var ICON_PENCIL = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zm1.414 1.06a.25.25 0 00-.354 0L10.811 3.75l1.439 1.44 1.263-1.263a.25.25 0 000-.354l-1.086-1.086zM11.189 6.25L9.75 4.81l-6.286 6.287a.25.25 0 00-.064.108l-.558 1.953 1.953-.558a.249.249 0 00.108-.064l6.286-6.286z"/></svg>';
 var ICON_CHECK = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/></svg>';
 var ICON_X = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M3.72 3.72a.75.75 0 011.06 0L8 6.94l3.22-3.22a.75.75 0 111.06 1.06L9.06 8l3.22 3.22a.75.75 0 11-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 01-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 010-1.06z"/></svg>';
+var ICON_REFRESH = '${ICON_REFRESH_SVG}';
 var ICON_TRASH = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M11 1.75V3h2.25a.75.75 0 010 1.5H2.75a.75.75 0 010-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75zM6.5 1.75V3h3V1.75a.25.25 0 00-.25-.25h-2.5a.25.25 0 00-.25.25z"/><path d="M4.997 6.178a.75.75 0 10-1.494.144L4.462 16.5h7.076l.959-10.178a.75.75 0 00-1.494-.144l-.888 9.322H5.885l-.888-9.322z"/></svg>';
 
 function focusRenameInput() {
@@ -1280,13 +1289,25 @@ function render(data, quotaData) {
       html += meridianCardStatus.duplicateBadgeHtml(p, 'profile-badge');
       html += renderSpentBadge((quotaById[p.id] || {}).spent, p);
       if ((quotaById[p.id] || {}).servingOnCredits) html += '<span class="profile-badge badge-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
+      if (p.forced) {
+        html += '<span class="profile-badge badge-forced" title="You activated this profile although a routing supervisor keeps it out of work. It stays active until '
+          + attr(new Date(p.forced.until).toLocaleString()) + ', or until you release it.">forced \u00b7 until ' + esc(new Date(p.forced.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })) + '</span>';
+        html += '<button type="button" class="link-btn forced-release" onclick="releaseForcedProfile()">release</button>';
+      }
       html += "<span class=\\"profile-card-actions\\">";
+      if (hasUsageReading(p)) {
+        var refreshingUsage = meridianProfileActions.refreshing(p.id);
+        html += '<button type="button" class="icon-btn usage-refresh' + (refreshingUsage ? ' spinning' : '') + '" title="Refresh usage now" aria-label="Refresh usage of ' + attr(p.id) + '"'
+          + ' data-profile="' + attr(p.id) + '" onclick="refreshProfileUsage(this.getAttribute(&quot;data-profile&quot;))"' + (refreshingUsage ? ' disabled' : '') + '>' + ICON_REFRESH + '</button>';
+      }
       html += "<button class=\\"icon-btn\\" title=\\"Rename profile\\" onclick=\\"startRename(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_PENCIL + "</button>";
       html += "<button class=\\"icon-btn danger\\" title=\\"" + (isChatGptProfile(p) ? "Remove seat" : "Remove profile") + "\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
       html += "</span>";
     }
     html += '</div>';
     html += meridianCardStatus.updateHtml(update);
+    var usageOutcome = meridianProfileActions.outcome(p.id);
+    if (usageOutcome) html += '<div class="usage-refresh-outcome' + (usageOutcome.ok ? '' : ' err') + '" role="status">' + esc(usageOutcome.text) + '</div>';
 
     if (editingProfile === p.id && renameError) {
       html += '<div class="rename-error">' + esc(renameError) + '</div>';
@@ -1523,15 +1544,23 @@ function copyCmd(btn) {
   }, 1500);
 }
 
-async function switchProfile(id) {
-  const res = await fetch('/profiles/active', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ profile: id })
-  });
-  const data = await res.json();
-  if (data.success) refresh();
-  else if (data.error) alert(data.error);
+// A refusal opens the shared dialog saying why and who (profileActions.ts).
+function switchProfile(id) {
+  return meridianProfileActions.activate(id, refresh);
+}
+
+function releaseForcedProfile() {
+  return meridianProfileActions.release(refresh);
+}
+
+// Claude subscription accounts and ChatGPT seats have usage to re-read; an
+// API-key profile has none.
+function hasUsageReading(p) {
+  return isChatGptProfile(p) || (p.type || 'claude-max') === 'claude-max';
+}
+
+function refreshProfileUsage(id) {
+  return meridianProfileActions.refreshUsage(id, function (finished) { return finished ? refresh() : redraw(); });
 }
 
 // --- Browser login ---
@@ -2555,9 +2584,14 @@ async function redeemFreeReset(button) {
   var grantId = button.getAttribute('data-grant');
   var usable = Number(button.getAttribute('data-usable')) || 0;
   var after = Math.max(0, usable - 1);
-  if (!confirm('Redeem one of ' + button.getAttribute('data-name') + '\\u2019s free resets now?\\n\\n'
-    + 'Anthropic clears this account\\u2019s usage limits right away. It cannot be undone, and Anthropic refuses it while the account is not rate limited. '
-    + after + ' usable reset' + (after === 1 ? '' : 's') + ' would be left.')) return;
+  var go = await meridianDialog.ask({
+    title: 'Redeem one of ' + button.getAttribute('data-name') + '\\u2019s free resets now?',
+    message: 'Anthropic clears this account\\u2019s usage limits right away. It cannot be undone, and Anthropic refuses it while the account is not rate limited.',
+    note: after + ' usable reset' + (after === 1 ? '' : 's') + ' would be left.',
+    confirmText: 'Redeem one',
+    danger: true
+  });
+  if (!go) return;
   redeemingReset = id;
   button.disabled = true;
   button.textContent = 'Redeeming\\u2026';
@@ -2614,7 +2648,7 @@ if (!restorePendingAdd()) resetAddForm('');
 // polls and catches up when it is shown again.
 function pollRefresh() {
   if (document.visibilityState !== 'visible' || meridianReorder.dragging()
-    || activeLogin || activeAdd || activeChatGptRelogin || redeemingReset) return;
+    || activeLogin || activeAdd || activeChatGptRelogin || redeemingReset || meridianProfileActions.busy()) return;
   refresh();
 }
 // The 1.5s poll while a card updates: a hidden tab keeps the timer, not the

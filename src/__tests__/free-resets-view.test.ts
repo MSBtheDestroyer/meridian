@@ -146,7 +146,7 @@ describe("both account pages embed it", () => {
     expect(profilePageHtml).toContain("var freeResetOutcomeText = ")
     expect(profilePageHtml).toContain("usage-extra free-resets")
     expect(profilePageHtml).toContain("onclick=\"redeemFreeReset(this)\"")
-    expect(profilePageHtml).toContain("confirm(")
+    expect(profilePageHtml).toContain("meridianDialog.ask(")
     expect(profilePageHtml).toContain("'/v1/usage/quota/reset'")
   })
 

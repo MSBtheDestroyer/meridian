@@ -318,7 +318,15 @@ A profile can be held out of rotation, for example to measure what one job spend
 
 Unlike `routingExcludedProfiles`, which refuses pinned work and still allows warms, a hold refuses warms and still allows pinned work.
 
-`routingManagedExcludedProfiles` (a supervisor's list, written through the same endpoint) keeps a profile out of unpinned work and off the active pointer, but a request pinned to it with `x-meridian-profile` is served there. Only the user's own `routingExcludedProfiles` refuses a pin (`409` with `profile_excluded`).
+`routingManagedExcludedProfiles` (a supervisor's list, written through the same endpoint) keeps a profile out of unpinned work and off the active pointer, but a request pinned to it with `x-meridian-profile` is served there. Only the user's own `routingExcludedProfiles` refuses a pin (`409` with `profile_excluded`). A supervisor may say why in `routingManagedReasons` (`{"loaner-bob": "loaner outside its harvest window"}`); Home and Profiles show that text when someone tries to activate the profile.
+
+### Forcing a forbidden profile
+
+Settings, Routing, **Allow forcing a forbidden profile** (off by default) lets you activate a Claude profile that a supervisor keeps out of work, through its managed exclusions, its held list or a usage reserve. The refusal dialog then offers **Activate anyway**. The profile stays active for up to five hours, or until you release it (the release link on its card, the Release button beside the setting, or switching with "Release and switch"); meanwhile the supervisor's lists still name it but do not move work or the pointer off it, and a switch to another profile is refused with `profile_forced`. Your own exclusion list and a missing login are never forced past. Turning the setting off ends a force in effect.
+
+### Refreshing usage
+
+The refresh icon on each card re-reads that profile's usage from Anthropic (or ChatGPT) right away, for example after a reset made outside Meridian. Routing and reserves see the new figures at once, and refusals the new reading shows are over are cleared. One refresh per profile per 30 seconds; `POST /profiles/<id>/usage/refresh` does the same from a script.
 
 ### Profile commands
 

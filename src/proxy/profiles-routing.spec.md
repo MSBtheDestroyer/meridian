@@ -150,6 +150,48 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   pointer (`POST /profiles/active`) and warms keep treating both lists alike.
   `GET /settings/api/routing` lists `pin-bypasses-managed-exclusion` in
   `capabilities`.
+- **Forcing a forbidden profile.** A supervisor may write
+  `routingManagedReasons` (`{profileId: text}`, whole map, at most 300
+  characters each) beside its lists; it is shown, verbatim, when someone tries
+  to activate that profile. Every refusal of `POST /profiles/active` carries
+  `refusal {kind, profile, by, reason, forceable, forceAllowed, forceNote,
+  forced?}` beside its existing fields; `kind` is `managed_excluded`,
+  `excluded`, `held`, `usage_reserve`, `needs_login`, `following` or
+  `forced_elsewhere`. With `allowForcingForbiddenProfile` on (a boolean set
+  through `PUT /settings/api/routing`, same-origin only, off by default),
+  `{profile, force: true}` activates a Claude profile kept out only by the
+  supervisor (managed exclusion, hold or usage reserve) and saves
+  `forcedActiveProfile {profile, forcedAt, until}`, five hours out. The
+  user's own `routingExcludedProfiles`, a missing login, follow mode and
+  ChatGPT seats are never forced; a force while the setting is off answers 409
+  `force_disabled`. While a force holds and its profile is the active pointer,
+  that profile is read out of `routingManagedExcludedProfiles`,
+  `routingHeldProfiles` and its usage reserve everywhere they are judged (the
+  pointer reconcile, unpinned dispatch, failover), while the lists themselves
+  keep what the supervisor wrote; `cvpManagedExcludedProfiles` is untouched.
+  A switch to another profile answers 409 `profile_forced` unless it carries
+  `releaseForce: true`, which ends the force with the switch. The force also
+  ends at `until`, on `POST /profiles/forced/release`, and when the setting is
+  turned off; each puts the ordinary rules back at once, so the pointer moves
+  off a profile the supervisor still keeps out. `GET /settings/api/routing`
+  reports `allowForcingForbiddenProfile`, `routingManagedReasons` and
+  `forcedActiveProfile` (null unless live) and lists `forced-active-profile`
+  and `managed-exclusion-reasons` in `capabilities`; `/profiles/list` adds
+  `forcedActiveProfile` and per entry `forced {forcedAt, until}` or null.
+- **Refreshing a profile's usage on request.** `POST /profiles/:id/usage/refresh`
+  (API key, same-origin browser writes) reads the profile's usage now: a
+  Claude profile through the OAuth usage cache with `force` (the 429 cooldown
+  still applies, a followed instance's copy is skipped), every ChatGPT seat
+  through one forced usage call. The fresh snapshot replaces the shared cache,
+  so `/v1/usage/quota/all`, reserves and dispatch see it at once, and the
+  windows it shows below their limit clear the refusals remembered for them as
+  a redeemed free reset does (rate-limit buckets, the spent mark, a quota
+  bench). One read per profile, and one for all seats, per 30 seconds; another
+  answers 429 `refresh_too_soon` with `Retry-After`. 200 answers
+  `{profile, refreshed, note, usage}`, `usage` in the `/v1/usage/quota/all`
+  entry shape; 404 `profile_not_found`, 400 `not_oauth` for an API-key
+  profile. `GET /settings/api/routing` lists `usage-refresh` in
+  `capabilities`.
 - **A pinned model list is that account's own.** `GET /v1/models` with
   `x-meridian-profile` naming a Claude profile answers the Claude models
   Anthropic's `GET /v1/models?limit=1000` lists for that profile's own

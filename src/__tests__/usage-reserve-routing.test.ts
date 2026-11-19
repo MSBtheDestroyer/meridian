@@ -280,6 +280,7 @@ describe("a held Claude profile under active routing", () => {
     expect(await response.json()).toEqual({
       error: "Profile \"personal\" is held back by its usage reserve: weekly at 95%, capped at 95%",
       code: "usage_reserve",
+      refusal: expect.objectContaining({ kind: "usage_reserve", profile: "personal", forceable: true, forceAllowed: false }),
     })
     expect(getActiveProfileId()).toBe("work")
   })

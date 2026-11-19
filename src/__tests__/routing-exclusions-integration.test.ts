@@ -517,6 +517,8 @@ describe("work routing exclusions", () => {
         type: "profile_excluded",
         message: "Profile \"work\" is excluded from work routing",
       },
+      // Additive: why, in words, for the page's dialog.
+      refusal: expect.objectContaining({ kind: "excluded", profile: "work", forceable: false }),
     })
   })
 

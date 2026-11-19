@@ -86,23 +86,26 @@ export function replacementForExcludedActive(input: {
   return { change: true, profileId: eligibleProfileIds[0] }
 }
 
-export function profileExcludedResponse(profileId: string): Response {
+/** `extra` adds fields beside the error, such as the activation route's `refusal`. */
+export function profileExcludedResponse(profileId: string, extra?: Record<string, unknown>): Response {
   return new Response(JSON.stringify({
     type: "error",
     error: {
       type: "profile_excluded",
       message: `Profile "${profileId}" is excluded from work routing`,
     },
+    ...extra,
   }), { status: 409, headers: { "Content-Type": "application/json" } })
 }
 
-export function profileHeldResponse(profileId: string): Response {
+export function profileHeldResponse(profileId: string, extra?: Record<string, unknown>): Response {
   return new Response(JSON.stringify({
     type: "error",
     error: {
       type: "profile_held",
       message: `Profile "${profileId}" is held out of rotation; only requests pinned to it reach it`,
     },
+    ...extra,
   }), { status: 409, headers: { "Content-Type": "application/json" } })
 }
 

@@ -161,6 +161,15 @@ at its provider, so card CSS never names one.
   it is a "resets" row under the usage figures; on `/profiles` it is a block
   below them with a small blue "Redeem one" button, which asks for
   confirmation first and shows the outcome in the block.
+- **Refresh usage:** a small icon button with circular arrows. On
+  `/profiles` it is the first of the card's action icons, before Rename and
+  Remove; on `/` it sits at the end of the name row, after the cost, and
+  clicking it never switches the account. While the read runs it spins
+  (still under reduced motion) and is disabled; the outcome is one muted line
+  on the card for a minute, red when the read did not land.
+- **Forced:** a profile activated past a supervisor's exclusion carries a
+  yellow "forced" badge naming when the force ends, and on `/profiles` a blue
+  "release" link beside it. Yellow because it is an override, not a fault.
 - **Needs a login:** a red border, the same for every provider, and a
   needs-login badge. An active card keeps its brand ring outside the red.
 - **Controls stay blue:** buttons, links, focus rings, drag handles and drop
@@ -265,6 +274,17 @@ account card on the home page (or the Profiles page). The header chip only
 - **Inline code chip:** mono, `--surface`/`--bg` fill, 1px border, radius
   4–5px, **violet text** (`--accent2`).
 - **Empty states:** calm centered `--muted` text in a card — never red.
+- **Dialogs and toasts:** never the browser's `alert`, `confirm` or
+  `prompt`. The shared header provides `meridianDialog` (`dialog.ts`): a
+  `--surface` card, radius 12px, on a dimmed backdrop, title 16px/600, body
+  13px, optional label/value facts and a muted note, buttons right-aligned in
+  the Buttons style (blue for the expected action, red only for one that
+  cannot be undone or overrides a safeguard). The border turns yellow for a
+  warning and red for an error. Escape, a click outside and Close all cancel;
+  focus stays inside while it is open and returns afterwards. Errors show the
+  server's message and code, never `[object Object]`. A toast is a short
+  `--surface2` note in the bottom-right corner with a blue, green or red left
+  edge, gone after four seconds.
 - **Header build badge:** a current npm install shows nothing; an
   outdated one shows the blue update chip linking to releases. A local or
   dev build shows one violet metadata pill (release · build number or
