@@ -355,7 +355,7 @@ export const profilePageHtml = `<!DOCTYPE html>
   .badge-forced { background: rgba(var(--yellow-rgb),0.15); color: var(--yellow); }
   .forced-release { font-size: 12px; }
   .profile-card > .refresh-outcome { font-size: 12px; margin: -4px 0 10px; }
-  /* Banked free resets: green while one can be redeemed, muted while all are held back. */
+  /* Banked free resets, one block per kind: green while one can be redeemed, muted otherwise. */
   .usage-extra.free-resets .usage-pct { color: var(--green); }
   .usage-extra.free-resets.held .usage-pct { color: var(--muted); }
   .usage-extra.free-resets .usage-extra-row { align-items: center; }
@@ -1066,7 +1066,7 @@ function renderUsageSection(profileQuota, p) {
   var usageTag = cachedTag(profileQuota.stale ? 'cached' : 'live');
   var chatgpt = isChatGptProfile(p);
   var credits = chatgpt ? codexCreditsView(profileQuota.credits, profileQuota) : null;
-  var resets = chatgpt ? null : freeResetView(profileQuota.bankedResets, Date.now());
+  var resets = chatgpt ? null : freeResetView(profileQuota.bankedResets, Date.now(), profileQuota);
 
   // No figures at all means this profile has never been read successfully —
   // the route serves the last good reading at any age, so an empty windows
@@ -1175,30 +1175,41 @@ function renderUsageSection(profileQuota, p) {
     + '</div>';
 }
 
-// The redeem control appears only while a grant can be spent, and only acts
-// after a confirmation: a reset is one of a handful per account.
+// One block per kind of reset, since each clears something different. A
+// block offers its own redeem only while the view names a grant of that kind,
+// and the click only acts after a confirmation naming the kind and the grant.
+// A redeem's outcome stays in the block of the kind it was for.
 function renderFreeResets(resets, p) {
   var outcome = resetOutcomes[p.id];
   if (outcome && Date.now() - outcome.at > 120000) outcome = null;
-  var said = outcome
-    ? '<div class="usage-note reset-outcome' + (outcome.ok ? '' : ' err') + '" role="status">' + esc(outcome.text) + '</div>'
-    : '';
-  if (!resets) return said ? '<div class="usage-extra free-resets">' + said + '</div>' : '';
-  var button = resets.grantId
-    ? '<button type="button" class="switch-btn reset-btn" data-profile="' + attr(p.id) + '" data-grant="' + attr(resets.grantId)
-      + '" data-name="' + attr(p.label || p.id) + '" data-usable="' + resets.usable + '" onclick="redeemFreeReset(this)"'
-      + (redeemingReset ? ' disabled' : '') + '>Redeem one</button>'
-    : '';
-  return '<div class="usage-extra free-resets' + (resets.usable > 0 ? '' : ' held') + '" title="' + attr(resets.title) + '">'
-    +   '<div class="usage-extra-row">'
-    +     '<span class="usage-label">Free resets</span>'
-    +     '<span class="usage-pct">' + esc(resets.value) + '</span>'
-    +   '</div>'
-    +   '<div class="usage-extra-row" style="margin-top:4px">'
-    +     '<span class="usage-note">' + esc(resets.note) + '</span>' + button
-    +   '</div>'
-    +   said
-    + '</div>';
+  function said(label) {
+    return '<div class="usage-note reset-outcome' + (outcome.ok ? '' : ' err') + '" role="status">' + esc(label + ': ' + outcome.text) + '</div>';
+  }
+  var placed = false;
+  var html = (resets ? resets.groups : []).map(function (g) {
+    var mine = !!outcome && outcome.kind === g.kind;
+    if (mine) placed = true;
+    var button = g.grantId
+      ? '<button type="button" class="switch-btn reset-btn" data-profile="' + attr(p.id) + '" data-name="' + attr(p.label || p.id)
+        + '" data-kind="' + attr(g.kind) + '" data-label="' + attr(g.name) + '" data-kind-name="' + attr(g.shortName)
+        + '" data-grant="' + attr(g.grantId) + '" data-grant-name="' + attr(g.grantName) + '" data-fable-used="' + attr(g.fableUsed)
+        + '" data-usable="' + g.usable + '" onclick="redeemFreeReset(this)"'
+        + (redeemingReset ? ' disabled' : '') + '>' + esc('Redeem ' + g.shortName) + '</button>'
+      : '';
+    return '<div class="usage-extra free-resets' + (g.muted ? ' held' : '') + '" title="' + attr(g.title) + '">'
+      +   '<div class="usage-extra-row">'
+      +     '<span class="usage-label">' + esc(g.name) + '</span>'
+      +     '<span class="usage-pct">' + esc(g.value) + '</span>'
+      +   '</div>'
+      +   '<div class="usage-extra-row" style="margin-top:4px">'
+      +     '<span class="usage-note">' + esc(g.note) + '</span>' + button
+      +   '</div>'
+      +   (mine ? said(g.name) : '')
+      + '</div>';
+  }).join('');
+  // The redeem spent the last reset of its kind, so its block is gone.
+  if (outcome && !placed) html += '<div class="usage-extra free-resets">' + said(outcome.label) + '</div>';
+  return html;
 }
 
 function render(data, quotaData) {
@@ -2571,14 +2582,23 @@ var resetOutcomes = Object.create(null);
 async function redeemFreeReset(button) {
   if (redeemingReset) return;
   var id = button.getAttribute('data-profile');
+  var kind = button.getAttribute('data-kind');
+  var noun = button.getAttribute('data-kind-name');
   var grantId = button.getAttribute('data-grant');
+  var fableUsed = button.getAttribute('data-fable-used');
   var usable = Number(button.getAttribute('data-usable')) || 0;
   var after = Math.max(0, usable - 1);
+  // Each kind says only what it does: a Fable reset never promises the week back.
+  var effect = kind === 'fable'
+    ? 'Anthropic gives back only this account\\u2019s Fable usage' + (fableUsed ? ' (now ' + fableUsed + ' used)' : '')
+      + '; the rest of the week\\u2019s usage stays as it is.'
+    : 'Anthropic clears this account\\u2019s weekly usage right away.';
   var go = await meridianDialog.ask({
-    title: 'Redeem one of ' + button.getAttribute('data-name') + '\\u2019s free resets now?',
-    message: 'Anthropic clears this account\\u2019s usage limits right away. It cannot be undone, and Anthropic refuses it while the account is not rate limited.',
-    note: after + ' usable reset' + (after === 1 ? '' : 's') + ' would be left.',
-    confirmText: 'Redeem one',
+    title: 'Redeem a ' + noun + ' on ' + button.getAttribute('data-name') + ' now?',
+    message: 'This spends \\u201c' + (button.getAttribute('data-grant-name') || grantId) + '\\u201d. ' + effect
+      + ' It cannot be undone.',
+    note: after + ' usable ' + noun + (after === 1 ? '' : 's') + ' would be left.',
+    confirmText: 'Redeem ' + noun,
     danger: true
   });
   if (!go) return;
@@ -2600,7 +2620,7 @@ async function redeemFreeReset(button) {
   }
   redeemingReset = null;
   var outcome = freeResetOutcomeText(status, data, labelForWindow);
-  resetOutcomes[id] = { ok: outcome.ok, text: outcome.text, at: Date.now() };
+  resetOutcomes[id] = { ok: outcome.ok, text: outcome.text, at: Date.now(), kind: kind, label: button.getAttribute('data-label') };
   await refresh();
 }
 

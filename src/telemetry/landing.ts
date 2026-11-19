@@ -263,7 +263,8 @@ export const landingHtml = `<!DOCTYPE html>
   .credits-row .w-credits.serving { color: var(--yellow); }
   .credits-row .w-credits-note { color: var(--muted); font-size: 11px; text-align: right; min-width: 0; overflow-wrap: anywhere; }
   .credits-row .w-credits-note.credits-pace { flex: 1; text-align: left; }
-  /* Banked free resets: green while one can be redeemed, muted while all are held back. */
+  /* Banked free resets, one row per kind: green while one can be redeemed, muted otherwise. */
+  .resets-row .w-label { width: auto; min-width: 64px; white-space: nowrap; }
   .resets-row .w-credits { color: var(--green); }
   .resets-row.held .w-credits { color: var(--muted); }
   .pool-chip.on-credits, .pool-chip.reserved { color: var(--yellow); background: rgba(210,153,34,0.15); }
@@ -355,6 +356,16 @@ var SPENT_AT=${SPENT_AT};
 ${isUnusableJs}
 // Shared with /profiles (freeResets.ts), so both pages count an account's resets alike.
 var freeResetView=${freeResetView.toString()};
+// One row per kind, since each clears something different; the row is muted
+// while nothing of its kind can be redeemed, and its note says why.
+function freeResetRows(resets){
+  if(!resets)return '';
+  return resets.groups.map(function(g){
+    return '<div class="usage-row credits-row resets-row'+(g.muted?' held':'')+'" title="'+esc(g.title)+'"><span class="w-label">'+esc(g.shortName)+'</span>'
+      +'<span class="w-credits">'+esc(g.value)+'</span>'
+      +'<span class="w-credits-note">'+esc(g.note)+'</span></div>';
+  }).join('');
+}
 function generalUtilization(windows,provider){
   var everyWindow=provider==='chatgpt';
   var worst=null;
@@ -672,10 +683,7 @@ function profileSection(q,s,pl,h){
       +(credits.pace?'<div class="usage-row credits-row" title="'+esc(credits.pace.title)+'">'
         +'<span class="w-credits-note credits-pace">'+esc(credits.pace.text)+'</span></div>':'');
     // Redeeming one is deliberate and lives on /profiles; the card only counts them.
-    var resets=chat?null:freeResetView(quota.bankedResets,Date.now());
-    if(resets)rows+='<div class="usage-row credits-row resets-row'+(resets.usable>0?'':' held')+'" title="'+esc(resets.title)+'"><span class="w-label">resets</span>'
-      +'<span class="w-credits">'+esc(resets.value)+'</span>'
-      +'<span class="w-credits-note">'+esc(resets.note)+'</span></div>';
+    if(!chat)rows+=freeResetRows(freeResetView(quota.bankedResets,Date.now(),quota));
     var isPriority=pl&&pl.routing==='priority';
     // active+priority keeps the active profile meaningful - switching it is how
     // you move traffic, so the card stays clickable, unlike in pure priority.
