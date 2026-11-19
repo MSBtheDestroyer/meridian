@@ -339,6 +339,14 @@ describe("brand colours", () => {
     expect(landingHtml.indexOf(spare)).toBeGreaterThan(landingHtml.indexOf(".profile-card.spend-fading > *, .profile-card.spend-spent > * {"))
   })
 
+  test("landing: a spent card never dims a refresh's outcome", () => {
+    // Its states are told apart by colour; greyed, "refreshed" and "rate
+    // limited" read alike on the very card someone just refreshed.
+    const spare = ".profile-card.spend-fading > .refresh-outcome, .profile-card.spend-spent > .refresh-outcome { filter: none; opacity: 1; }"
+    expect(landingHtml).toContain(spare)
+    expect(landingHtml.indexOf(spare)).toBeGreaterThan(landingHtml.indexOf(".profile-card.spend-fading > *, .profile-card.spend-spent > * {"))
+  })
+
   test("profiles: under the wide layout a provider heading spans the card grid and leaves spacing to its gap", () => {
     expect(profileProvidersCss).toContain("grid-column: 1 / -1;")
     expect(profilePageHtml).toContain('html[data-layout="wide"] #content > .provider-group-head { margin-bottom: 0; }')

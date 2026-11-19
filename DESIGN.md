@@ -169,7 +169,8 @@ at its provider, so card CSS never names one.
   card for a minute as a short muted list, one line per part (Login, Usage,
   Models, CVP): the part, its state as a word (green "refreshed", yellow "rate
   limited", red "failed", muted "skipped" / "not readable here"), then the
-  note. Below 520px the note wraps under the part and state.
+  note. Below 520px the note wraps under the part and state. A spent card's
+  fade on `/` never reaches the outcome: its states are told apart by colour.
 - **Forced:** a profile activated past a supervisor's exclusion carries a
   yellow "forced" badge naming when the force ends, and on `/profiles` a blue
   "release" link beside it. Yellow because it is an override, not a fault.

@@ -97,6 +97,9 @@ export const landingHtml = `<!DOCTYPE html>
   .profile-card.active.spend-fading > .profile-head, .profile-card.active.spend-spent > .profile-head { filter: none; opacity: 1; }
   .profile-card.active.spend-fading > .card-strip, .profile-card.active.spend-spent > .card-strip { filter: none; opacity: 1; }
   .profile-card.spend-fading > .profile-head:focus-within, .profile-card.spend-spent > .profile-head:focus-within { filter: none; opacity: 1; }
+  /* A refresh's outcome is what someone just asked for, and its states are
+     told apart by colour, so the fade never reaches it. */
+  .profile-card.spend-fading > .refresh-outcome, .profile-card.spend-spent > .refresh-outcome { filter: none; opacity: 1; }
   .profile-card.needs-login { border-color: var(--red); }
   .profile-card.needs-login .prof-dot { background: var(--red); }
   .spend-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
