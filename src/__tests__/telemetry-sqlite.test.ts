@@ -537,6 +537,7 @@ describe("SqliteTelemetryStore — memory-store parity for newer fields", () => 
     migrated.telemetry.record(makeMetric({
       requestId: "req-new",
       profileId: "work",
+      clientSessionId: "client-thread",
       resolvedModel: "claude-haiku-4-5",
       sessionQueueWaitMs: 42,
       sdkQueueWaitMs: 7,
@@ -558,6 +559,7 @@ describe("SqliteTelemetryStore — memory-store parity for newer fields", () => 
     expect(fresh.routeAttempt).toBe(2)
     expect(fresh.routeRefusedBucket).toBe("five_hour")
     expect(fresh.routingRequire).toEqual(["cvp"])
+    expect(fresh.clientSessionId).toBe("client-thread")
 
     // The pre-existing row survives and reads back on the NOT NULL DEFAULT 0
     // columns rather than throwing or coming back null.
@@ -566,6 +568,7 @@ describe("SqliteTelemetryStore — memory-store parity for newer fields", () => 
     expect(old.profileId).toBeUndefined()
     expect(old.resolvedModel).toBeUndefined()
     expect(old.routingRequire).toBeUndefined()
+    expect(old.clientSessionId).toBeUndefined()
     expect(old.sessionQueueWaitMs ?? 0).toBe(0)
     expect(old.sdkQueueWaitMs ?? 0).toBe(0)
 

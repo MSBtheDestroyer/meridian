@@ -172,6 +172,7 @@ describe("Session resume: session ID tracking", () => {
 
   it("should use resume option on follow-up requests with same session", async () => {
     const app = createTestApp()
+    const since = Date.now()
 
     // First request — establishes session
     const r1 = await post(app, {
@@ -204,6 +205,13 @@ describe("Session resume: session ID tracking", () => {
 
     // Second call should resume the exact ID Meridian selected for the first call.
     expect(capturedQueryParams.options.resume).toBe(firstCallSessionId)
+
+    const history = await app.fetch(new Request(`http://localhost/telemetry/requests?since=${since}&limit=2`))
+    expect(capturedQueryParams.options.sessionId).not.toBe(firstCallSessionId)
+    expect(await history.json()).toMatchObject([
+      { clientSessionId: "oc-session-1", sdkSessionId: capturedQueryParams.options.sessionId, isResume: true },
+      { clientSessionId: "oc-session-1", sdkSessionId: firstCallSessionId, isResume: false },
+    ])
   })
 
   it("should NOT resume for a different session ID", async () => {

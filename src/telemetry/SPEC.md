@@ -46,6 +46,8 @@ Record what Meridian did and show it to the operator:
 
 ## Decisions
 
+- **Client conversation identity is not SDK session identity.** `/telemetry/requests` may include `clientSessionId`, the conversation key resolved from the client's adapter or the unscoped thread ID in Responses metadata. It is retained across requests and profile attempts even when the provider creates a new SDK session or the request uses a side-flow routing key. `sdkSessionId` still identifies the SDK transcript and keeps its existing meaning. Keepalive beats, requests without a client key, and legacy rows omit `clientSessionId`; a prompt fingerprint or cache key alone is not a conversation identifier.
+
 - **`/` and `/profiles` update in place.** Their polls patch `#content` from
   the fresh markup (`domPatch.ts`) instead of replacing it: nodes are matched
   by `data-key`/`id` (cards by profile id) or by position among unkeyed

@@ -235,6 +235,52 @@ describe("Thinking Passthrough", () => {
 })
 
 describe("telemetry", () => {
+  it("attributes ChatGPT requests to the client session, preferring it over the prompt cache key", async () => {
+    const { app } = makeServer()
+    upstream = () => streamResponse(completedStream("gpt-5.6-sol"))
+
+    await (await post(app, codexBody("gpt-5.6-sol"), {
+      "x-opencode-agent-mode": "subagent",
+      "x-opencode-agent-name": "explore",
+    })).text()
+
+    const response = await app.fetch(new Request("http://localhost/telemetry/requests?limit=1"))
+    const rows = await response.json()
+    expect(rows).toMatchObject([{ adapter: "chatgpt", clientSessionId: "sess-parity" }])
+  })
+
+  it("attributes a native Codex side request to the same thread as the turn", async () => {
+    const { app } = makeServer()
+    upstream = () => streamResponse(completedStream("gpt-5.6-sol"))
+
+    for (const requestKind of ["turn", "compact"]) {
+      await (await post(app, codexBody("gpt-5.6-sol"), {
+        "user-agent": "codex_cli_rs/0.150.0",
+        "x-opencode-session": "",
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: "child-thread", request_kind: requestKind }),
+      })).text()
+    }
+
+    const response = await app.fetch(new Request("http://localhost/telemetry/requests?limit=2"))
+    const rows = await response.json()
+    expect(rows).toMatchObject([
+      { adapter: "chatgpt", clientSessionId: "child-thread" },
+      { adapter: "chatgpt", clientSessionId: "child-thread" },
+    ])
+  })
+
+  it("omits client attribution for a Responses request with only a prompt cache key", async () => {
+    const { app } = makeServer()
+    upstream = () => streamResponse(completedStream("gpt-5.6-sol"))
+
+    await (await post(app, codexBody("gpt-5.6-sol"), { "user-agent": "generic-client", "x-opencode-session": "" })).text()
+
+    const response = await app.fetch(new Request("http://localhost/telemetry/requests?limit=1"))
+    const rows: unknown = await response.json()
+    expect(rows).toMatchObject([{ adapter: "chatgpt" }])
+    expect(rows).not.toMatchObject([{ clientSessionId: expect.any(String) }])
+  })
+
   it("records provider tokens with cached and reasoning tokens counted once, and values them at the built-in OpenAI rate", async () => {
     const { app } = makeServer()
     upstream = () => streamResponse(completedStream("gpt-5.6-sol"))

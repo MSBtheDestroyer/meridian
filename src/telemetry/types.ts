@@ -149,6 +149,7 @@ export interface RequestMetric {
 
   /** SDK session ID used for this request (for correlating across turns) */
   sdkSessionId?: string
+  readonly clientSessionId?: string
 
   /** HTTP status code returned to the client */
   status: number
