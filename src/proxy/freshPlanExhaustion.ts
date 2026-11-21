@@ -1,8 +1,8 @@
 import type { OAuthUsageSnapshot } from "./oauthUsage"
 import type { RateLimitEntry } from "./rateLimitStore"
 import type { ClaudeExtraUsagePolicy } from "./routing"
+import { capacityObservationIsFresh } from "./managedExclusionEvidence"
 
-const MAX_AGE_MS = 120_000
 const ACCOUNT_WINDOWS = ["five_hour", "seven_day"] as const
 
 export function freshPlanExhaustion(input: {
@@ -12,7 +12,7 @@ export function freshPlanExhaustion(input: {
   readonly sdk: readonly RateLimitEntry[]
 }): number | null {
   const { now, policy, oauth, sdk } = input
-  const fresh = (at: number) => Number.isFinite(at) && at <= now && now - at <= MAX_AGE_MS
+  const fresh = (at: number) => capacityObservationIsFresh(at, now)
   if (policy !== "never" && (!oauth || oauth.stale || !fresh(oauth.fetchedAt) || oauth.extraUsage?.isEnabled !== false ||
     sdk.some(event => event.observedAt >= oauth.fetchedAt && event.isUsingOverage === true))) return null
   const resetTimes = ACCOUNT_WINDOWS.flatMap(type => {

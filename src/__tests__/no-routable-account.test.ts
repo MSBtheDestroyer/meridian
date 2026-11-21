@@ -87,6 +87,14 @@ function createTestApp(): TestApp {
   return createProxyServer({ port: 0, host: "127.0.0.1", profiles: PROFILES, defaultProfile: "work" }).app
 }
 
+function setFleetEvidence(app: TestApp, reasons: Record<string, string>, observedAt = Date.now()) {
+  return app.fetch(new Request("http://localhost/settings/api/routing", {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ routingManagedExcludedProfiles: Object.keys(reasons),
+      routingManagedExclusionEvidence: { version: 1, observedAt, reasons } }),
+  }))
+}
+
 function post(app: TestApp, opts: { stream?: boolean; content?: string; requestId?: string; profile?: string; attest?: boolean } = {}) {
   const headers = new Headers({ "Content-Type": "application/json" })
   if (opts.requestId) headers.set("x-request-id", opts.requestId)
@@ -227,7 +235,6 @@ describe("early refusal for fresh, spent plan windows", () => {
     ["legacy correlated request", "legacy", false, 200],
   ] as const)("honors routing evidence for %s", async (_name, special, stale, status) => {
     process.env.MERIDIAN_CLAUDE_EXTRA_USAGE = special === "overflow" ? "immediately" : "never"
-    if (special === "managed") setSetting("routingManagedExcludedProfiles", ["spare"])
     if (special === "manual") setSetting("routingExcludedProfiles", ["spare"])
     const now = Date.now()
     for (const id of special === "managed" || special === "manual" ? ["work", "personal"] : ["work", "personal", "spare"]) {
@@ -235,6 +242,7 @@ describe("early refusal for fresh, spent plan windows", () => {
         stale && id === "spare" ? now - 10 * 60_000 : now)
     }
     const app = createTestApp()
+    if (special === "managed") expect((await setFleetEvidence(app, { spare: "loaner-gate" })).status).toBe(200)
 
     const res = await post(app, { stream: true, requestId: "aba6ca87-82f1-49ed-8905-329ff6b25931", attest: special !== "legacy" })
 
@@ -408,6 +416,27 @@ describe("the pool incident on /profiles/events", () => {
 })
 
 describe("no_routable_account when the supervisor's exclusions empty the pool", () => {
+  it.each([
+    ["fresh full fleet evidence", 0, "spent", 200, true],
+    ["stale fleet evidence", 120_001, "spent", 200, false],
+    ["hand hold", 0, "held", 400, false],
+    ["needs login", 0, "logged-out", 400, false],
+  ] as const)("attests only a fresh capacity/protection exclusion set: %s", async (_name, age, reason, status, attests) => {
+    const app = createTestApp()
+    setSetting("routingManagedExcludedProfiles", ["work", "personal", "spare"])
+    const update = await setFleetEvidence(app, { work: reason, personal: "weekly-reserve", spare: "unmeasured-loaner-cap" }, Date.now() - age)
+    expect(update.status).toBe(status)
+
+    const refused = await post(app, { stream: true, attest: true, requestId: "542acae5-5ad5-4a5b-8a40-6b78a9ea3e47" })
+
+    expect(refused.status).toBe(429)
+    const error = await errorOf(refused)
+    expect(error.code).toBe("no_routable_account")
+    if (attests) expect(error.route_refusal).toMatchObject({ sent: false, reason: "quota_exhausted" })
+    else expect(error.route_refusal).toBeUndefined()
+    expect(sdkCalls).toBe(0)
+  })
+
   for (const routing of ["active", "active+priority"]) {
     it(`answers 429 instead of no_eligible_profiles under ${routing}, naming each profile excluded`, async () => {
       process.env.MERIDIAN_ROUTING = routing

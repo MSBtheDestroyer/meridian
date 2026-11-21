@@ -17,6 +17,7 @@ import { computeSummary } from '../telemetry/percentiles'
 import { CATALOG_CLIENT_VERSION, chatGptModelList, createChatGptModelCatalog, type CatalogModel } from './chatgpt/catalog'
 import { chatGptRouteAvailability } from './chatgpt/routeAvailability'
 import { freshPlanExhaustion } from './freshPlanExhaustion'
+import { capacityObservationIsFresh, parseManagedExclusionEvidence, type ManagedExclusionEvidence } from './managedExclusionEvidence'
 import { createCodexClientVersion } from './chatgpt/clientVersion'
 import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
 import { chatGptNameProblem, type ChatGptProfile } from './chatgpt/profiles'
@@ -1285,6 +1286,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // a pin, the supervisor's only keeps unpinned work away.
   const userRoutingExcludedProfileIds = () => parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles"))
   const managedRoutingExcludedProfileIds = () => withoutForcedProfile(parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")), forcedProfileId())
+  let managedExclusionEvidence: ManagedExclusionEvidence | undefined
   // `x-meridian-require: cvp` work answers to the cybersec switcher's managed
   // list instead of the general one: the two switchers own separate lists, so
   // an account rested from general work can still take cvp work.
@@ -3345,6 +3347,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         }
         const cvpModel = typeof body.model === "string" ? body.model : ""
         const requireCvp = requirements.cvp && !warmProfileId && !options.forcedProfileId && !c.req.header("x-meridian-profile")
+        const attestedModel = !requirements.cvp && !requestedProfileId && !forcedProfileId() &&
+          c.req.header("x-meridian-route-refusal") === "1" &&
+          c.req.header("x-request-id") === requestMeta.requestId &&
+          /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(requestMeta.requestId) &&
+          cvpModel ? cvpModel : undefined
+        const freshFleetEvidence = () => managedExclusionEvidence && capacityObservationIsFresh(managedExclusionEvidence.observedAt, Date.now())
+          ? managedExclusionEvidence.profiles : undefined
         const lacksCvp = requireCvp ? (id: string) => !cvpActive(id, cvpModel) : undefined
         // What took a profile out of this request's routing, when cvp work's
         // own list applies instead of the general managed one.
@@ -3379,7 +3388,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             if (!someOutOnlyByManagedExclusion(requireCvp ? cvpManagedExcludedProfileIds() : undefined)) return noEligibleProfilesResponse()
             claudeLog("routing.managed_exclusion_refused", { routing: routingMode })
             const reserves = usageReserves()
-            return noRoutableAccountResponse(noRoutableAccount({
+            const refusal = noRoutableAccount({
               requestId: requestMeta.requestId,
               sessionKey: null,
               routing: routingMode,
@@ -3391,7 +3400,19 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 reserveHold: id => claudeReserveHold(id, reserves),
                 excluded: cvpExcluded,
               }),
-            }))
+            })
+            const fleetEvidence = freshFleetEvidence()
+            if (attestedModel && fleetEvidence) {
+              const pool = getEffectiveProfiles(finalConfig.profiles)
+              const managed = new Set(canonicalRoutingExcludedProfileIds(pool, managedRoutingExcludedProfileIds()))
+              const manual = new Set(canonicalRoutingExcludedProfileIds(pool, userRoutingExcludedProfileIds()))
+              const held = new Set(routingHeldProfileIds())
+              if (pool.length > 0 && pool.every(({ id }) => !manual.has(id) && !held.has(id) && managed.has(id) && fleetEvidence.has(id))) {
+                refusal.error.route_refusal = { version: 1, phase: "before_inference", sent: false,
+                  provider: "claude", model: attestedModel, reason: "quota_exhausted" }
+              }
+            }
+            return noRoutableAccountResponse(refusal)
           }
           case "allowed":
             break
@@ -3606,11 +3627,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
               }
               // An account-shaped error after dispatch cannot attest that the request was unsent.
-              const attestedModel = !requireCvp && !requestedProfileId && !warmProfileId && retainOnlyProfile === undefined &&
-                c.req.header("x-meridian-route-refusal") === "1" &&
-                c.req.header("x-request-id") === requestMeta.requestId &&
-                /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(requestMeta.requestId) &&
-                typeof body.model === "string" && body.model.length > 0 ? body.model : undefined
+              const attestPool = retainOnlyProfile === undefined && !forcedProfileId() ? attestedModel : undefined
               const refuseUnsent = (input: {
                 lead: string; reason: "weekly_held" | "extra_usage_off" | "reserve_held" | "quota_exhausted";
                 provenProfiles?: NoRoutableProfile[];
@@ -3618,11 +3635,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 const profiles = input.provenProfiles ?? describeUnroutable()
                 const refusal = noRoutableAccount({ requestId: requestMeta.requestId, sessionKey, routing: routingMode,
                   lead: input.lead, reason: input.reason, lastTried: null, profiles })
-                if (attestedModel && (input.provenProfiles || input.reason !== "extra_usage_off" &&
+                if (attestPool && (input.provenProfiles || input.reason !== "extra_usage_off" &&
                   profiles.length === effectivePool.length && profiles.every(p => p.reason === input.reason))) {
                   refusal.error.route_refusal = {
                     version: 1, phase: "before_inference", sent: false,
-                    provider: "claude", model: attestedModel, reason: input.reason === "quota_exhausted" ? "quota_exhausted" : "reserve_held",
+                    provider: "claude", model: attestPool, reason: input.reason === "quota_exhausted" ? "quota_exhausted" : "reserve_held",
                   }
                 }
                 return noRoutableAccountResponse(refusal)
@@ -3630,7 +3647,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               if (allReserveHeld && retainOnlyProfile === undefined) {
                 return refuseUnsent({ lead: "every profile is holding its weekly reserve", reason: "weekly_held" })
               }
-              if (attestedModel && !forcedProfileId()) {
+              if (attestPool) {
+                const fleetEvidence = freshFleetEvidence()
                 const managed = new Set(canonicalRoutingExcludedProfileIds(effectivePool, managedRoutingExcludedProfileIds()))
                 const manual = new Set(canonicalRoutingExcludedProfileIds(effectivePool, userRoutingExcludedProfileIds()))
                 const held = new Set(routingHeldProfileIds())
@@ -3638,7 +3656,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 const now = Date.now()
                 const profiles = effectivePool.flatMap((profile): NoRoutableProfile[] => {
                   if (manual.has(profile.id) || held.has(profile.id)) return []
-                  if (managed.has(profile.id) && !eligible.has(profile.id)) {
+                  if (managed.has(profile.id) && !eligible.has(profile.id) && fleetEvidence?.has(profile.id)) {
                     return [{ id: profile.id, reason: "excluded", resetsAt: knownUsageReset(profile.id, now) }]
                   }
                   if (!eligible.has(profile.id) || (profile.type ?? "claude-max") !== "claude-max") return []
@@ -11029,7 +11047,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       cvpHolders: cvpHoldersByModel(cvpEffectiveOrder),
       // What a supervisor may rely on this build doing; read rather than
       // guessed from a version, which forks share.
-      capabilities: ["managed-exclusion-no-routable", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order", "forced-active-profile", "managed-exclusion-reasons", "usage-refresh", "profile-refresh"],
+      capabilities: ["managed-exclusion-no-routable", "managed-exclusion-evidence-v1", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order", "forced-active-profile", "managed-exclusion-reasons", "usage-refresh", "profile-refresh"],
       profiles: profileIds,
       saved: {
         routing: getSetting("routing") ?? null,
@@ -11055,6 +11073,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       routingManagedExcludedProfiles?: unknown
       routingHeldProfiles?: unknown
       routingManagedReasons?: unknown
+      routingManagedExclusionEvidence?: unknown
       allowForcingForbiddenProfile?: unknown
       usageReserves?: unknown
       cvpProfileOrder?: unknown
@@ -11149,7 +11168,23 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       }
       updates.cvpManagedExcludedProfiles = parseRoutingExcludedProfiles(body.cvpManagedExcludedProfiles)
     }
+    let evidence: ManagedExclusionEvidence | undefined
+    if (body.routingManagedExclusionEvidence !== undefined) {
+      if (!isSameOriginRequest(c.req.raw)) return c.json({ error: "Managed exclusion evidence requires a same-origin request" }, 403)
+      if (body.routingManagedExclusionEvidence !== null) {
+        const known = new Set(claudeProfileIds())
+        const excluded = new Set((updates.routingManagedExcludedProfiles ?? managedRoutingExcludedProfileIds()).filter(id => known.has(id)))
+        evidence = parseManagedExclusionEvidence(body.routingManagedExclusionEvidence, excluded)
+        if (!evidence || evidence.observedAt > Date.now()) return c.json({ error: "Invalid managed exclusion evidence" }, 400)
+        if (managedExclusionEvidence && evidence.observedAt < managedExclusionEvidence.observedAt) {
+          return c.json({ error: "Newer managed exclusion evidence is already recorded" }, 409)
+        }
+      }
+    }
     if (Object.keys(updates).length > 0) saveSettings(updates)
+    if (body.routingManagedExclusionEvidence !== undefined || body.routingManagedExcludedProfiles !== undefined ||
+      body.routingManagedReasons !== undefined || body.routingExcludedProfiles !== undefined || body.routingHeldProfiles !== undefined ||
+      body.usageReserves !== undefined) managedExclusionEvidence = evidence
     // Turning forcing off ends a force in effect: the switch says no profile
     // is forced past a supervisor any more.
     if (updates.allowForcingForbiddenProfile === false && getSetting("forcedActiveProfile") !== undefined) {
