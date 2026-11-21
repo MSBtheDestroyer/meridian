@@ -208,6 +208,7 @@ export interface ChatGptSeatCreditState {
 }
 
 export interface ChatGptBackend<Ctx> extends UpstreamBackend<Ctx> {
+  planSeatAvailable(seat: string, model: string): boolean
   /** Latest `x-codex-*` window headers per seat, from real responses. */
   observedLimits(): ReadonlyMap<string, ObservedSeatLimits>
   seatCreditState(seat: string): ChatGptSeatCreditState
@@ -296,6 +297,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
   const reserveRefusedUntil = new Map<string, number>()
   const modelRefusedUntil = new Map<string, number>()
   const reserveKey = (seat: string, model: string | undefined) => `${seat}\u0000${model ?? ""}`
+  const refusesModel = (seat: string, model: string | undefined) => (modelRefusedUntil.get(reserveKey(seat, model)) ?? 0) > now()
 
   /** The newer of what a response stated and what the usage read found. */
   const creditsOf = (seat: string): CodexCredits | null => {
@@ -351,6 +353,10 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
     provider: "chatgpt",
     observedLimits: () => observed,
     reserveHold,
+    planSeatAvailable(seat, model) {
+      return source.candidateSeats(model).includes(seat) && !(source.reserveSeats?.(model) ?? []).includes(seat) &&
+        !exhaustion.isExhausted(seat) && !refusesModel(seat, model) && !readingSpent(seat) && reserveHold(seat) === null
+    },
 
     forgetSeat(seat) {
       observed.delete(seat)
@@ -531,10 +537,9 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       // A seat that refused this model sits it out (MODEL_REFUSAL_MS). It is
       // asked again only when no other seat was, so a model that every seat
       // refuses still gets the backend's own answer, not "unavailable".
-      const refusesModel = (seat: string) => (modelRefusedUntil.get(reserveKey(seat, model)) ?? 0) > now()
       const queue: Array<{ seat: string; onCredits: boolean }> = []
       const sittingOut: Array<{ seat: string; onCredits: boolean }> = []
-      const enqueue = (seat: string, onCredits: boolean) => (refusesModel(seat) ? sittingOut : queue).push({ seat, onCredits })
+      const enqueue = (seat: string, onCredits: boolean) => (refusesModel(seat, model) ? sittingOut : queue).push({ seat, onCredits })
       for (const seat of seats) enqueue(seat, onCreditsNow.has(seat))
       const dispatched = new Set<string>()
       let reserveQueued = false

@@ -15,6 +15,8 @@ import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
 import { computeSummary } from '../telemetry/percentiles'
 import { CATALOG_CLIENT_VERSION, chatGptModelList, createChatGptModelCatalog, type CatalogModel } from './chatgpt/catalog'
+import { chatGptRouteAvailability } from './chatgpt/routeAvailability'
+import { freshPlanExhaustion } from './freshPlanExhaustion'
 import { createCodexClientVersion } from './chatgpt/clientVersion'
 import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
 import { chatGptNameProblem, type ChatGptProfile } from './chatgpt/profiles'
@@ -3603,20 +3605,53 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   error: { type: "overloaded_error", message: "Durable priority routing state is unavailable" },
                 }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
               }
-              const refuseUnsent = (lead: string, reason: string): Response => noRoutableAccountResponse(noRoutableAccount({
-                requestId: requestMeta.requestId,
-                sessionKey,
-                routing: routingMode,
-                lead,
-                reason,
-                lastTried: null,
-                profiles: describeUnroutable(),
-              }))
+              // An account-shaped error after dispatch cannot attest that the request was unsent.
+              const attestedModel = !requireCvp && !requestedProfileId && !warmProfileId && retainOnlyProfile === undefined &&
+                c.req.header("x-meridian-route-refusal") === "1" &&
+                c.req.header("x-request-id") === requestMeta.requestId &&
+                /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(requestMeta.requestId) &&
+                typeof body.model === "string" && body.model.length > 0 ? body.model : undefined
+              const refuseUnsent = (input: {
+                lead: string; reason: "weekly_held" | "extra_usage_off" | "reserve_held" | "quota_exhausted";
+                provenProfiles?: NoRoutableProfile[];
+              }): Response => {
+                const profiles = input.provenProfiles ?? describeUnroutable()
+                const refusal = noRoutableAccount({ requestId: requestMeta.requestId, sessionKey, routing: routingMode,
+                  lead: input.lead, reason: input.reason, lastTried: null, profiles })
+                if (attestedModel && (input.provenProfiles || input.reason !== "extra_usage_off" &&
+                  profiles.length === effectivePool.length && profiles.every(p => p.reason === input.reason))) {
+                  refusal.error.route_refusal = {
+                    version: 1, phase: "before_inference", sent: false,
+                    provider: "claude", model: attestedModel, reason: input.reason === "quota_exhausted" ? "quota_exhausted" : "reserve_held",
+                  }
+                }
+                return noRoutableAccountResponse(refusal)
+              }
               if (allReserveHeld && retainOnlyProfile === undefined) {
-                return refuseUnsent("every profile is holding its weekly reserve", "weekly_held")
+                return refuseUnsent({ lead: "every profile is holding its weekly reserve", reason: "weekly_held" })
+              }
+              if (attestedModel && !forcedProfileId()) {
+                const managed = new Set(canonicalRoutingExcludedProfileIds(effectivePool, managedRoutingExcludedProfileIds()))
+                const manual = new Set(canonicalRoutingExcludedProfileIds(effectivePool, userRoutingExcludedProfileIds()))
+                const held = new Set(routingHeldProfileIds())
+                const eligible = new Set(eligibleOrder)
+                const now = Date.now()
+                const profiles = effectivePool.flatMap((profile): NoRoutableProfile[] => {
+                  if (manual.has(profile.id) || held.has(profile.id)) return []
+                  if (managed.has(profile.id) && !eligible.has(profile.id)) {
+                    return [{ id: profile.id, reason: "excluded", resetsAt: knownUsageReset(profile.id, now) }]
+                  }
+                  if (!eligible.has(profile.id) || (profile.type ?? "claude-max") !== "claude-max") return []
+                  const resetsAt = freshPlanExhaustion({ now, policy: extraUsagePolicy,
+                    oauth: peekOAuthUsage(profile.id), sdk: rateLimitStore.getAll(profile.id) })
+                  return resetsAt === null ? [] : [{ id: profile.id, reason: "spent", resetsAt }]
+                })
+                if (profiles.length === effectivePool.length && profiles.some(profile => profile.reason === "spent")) {
+                  return refuseUnsent({ lead: "every permitted profile has a fresh spent plan window", reason: "quota_exhausted", provenProfiles: profiles })
+                }
               }
               if (extraUsage.refused && retainOnlyProfile === undefined) {
-                return refuseUnsent("every profile's plan usage is spent and Extra Usage is off for this instance", "extra_usage_off")
+                return refuseUnsent({ lead: "every profile's plan usage is spent and Extra Usage is off for this instance", reason: "extra_usage_off" })
               }
               let candidates: string[]
               if (routingMode === ACTIVE_PRIORITY) {
@@ -3666,7 +3701,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 claudeLog("routing.usage_reserve_refused", { held: [...holds.keys()], retained: retainOnlyProfile ?? null })
                 return retainedHold && retainOnlyProfile !== undefined
                   ? usageReserveResponse(`${heldMessage(retainOnlyProfile, retainedHold)}.`, retainedHold.opensAt, Date.now())
-                  : refuseUnsent("every eligible profile is held back by its usage reserve", "reserve_held")
+                  : refuseUnsent({ lead: "every eligible profile is held back by its usage reserve", reason: "reserve_held" })
               }
               if (serving.length < candidates.length) {
                 claudeLog("routing.usage_reserve", { held: candidates.filter(id => !serving.includes(id)) })
@@ -10668,6 +10703,27 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       onRefusalsSettled: recordChatGptRefusalOutcome,
     },
   }) : undefined
+  app.get("/profiles/route-availability", (c) => {
+    const provider = c.req.query("provider")
+    const model = c.req.query("model")
+    const variant = c.req.query("variant")
+    c.header("Cache-Control", "no-store")
+    if (provider !== "chatgpt" || !model || model.length > 128 || !variant || variant.length > 32) {
+      return c.json({ error: "Expected a ChatGPT provider and exact model and variant" }, 400)
+    }
+    const route = chatGptProfiles?.route(undefined, "work")
+    const seats = new Map(chatGptSource?.seats(model).map(seat => [seat.id, seat]))
+    const now = Date.now()
+    const eligible = route?.kind === "pool" && chatGptSource?.isServing() && chatGptBackend && chatGptCatalog
+      ? chatGptUsage?.entries.filter(entry => {
+          const seat = seats.get(entry.id)
+          return entry.plan !== null && seat?.eligible && seat.expiresAt !== null && seat.expiresAt > now &&
+            !route.excluded.has(entry.id) && chatGptProfiles?.loginState(entry.id) === "authenticated" &&
+            chatGptBackend.planSeatAvailable(entry.id, model) && chatGptCatalog.routeOffered(model, variant, entry.plan.slug)
+        }) ?? []
+      : []
+    return c.json(chatGptRouteAvailability({ provider, model, variant }, eligible, now))
+  })
   if (chatGptBackend) {
     chatGptObserved = () => chatGptBackend.observedLimits()
     chatGptCreditState = (seat) => chatGptBackend.seatCreditState(seat)

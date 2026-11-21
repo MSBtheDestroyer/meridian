@@ -15,10 +15,12 @@ import { installMcpToolsMock } from "./mcpToolsMock"
 import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
 
 let failingDirs = new Set<string>()
+let sdkCalls = 0
 const SESSION_LIMIT = "Claude Code returned an error result: You've hit your session limit · resets 12:30am (America/Chicago)"
 
 installSdkMock(() => ({
   query: (params: any) => {
+    sdkCalls++
     const dir = params.options?.env?.CLAUDE_CONFIG_DIR ?? "default"
     const sessionId = resolveMockSdkSessionId(params.options, "test-session")
     return (async function* () {
@@ -66,6 +68,7 @@ type NoRoutableError = {
   reset_at?: string | null
   incident_id?: string
   request_id?: string
+  route_refusal?: unknown
   profiles?: ProfileEntry[]
 }
 type PoolEvent = {
@@ -84,10 +87,14 @@ function createTestApp(): TestApp {
   return createProxyServer({ port: 0, host: "127.0.0.1", profiles: PROFILES, defaultProfile: "work" }).app
 }
 
-function post(app: TestApp, opts: { stream?: boolean; content?: string } = {}) {
+function post(app: TestApp, opts: { stream?: boolean; content?: string; requestId?: string; profile?: string; attest?: boolean } = {}) {
+  const headers = new Headers({ "Content-Type": "application/json" })
+  if (opts.requestId) headers.set("x-request-id", opts.requestId)
+  if (opts.profile) headers.set("x-meridian-profile", opts.profile)
+  if (opts.attest) headers.set("x-meridian-route-refusal", "1")
   return Promise.resolve(app.fetch(new Request("http://localhost/v1/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({
       model: "claude-sonnet-4-5",
       max_tokens: 128,
@@ -137,6 +144,7 @@ const ENV_KEYS = ["MERIDIAN_ROUTING", "MERIDIAN_PROFILE_ORDER", "MERIDIAN_WEEKLY
 
 beforeEach(async () => {
   failingDirs = new Set()
+  sdkCalls = 0
   await clearSessionCache()
   resetActiveProfile()
   rateLimitStore.clear()
@@ -188,13 +196,19 @@ describe("no_routable_account inside the stream", () => {
     for (const dir of ALL_DIRS) failingDirs.add(dir)
     const app = createTestApp()
 
-    const res = await post(app, { stream: true, content: "streamed unique message" })
+    const res = await post(app, {
+      stream: true,
+      content: "streamed unique message",
+      requestId: "d8f674be-a3b9-4bc9-a13c-57aa3cf2fa6d",
+      attest: true,
+    })
 
     expect(res.status).toBe(200)
     const frames = streamErrors(await res.text())
     expect(frames).toHaveLength(1)
     const error = frames[0]!
     expectContractShape(error)
+    expect(error.route_refusal).toBeUndefined()
     expect(error.profiles!.map(p => p.id).sort()).toEqual(["personal", "spare", "work"])
 
     // Same object shape as the JSON body a non-streaming request gets.
@@ -203,8 +217,42 @@ describe("no_routable_account inside the stream", () => {
   }, 40_000)
 })
 
+describe("early refusal for fresh, spent plan windows", () => {
+  it.each([
+    ["all spent", null, false, 429],
+    ["managed-out account", "managed", false, 429],
+    ["manually excluded account", "manual", false, 200],
+    ["stale observation", null, true, 200],
+    ["paid overflow still allowed", "overflow", false, 200],
+    ["legacy correlated request", "legacy", false, 200],
+  ] as const)("honors routing evidence for %s", async (_name, special, stale, status) => {
+    process.env.MERIDIAN_CLAUDE_EXTRA_USAGE = special === "overflow" ? "immediately" : "never"
+    if (special === "managed") setSetting("routingManagedExcludedProfiles", ["spare"])
+    if (special === "manual") setSetting("routingExcludedProfiles", ["spare"])
+    const now = Date.now()
+    for (const id of special === "managed" || special === "manual" ? ["work", "personal"] : ["work", "personal", "spare"]) {
+      rateLimitStore.record(id, { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt: now + 3_600_000 },
+        stale && id === "spare" ? now - 10 * 60_000 : now)
+    }
+    const app = createTestApp()
+
+    const res = await post(app, { stream: true, requestId: "aba6ca87-82f1-49ed-8905-329ff6b25931", attest: special !== "legacy" })
+
+    expect(res.status).toBe(status)
+    if (status === 429) {
+      const error = await errorOf(res)
+      expect(error.code).toBe("no_routable_account")
+      expect(error.route_refusal).toMatchObject({ sent: false, model: "claude-sonnet-4-5", reason: "quota_exhausted" })
+      expect(sdkCalls).toBe(0)
+    } else {
+      expect(await res.text()).toContain("ok from")
+    }
+  })
+})
+
 describe("no_routable_account when every candidate is held back", () => {
   const FLAT_WEEK_95 = { seven_day: { floor: 95, ceiling: 95 } }
+  const REQUEST_ID = "73f3a376-4d3a-4efa-ae91-d4aff18d898d"
 
   function holdEveryProfile(): void {
     setSetting("usageReserves", { work: FLAT_WEEK_95, personal: FLAT_WEEK_95, spare: FLAT_WEEK_95 })
@@ -226,6 +274,60 @@ describe("no_routable_account when every candidate is held back", () => {
     expect(error.profiles!.map(p => [p.id, p.reason]).sort()).toEqual([["personal", "reserve_held"], ["spare", "reserve_held"], ["work", "reserve_held"]])
     const personal = error.profiles!.find(p => p.id === "personal")!
     expect(error.reset_at).toBe(personal.resets_at)
+    expect(error.route_refusal).toBeUndefined()
+  })
+
+  it("attests an unsent streaming request held by every pool reserve in the HTTP refusal", async () => {
+    holdEveryProfile()
+    const app = createTestApp()
+
+    const res = await post(app, { stream: true, requestId: REQUEST_ID, attest: true })
+
+    expect(res.status).toBe(429)
+    const error = await errorOf(res)
+    expect(error.request_id).toBe(REQUEST_ID)
+    expect(error.route_refusal).toEqual({
+      version: 1,
+      phase: "before_inference",
+      sent: false,
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+      reason: "reserve_held",
+    })
+  })
+
+  it("does not attest a pinned request when the named seat is held", async () => {
+    holdEveryProfile()
+    const app = createTestApp()
+
+    const res = await post(app, { stream: true, requestId: REQUEST_ID, profile: "work", attest: true })
+
+    expect(res.status).toBe(429)
+    expect((await errorOf(res)).route_refusal).toBeUndefined()
+  })
+
+  it("does not attest a mixed reserve and exclusion refusal", async () => {
+    holdEveryProfile()
+    setSetting("routingExcludedProfiles", ["spare"])
+    const app = createTestApp()
+
+    const res = await post(app, { stream: true, requestId: REQUEST_ID, attest: true })
+
+    expect(res.status).toBe(429)
+    const error = await errorOf(res)
+    expect(error.profiles?.map(p => p.reason).sort()).toEqual(["excluded", "reserve_held", "reserve_held"])
+    expect(error.route_refusal).toBeUndefined()
+  })
+
+  it("tries the remaining permitted account instead of attesting pool exhaustion", async () => {
+    holdEveryProfile()
+    setSetting("usageReserves", { work: FLAT_WEEK_95, personal: FLAT_WEEK_95 })
+    const app = createTestApp()
+
+    const res = await post(app, { requestId: REQUEST_ID, attest: true })
+
+    expect(res.status).toBe(200)
+    expect(await res.text()).toContain("ok from /tmp/meridian-nr-spare")
   })
 
   it("does the same for unpinned work in plain active mode", async () => {
