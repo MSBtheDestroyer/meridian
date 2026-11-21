@@ -90,6 +90,10 @@ interface RawOAuthUsageResponse {
   seven_day?: RawOAuthWindow | null
   seven_day_opus?: RawOAuthWindow | null
   seven_day_sonnet?: RawOAuthWindow | null
+  seven_day_fable?: RawOAuthWindow | null
+  seven_day_mythos?: RawOAuthWindow | null
+  seven_day_haiku?: RawOAuthWindow | null
+  seven_day_overage_included?: RawOAuthWindow | null
   seven_day_oauth_apps?: RawOAuthWindow | null
   seven_day_cowork?: RawOAuthWindow | null
   seven_day_omelette?: RawOAuthWindow | null
@@ -125,6 +129,7 @@ export interface OAuthExtraUsageInfo {
 
 export interface OAuthUsageSnapshot {
   windows: OAuthUsageWindow[]
+  unreadableWindowTypes?: readonly string[]
   extraUsage: OAuthExtraUsageInfo | null
   bankedResets: OAuthBankedResets | null
   fetchedAt: number
@@ -289,6 +294,10 @@ const WINDOW_TYPES: Array<keyof RawOAuthUsageResponse> = [
   "seven_day",
   "seven_day_opus",
   "seven_day_sonnet",
+  "seven_day_fable",
+  "seven_day_mythos",
+  "seven_day_haiku",
+  "seven_day_overage_included",
   "seven_day_oauth_apps",
   "seven_day_cowork",
   "seven_day_omelette",
@@ -369,7 +378,8 @@ function modelScopedWindowType(limit: RawOAuthLimit): string | null {
   if (limit.kind !== "weekly_scoped") return null
 
   const model = limit.scope?.model
-  const name = model?.display_name?.trim() || model?.id?.trim()
+  const id = model?.id?.trim()
+  const name = id?.startsWith("claude-") ? id : model?.display_name?.trim() || id
   if (!name) return null
 
   const slug = name
@@ -382,33 +392,32 @@ function modelScopedWindowType(limit: RawOAuthLimit): string | null {
 
 function buildSnapshot(raw: RawOAuthUsageResponse): OAuthUsageSnapshot {
   const windows: OAuthUsageWindow[] = []
+  const unreadable = new Set<string>()
+  const addWindow = (type: string, percent: number | null | undefined, reset: string | null | undefined) => {
+    const utilization = normalizeUtilization(percent)
+    const resetsAt = parseIsoToMs(reset)
+    if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || resetsAt === null) unreadable.add(type)
+    if (utilization === null && resetsAt === null) return
+    const prior = windows.find(window => window.type === type)
+    if (!prior) windows.push({ type, utilization, resetsAt })
+    else if (prior.utilization !== utilization || prior.resetsAt !== resetsAt) unreadable.add(type)
+  }
   for (const key of WINDOW_TYPES) {
     const w = raw[key] as RawOAuthWindow | null | undefined
     if (!w) continue
-    const utilization = normalizeUtilization(w.utilization)
-    const resetsAt = parseIsoToMs(w.resets_at)
-    if (utilization === null && resetsAt === null) continue
-    windows.push({ type: key as string, utilization, resetsAt })
+    addWindow(key, w.utilization, w.resets_at)
   }
 
-  const windowTypes = new Set(windows.map(window => window.type))
   for (const limit of raw.limits ?? []) {
     const type = modelScopedWindowType(limit)
-    if (!type || windowTypes.has(type)) continue
-
-    const utilization = normalizeUtilization(limit.percent)
-    const resetsAt = parseIsoToMs(limit.resets_at)
-    if (utilization === null && resetsAt === null) continue
-
-    windows.push({ type, utilization, resetsAt })
-    windowTypes.add(type)
+    if (type) addWindow(type, limit.percent, limit.resets_at)
   }
 
   const extra = raw.extra_usage
   const exponent = extraUsageExponent(extra?.decimal_places)
-  const extraUsage: OAuthExtraUsageInfo | null = extra
+  const extraUsage: OAuthExtraUsageInfo | null = typeof extra?.is_enabled === "boolean"
     ? {
-        isEnabled: !!extra.is_enabled,
+        isEnabled: extra.is_enabled,
         monthlyLimit: minorToMajor(extra.monthly_limit, exponent),
         usedCredits: minorToMajor(extra.used_credits, exponent),
         utilization: normalizeUtilization(extra.utilization ?? null),
@@ -417,7 +426,8 @@ function buildSnapshot(raw: RawOAuthUsageResponse): OAuthUsageSnapshot {
       }
     : null
 
-  return { windows, extraUsage, bankedResets: parseBankedResets(raw.cedar_ember), fetchedAt: Date.now() }
+  return { windows, extraUsage, bankedResets: parseBankedResets(raw.cedar_ember), fetchedAt: Date.now(),
+    ...(unreadable.size > 0 ? { unreadableWindowTypes: [...unreadable] } : {}) }
 }
 
 async function readAccessToken(store: CredentialStore): Promise<string | null> {
@@ -513,17 +523,17 @@ type UsageCallResult = Awaited<ReturnType<typeof callAnthropic>>
 async function retryAfterRateLimitRun(
   limited: UsageCallResult,
   ctx: { store: CredentialStore; refresh: RefreshFn; cacheKey: string; token: string; fetchImpl: FetchLike; owner: Promise<RawUsageResult> },
-): Promise<UsageCallResult> {
+): Promise<{ result: UsageCallResult; token: string }> {
   const runLength = countRateLimited(ctx.cacheKey, ctx.token)
-  if (!claimRateLimitRefresh(ctx.cacheKey, runLength)) return limited
+  if (!claimRateLimitRefresh(ctx.cacheKey, runLength)) return { result: limited, token: ctx.token }
   claudeLog("oauth_usage.refresh_on_429", { profile: ctx.cacheKey, runLength })
   const newToken = await refreshAndRead(ctx.store, ctx.refresh, ctx.cacheKey, "rate_limited")
-  if (!newToken || inflightByProfile.get(ctx.cacheKey) !== ctx.owner) return limited
+  if (!newToken || inflightByProfile.get(ctx.cacheKey) !== ctx.owner) return { result: limited, token: ctx.token }
   const retried = await callAnthropic(newToken, ctx.fetchImpl)
-  if (inflightByProfile.get(ctx.cacheKey) !== ctx.owner) return retried
+  if (inflightByProfile.get(ctx.cacheKey) !== ctx.owner) return { result: retried, token: newToken }
   if ("__status" in retried && retried.__status === 429) countRateLimited(ctx.cacheKey, newToken)
   else rateLimitRunByProfile.delete(ctx.cacheKey)
-  return retried
+  return { result: retried, token: newToken }
 }
 
 export interface FetchOAuthUsageOpts {
@@ -914,7 +924,9 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
       }
       if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
       if ("__status" in result && result.__status === 429) {
-        result = await retryAfterRateLimitRun(result, { store, refresh, cacheKey, token, fetchImpl, owner: promise })
+        const retry = await retryAfterRateLimitRun(result, { store, refresh, cacheKey, token, fetchImpl, owner: promise })
+        result = retry.result
+        token = retry.token
       } else {
         rateLimitRunByProfile.delete(cacheKey)
       }
@@ -946,6 +958,7 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
       rateLimitedUntilByProfile.delete(cacheKey)
       failureByProfile.delete(cacheKey)
       const snapshot = buildSnapshot(result)
+      usageTokenDigests.set(snapshot, createHash("sha256").update(token).digest("hex"))
       noteProviderAccepted(store.refreshKey, { startedAt })
       cacheByProfile.set(cacheKey, snapshot)
       return { snapshot, error: null }
@@ -975,9 +988,12 @@ export function peekOAuthUsage(profileId?: string | null): OAuthUsageSnapshot | 
   return cacheByProfile.get(profileId ?? DEFAULT_KEY)
 }
 
-export function peekSuccessfulOAuthUsage(profileId: string): OAuthUsageSnapshot | undefined {
+const usageTokenDigests = new WeakMap<OAuthUsageSnapshot, string>()
+
+export function peekSuccessfulOAuthUsage(profileId: string, tokenDigest?: string): OAuthUsageSnapshot | undefined {
   const snapshot = peekOAuthUsage(profileId)
-  return failureByProfile.has(profileId) || snapshot?.stale ? undefined : snapshot
+  return !snapshot || failureByProfile.has(profileId) || snapshot.stale ||
+    (tokenDigest !== undefined && usageTokenDigests.get(snapshot) !== tokenDigest) ? undefined : snapshot
 }
 
 /** Clear cached OAuth usage snapshot, failure state, and 429 cooldowns for one profile. */

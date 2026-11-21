@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "bun:test"
+import { createHash } from "node:crypto"
 import { accountModelReadDue, accountModelsState, accountOffersModelEffort, clearAccountModels, fetchAccountModels, toAccountModelList } from "../proxy/accountModels"
 import { buildModelList } from "../proxy/openai"
 
@@ -44,14 +45,20 @@ describe("fetchAccountModels", () => {
       effort: { supported: true, high: { supported: true }, low: { supported: false } },
     } }]), () => new Response(null, { status: 401 })])
     const opts = { cacheKey: "max", auth: async () => ({ Authorization: "Bearer fixture" }), fetchImpl, now: () => at }
+    const route = { model: "claude-opus-5-5", variant: "high" }
+    const evidence = { now: at, tokenDigest: createHash("sha256").update("fixture").digest("hex") }
+    const otherDigest = createHash("sha256").update("another-token").digest("hex")
 
     await fetchAccountModels(opts)
-    expect(accountOffersModelEffort("max", "claude-opus-5-5", "high", at)).toBe(true)
-    expect(accountOffersModelEffort("max", "claude-opus-5-5", "low", at)).toBe(false)
-    expect(accountModelReadDue("max", at)).toBe(false)
+    expect(accountOffersModelEffort("max", route, evidence)).toBe(true)
+    expect(accountOffersModelEffort("max", route, { ...evidence, tokenDigest: otherDigest })).toBe(false)
+    expect(accountOffersModelEffort("max", { ...route, variant: "low" }, evidence)).toBe(false)
+    expect(accountModelReadDue("max", at, evidence.tokenDigest)).toBe(false)
+    expect(accountModelReadDue("max", at, otherDigest)).toBe(true)
     await fetchAccountModels({ ...opts, force: true })
 
-    expect(accountOffersModelEffort("max", "claude-opus-5-5", "high", at)).toBe(false)
+    expect(accountOffersModelEffort("max", route, evidence)).toBe(false)
+    expect(accountModelReadDue("max", at, otherDigest)).toBe(false)
   })
 
   it("lists the account's models with its own token and caches them per profile", async () => {

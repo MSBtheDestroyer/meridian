@@ -15,7 +15,8 @@ import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
 import { computeSummary } from '../telemetry/percentiles'
 import { CATALOG_CLIENT_VERSION, chatGptModelList, createChatGptModelCatalog, type CatalogModel } from './chatgpt/catalog'
-import { claudeOpusReturnUsage, routeAvailability } from './routeAvailability'
+import { createHash } from 'node:crypto'
+import { claudeReturnUsage, isExactClaudeWireModel, routeAvailability } from './routeAvailability'
 import { freshPlanExhaustion } from './freshPlanExhaustion'
 import { capacityObservationIsFresh, parseManagedExclusionEvidence, type ManagedExclusionEvidence } from './managedExclusionEvidence'
 import { CHATGPT_MANAGED_PROTECTION_REASONS, chatGptRefusalPoolKey, proveChatGptRouteRefusal } from './chatgpt/routeRefusal'
@@ -126,7 +127,7 @@ import type { RequestMetric } from "../telemetry"
 import { assistantRefusalOf, type AssistantRefusal, canRecoverCapturedToolUses, uncapturedRecoveryVeto, streamedToolBlockVeto, cliRejectedToolResults, type StreamedToolBlockRecord, type UncapturedDeliveryVeto, classifyError, extractSdkTermination, formatSdkTermination, classifyResumeRefusal, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError, isAccountFailoverError, isQuotaRefusal, isOutputTokenCapExceeded } from "./errors"
 import { createSseRelayStream, relayStreamAttempt } from "./sseFailureSniff"
 import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, readStoredCredentialSnapshot, getAuthRenewalStatus, getStoredPlanFields, renewalStatusFor, resolveRenewalWarnDays, type CredentialStore, type StoredPlanFields, type AuthRenewalStatus } from "./tokenRefresh"
-import { describeAuthLifecycleEvent, noteCredentialObserved, noteProviderAccepted, onAuthLifecycleTransition, type AuthLifecycleTransition } from "./authLifecycle"
+import { authLifecycleFor, describeAuthLifecycleEvent, noteCredentialObserved, noteProviderAccepted, onAuthLifecycleTransition, type AuthLifecycleTransition } from "./authLifecycle"
 import { noteClaudeAuthenticationFailure, profileLoginState, reconcileClaudeProfileAuth } from "./profileLoginState"
 import { planAllowance } from "./planAllowance"
 import { isCredentialsReadOnly, logCredentialsModeBanner } from "./credentialsMode"
@@ -3352,11 +3353,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         }
         const cvpModel = typeof body.model === "string" ? body.model : ""
         const requireCvp = requirements.cvp && !warmProfileId && !options.forcedProfileId && !c.req.header("x-meridian-profile")
-        const attestedModel = !requirements.cvp && !requestedProfileId && !forcedProfileId() &&
+        const attestedModel = isPoolRouting(routingMode) && !requirements.cvp && !requestedProfileId && !forcedProfileId() &&
           c.req.header("x-meridian-route-refusal") === "1" &&
           c.req.header("x-request-id") === requestMeta.requestId &&
           /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(requestMeta.requestId) &&
-          cvpModel ? cvpModel : undefined
+          isExactClaudeWireModel(cvpModel) ? cvpModel : undefined
         const freshFleetEvidence = () => managedExclusionEvidence && capacityObservationIsFresh(managedExclusionEvidence.observedAt, Date.now())
           ? managedExclusionEvidence.profiles : undefined
         const lacksCvp = requireCvp ? (id: string) => !cvpActive(id, cvpModel) : undefined
@@ -10769,7 +10770,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     },
   }) : undefined
   let returnModelRead: Promise<unknown> | undefined
-  app.get("/profiles/route-availability", (c) => {
+  app.get("/profiles/route-availability", async (c) => {
     const provider = c.req.query("provider")
     const model = c.req.query("model")
     const variant = c.req.query("variant")
@@ -10780,40 +10781,55 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const now = Date.now()
     if (provider === "claude") {
       const query = { provider, model, variant }
-      const policy = getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing"))
-      if (model !== "claude-opus-5-5" || variant !== "high" || !isPoolRouting(policy) || forcedProfileId()) {
+      const unpinnedPool = () => isPoolRouting(getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing"))) &&
+        !forcedProfileId() && getClaudeExtraUsagePolicy(process.env.MERIDIAN_CLAUDE_EXTRA_USAGE ?? getSetting("claudeExtraUsage")) !== "immediately"
+      const requirements = parseRoutingRequirements(c.req.header(ROUTING_REQUIRE_HEADER))
+      if (!isExactClaudeWireModel(model) || !normalizeEffort(variant) || !unpinnedPool() ||
+        c.req.header("x-meridian-profile") !== undefined || requirements.cvp || requirements.unknown.length > 0) {
         return c.json(routeAvailability(query, [], now))
       }
-      const routing = evaluateRoutingProfileAccess({
+      const family = claudeModelFamily(model)
+      const pool = () => evaluateRoutingProfileAccess({
         profiles: getEffectiveProfiles(finalConfig.profiles), defaultProfile: finalConfig.defaultProfile, purpose: "work",
         excludedProfileIds: userRoutingExcludedProfileIds(), managedExcludedProfileIds: managedRoutingExcludedProfileIds(),
         heldProfileIds: routingHeldProfileIds(),
       })
-      const weekly = weeklyReserveHolds(routing.profiles.map(p => p.id),
-        parseWeeklyReserves(process.env.MERIDIAN_WEEKLY_RESERVE, getSetting("weeklyReserve")).reserves, weeklyUsageReadings, now)
+      const observed = await Promise.all(pool().profiles.flatMap(profile => {
+        if ((profile.type ?? "claude-max") !== "claude-max" || !peekSuccessfulOAuthUsage(profile.id)) return []
+        const account = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, profile.id)
+        const store = credentialStoreForProfile(account)
+        if (!store) return []
+        return [store.read().then(value => ({ account, store, credential: value?.claudeAiOauth }), () => ({ account, store, credential: undefined }))]
+      }))
+      const checkedAt = Date.now()
+      if (!unpinnedPool()) return c.json(routeAvailability(query, [], checkedAt))
+      const routable = pool().profiles.map(profile => profile.id)
+      const weekly = weeklyReserveHolds(routable,
+        parseWeeklyReserves(process.env.MERIDIAN_WEEKLY_RESERVE, getSetting("weeklyReserve")).reserves, weeklyUsageReadings, checkedAt)
       const reserves = usageReserves()
-      let missingModelCatalog: string | undefined
-      const eligible = routing.access.kind === "allowed" ? routing.profiles.flatMap(profile => {
-        if ((profile.type ?? "claude-max") !== "claude-max" || weekly.has(profile.id) ||
-          priorityExhaustion.isExhausted(profile.id, "opus") || profileDrawsExtraUsage(profile.id)) return []
-        const snapshot = peekSuccessfulOAuthUsage(profile.id)
-        if (!snapshot) return []
-        const sdk = rateLimitStore.getAll(profile.id)
-        const reserve = reserves[profile.id]
-        if (reserve && usageReserveHold(newestClaudeWindows(snapshot, sdk), reserve, now)) return []
-        const usage = claudeOpusReturnUsage(snapshot, sdk)
-        if (!usage || !routeAvailability(query, [usage], now).available) return []
-        if (accountOffersModelEffort(profile.id, model, variant, now)) return [usage]
-        if (accountModelReadDue(profile.id, now)) missingModelCatalog ??= profile.id
+      let catalogProbe: (typeof observed)[number] | undefined
+      const eligible = observed.flatMap(candidate => {
+        const { account: { id }, store, credential } = candidate
+        if (!routable.includes(id) || weekly.has(id) || priorityExhaustion.isExhausted(id, family) || profileDrawsExtraUsage(id) ||
+          typeof credential?.accessToken !== "string" || !credential.accessToken || !Number.isFinite(credential.expiresAt) || credential.expiresAt <= checkedAt ||
+          authLifecycleFor(store.refreshKey)?.firstUnauthedAt !== undefined) return []
+        const tokenDigest = createHash("sha256").update(credential.accessToken).digest("hex")
+        const snapshot = peekSuccessfulOAuthUsage(id, tokenDigest)
+        if (!snapshot?.extraUsage) return []
+        const sdk = rateLimitStore.getAll(id)
+        const usage = claudeReturnUsage(model, snapshot, sdk)
+        if (!usage || !routeAvailability(query, [usage], checkedAt).available || usageReserveHold(usage.windows, reserves[id], checkedAt)) return []
+        if (accountOffersModelEffort(id, query, { now: checkedAt, tokenDigest })) return [usage]
+        if (accountModelReadDue(id, checkedAt, tokenDigest)) catalogProbe ??= candidate
         return []
-      }) : []
-      if (eligible.length === 0 && !returnModelRead && missingModelCatalog !== undefined) {
-        const profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, missingModelCatalog)
-        returnModelRead = fetchAccountModels({ cacheKey: profile.id,
-          auth: () => resolveDesignAuthHeaders({ designToken: null, profile, credentialStore: credentialStoreForProfile(profile) }),
+      })
+      if (eligible.length === 0 && !returnModelRead && catalogProbe) {
+        const { account, store } = catalogProbe
+        returnModelRead = fetchAccountModels({ cacheKey: account.id, force: true,
+          auth: () => resolveDesignAuthHeaders({ designToken: null, profile: account, credentialStore: store }),
         }).finally(() => { returnModelRead = undefined })
       }
-      return c.json(routeAvailability(query, eligible, now))
+      return c.json(routeAvailability(query, eligible, checkedAt))
     }
     const route = chatGptProfiles?.route(undefined, "work")
     const seats = new Map(chatGptSource?.seats(model).map(seat => [seat.id, seat]))
