@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { routeAvailability, claudeOpusReturnUsage } from "../proxy/routeAvailability"
+import { routeAvailability, claudeReturnUsage } from "../proxy/routeAvailability"
 import type { CodexUsageWindow } from "../proxy/codex/types"
 
 const NOW = 1_800_000_000_000
@@ -41,7 +41,7 @@ describe("exact Claude Opus return availability", () => {
   ]
   const snapshot = { fetchedAt: NOW - 1_000, windows: plan, extraUsage: null, bankedResets: null }
   it("uses the tightest governing window, not another model's spent window", () => {
-    const usage = claudeOpusReturnUsage(snapshot, [])
+    const usage = claudeReturnUsage(claude.model, snapshot, [])
 
     expect(routeAvailability(claude, usage ? [usage] : [], NOW)).toEqual({
       ...claude, version: 1, available: true, routable_allotment: 0.25, observed_at: NOW - 1_000,
@@ -49,8 +49,8 @@ describe("exact Claude Opus return availability", () => {
   })
 
   it("does not return on missing account-wide quota or a newer Opus refusal", () => {
-    const missing = claudeOpusReturnUsage({ ...snapshot, windows: plan.slice(2) }, [])
-    const refused = claudeOpusReturnUsage(snapshot, [{
+    const missing = claudeReturnUsage(claude.model, { ...snapshot, windows: plan.slice(2) }, [])
+    const refused = claudeReturnUsage(claude.model, snapshot, [{
       status: "rejected", rateLimitType: "seven_day_opus", observedAt: NOW - 10, resetsAt: NOW + 86_400_000,
     }])
 

@@ -14,6 +14,7 @@
  */
 
 import { z } from "zod"
+import { createHash } from "node:crypto"
 import { claudeLog } from "../logger"
 import { oauthUserAgent } from "./oauthUsage"
 import type { ModelCapabilities, OpenAiModel } from "./openai"
@@ -50,6 +51,7 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 interface CacheEntry {
   readonly models: AnthropicModel[] | null
   readonly at: number
+  readonly tokenDigest?: string
 }
 
 /** Why the last read of a profile's list failed: `no_credential`, `upstream_error` (with its status), `malformed` or `request_failed`. */
@@ -60,15 +62,17 @@ export interface AccountModelsFailure {
 
 const cache = new Map<string, CacheEntry>()
 const inflight = new Map<string, Promise<AnthropicModel[] | null>>()
-const failures = new Map<string, AccountModelsFailure>()
+const failures = new Map<string, { readonly failure: AccountModelsFailure; readonly at: number }>()
 
 function accountModelCacheExpired(entry: CacheEntry, now: number): boolean {
   return now - entry.at >= (entry.models ? ACCOUNT_MODELS_TTL_MS : FAILURE_RETRY_AFTER_MS)
 }
 
-export function accountModelReadDue(profile: string, now: number): boolean {
+export function accountModelReadDue(profile: string, now: number, tokenDigest?: string): boolean {
   const entry = cache.get(profile)
-  return !inflight.has(profile) && (!entry || accountModelCacheExpired(entry, now))
+  const failure = failures.get(profile)
+  if (inflight.has(profile) || (failure && now - failure.at < FAILURE_RETRY_AFTER_MS)) return false
+  return !entry || accountModelCacheExpired(entry, now) || (tokenDigest !== undefined && entry.tokenDigest !== tokenDigest)
 }
 
 export interface FetchAccountModelsOpts {
@@ -97,9 +101,11 @@ export async function fetchAccountModels(opts: FetchAccountModelsOpts): Promise<
   const pending = inflight.get(opts.cacheKey)
   if (pending) return pending
   const request = readModels(opts)
-    .then(models => {
-      if (inflight.get(opts.cacheKey) === request && (models || !opts.force || !cache.get(opts.cacheKey)?.models)) {
-        cache.set(opts.cacheKey, { models, at: now() })
+    .then(({ models, failure, tokenDigest }) => {
+      if (inflight.get(opts.cacheKey) === request) {
+        if (failure) failures.set(opts.cacheKey, { failure, at: now() })
+        else failures.delete(opts.cacheKey)
+        if (models || !opts.force || !cache.get(opts.cacheKey)?.models) cache.set(opts.cacheKey, { models, at: now(), tokenDigest })
       }
       return models
     })
@@ -110,12 +116,13 @@ export async function fetchAccountModels(opts: FetchAccountModelsOpts): Promise<
   return request
 }
 
-async function readModels(opts: FetchAccountModelsOpts): Promise<AnthropicModel[] | null> {
+type AccountModelsRead = { readonly models: AnthropicModel[] | null; readonly failure?: AccountModelsFailure; readonly tokenDigest?: string }
+
+async function readModels(opts: FetchAccountModelsOpts): Promise<AccountModelsRead> {
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch
-  const failed = (reason: string, status?: number, detail?: string): null => {
-    failures.set(opts.cacheKey, status === undefined ? { reason } : { reason, status })
+  const failed = (reason: string, status?: number, detail?: string): AccountModelsRead => {
     claudeLog("account_models.unavailable", { profile: opts.cacheKey, reason: detail ?? reason, ...(status === undefined ? {} : { status }) })
-    return null
+    return { models: null, failure: status === undefined ? { reason } : { reason, status } }
   }
   try {
     let auth = await opts.auth()
@@ -129,9 +136,9 @@ async function readModels(opts: FetchAccountModelsOpts): Promise<AnthropicModel[
     if (!response.ok) return failed("upstream_error", response.status)
     const parsed = anthropicModelList.safeParse(await response.json())
     if (!parsed.success) return failed("malformed")
-    failures.delete(opts.cacheKey)
     claudeLog("account_models.read", { profile: opts.cacheKey, count: parsed.data.data.length })
-    return parsed.data.data
+    const bearer = auth.Authorization
+    return { models: parsed.data.data, tokenDigest: bearer?.startsWith("Bearer ") ? createHash("sha256").update(bearer.slice(7)).digest("hex") : undefined }
   } catch (err) {
     return failed("request_failed", undefined, err instanceof Error ? err.message : String(err))
   }
@@ -182,15 +189,16 @@ export function toAccountModelList(
 /** When the profile's list in use was read (null when none is), and why the last read failed (null after a success). */
 export function accountModelsState(cacheKey: string): { listedAt: number | null; failure: AccountModelsFailure | null } {
   const entry = cache.get(cacheKey)
-  return { listedAt: entry?.models ? entry.at : null, failure: failures.get(cacheKey) ?? null }
+  return { listedAt: entry?.models ? entry.at : null, failure: failures.get(cacheKey)?.failure ?? null }
 }
 
-export function accountOffersModelEffort(profile: string, model: string, effort: string, now: number): boolean {
+export function accountOffersModelEffort(profile: string, route: { readonly model: string; readonly variant: string }, evidence: { readonly now: number; readonly tokenDigest: string }): boolean {
   const entry = cache.get(profile)
-  if (!entry?.models || failures.has(profile) || now < entry.at || now - entry.at >= ACCOUNT_MODELS_TTL_MS) return false
-  const capability = entry.models.find(item => item.id === model)?.capabilities?.effort
+  const { now, tokenDigest } = evidence
+  if (!entry?.models || entry.tokenDigest !== tokenDigest || inflight.has(profile) || failures.has(profile) || now < entry.at || now - entry.at >= ACCOUNT_MODELS_TTL_MS) return false
+  const capability = entry.models.find(item => item.id === route.model)?.capabilities?.effort
   const support = modelCapability.safeParse(capability)
-  return support.success && modelCapability.safeParse(support.data[effort]).success
+  return support.success && modelCapability.safeParse(support.data[route.variant]).success
 }
 
 /** Forget one profile's list (a new login may be another account), or all of them. */

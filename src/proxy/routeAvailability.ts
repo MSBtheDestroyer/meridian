@@ -1,4 +1,5 @@
 import type { OAuthUsageSnapshot, OAuthUsageWindow } from "./oauthUsage"
+import { claudeModelFamily } from "./models"
 import type { RateLimitEntry } from "./rateLimitStore"
 import { newestClaudeWindows } from "./usageReserve"
 
@@ -42,12 +43,30 @@ export function routeAvailability(route: RouteQuery, eligible: readonly Usage[],
   return { ...route, version: 1, available: allotment > 0, routable_allotment: allotment, observed_at: observedAt }
 }
 
-export function claudeOpusReturnUsage(snapshot: OAuthUsageSnapshot, sdk: readonly RateLimitEntry[]): Usage | undefined {
-  const governing = new Set(["five_hour", "seven_day", "seven_day_opus"])
-  if (snapshot.stale || !snapshot.windows.some(window => window.type === "five_hour") ||
+const CLAUDE_WIRE_ID = /^claude-(?:opus|fable|mythos|sonnet|haiku)-\d+(?:-\d+)*$/
+const FABLE_ALLOWANCE = ["seven_day_fable", "seven_day_overage_included"] as const
+
+export function isExactClaudeWireModel(model: string): boolean {
+  return model === CLAUDE_WIRE_ID.exec(model)?.[0]
+}
+
+export function claudeReturnUsage(model: string, snapshot: OAuthUsageSnapshot, sdk: readonly RateLimitEntry[]): Usage | undefined {
+  const family = claudeModelFamily(model)
+  const modelSlug = model.slice("claude-".length).replaceAll("-", "_")
+  const exactScope = `seven_day_${modelSlug}`
+  const tierScope = `seven_day_${modelSlug.replace(/^mythos_/, "fable_")}`
+  const scoped = new Set([`seven_day_${family}`, exactScope, tierScope])
+  if (family === "fable") {
+    for (const bucket of FABLE_ALLOWANCE) scoped.add(bucket)
+    if (modelSlug.startsWith("mythos_")) scoped.add("seven_day_mythos")
+  }
+  const governing = (type: string) => type === "five_hour" || type === "seven_day" || scoped.has(type)
+  if (snapshot.stale || snapshot.unreadableWindowTypes?.some(governing) || !snapshot.windows.some(window => window.type === "five_hour") ||
     !snapshot.windows.some(window => window.type === "seven_day")) return undefined
-  if (sdk.some(event => event.observedAt >= snapshot.fetchedAt && event.rateLimitType &&
-    governing.has(event.rateLimitType) && event.status === "rejected")) return undefined
-  const windows = newestClaudeWindows(snapshot, sdk).filter(window => governing.has(window.type))
+  if (family === "fable" && !snapshot.windows.some(({ type }) => type === tierScope || FABLE_ALLOWANCE.some(bucket => bucket === type))) return undefined
+  if (sdk.some(event => event.observedAt >= snapshot.fetchedAt &&
+    (!event.rateLimitType || governing(event.rateLimitType)) &&
+    (event.status === "rejected" || event.utilization === undefined || event.resetsAt === undefined))) return undefined
+  const windows = newestClaudeWindows(snapshot, sdk).filter(window => governing(window.type))
   return { fetchedAt: snapshot.fetchedAt, windows }
 }

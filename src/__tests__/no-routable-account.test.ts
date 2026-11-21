@@ -8,10 +8,14 @@
  * are on the machine-read fields: the code, the incident that ties the error
  * to its `pool_exhausted` events, and the per-profile reasons.
  */
-import { describe, it, expect, beforeEach, afterEach } from "bun:test"
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
+import { createOwnedCredentialStore } from "./modelsMock"
 import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
 
 let failingDirs = new Set<string>()
@@ -46,6 +50,7 @@ const { resetActiveProfile } = await import("../proxy/profiles")
 const { __setFetchOAuthUsageOverride, clearOAuthUsageForProfile, fetchOAuthUsage } = await import("../proxy/oauthUsage")
 const { clearAccountModels, fetchAccountModels } = await import("../proxy/accountModels")
 const { rateLimitStore } = await import("../proxy/rateLimitStore")
+const tokens = await import("../proxy/tokenRefresh")
 const { setSetting } = await import("../settings")
 
 const ALL_DIRS = ["nr-work", "nr-personal", "nr-spare"]
@@ -96,7 +101,7 @@ function setFleetEvidence(app: TestApp, reasons: Record<string, string>, observe
   }))
 }
 
-function post(app: TestApp, opts: { stream?: boolean; content?: string; requestId?: string; profile?: string; attest?: boolean } = {}) {
+function post(app: TestApp, opts: { stream?: boolean; content?: string; requestId?: string; profile?: string; attest?: boolean; model?: string } = {}) {
   const headers = new Headers({ "Content-Type": "application/json" })
   if (opts.requestId) headers.set("x-request-id", opts.requestId)
   if (opts.profile) headers.set("x-meridian-profile", opts.profile)
@@ -105,7 +110,7 @@ function post(app: TestApp, opts: { stream?: boolean; content?: string; requestI
     method: "POST",
     headers,
     body: JSON.stringify({
-      model: "claude-sonnet-4-5",
+      model: opts.model ?? "claude-sonnet-4-5",
       max_tokens: 128,
       stream: opts.stream ?? false,
       messages: [{ role: "user", content: opts.content ?? "hello" }],
@@ -259,31 +264,122 @@ describe("early refusal for fresh, spent plan windows", () => {
   })
 })
 
-it("serves fresh exact preferred availability from a routable Claude account without calling inference", async () => {
-  const profileId = "work"
+it.each([
+  { name: "Opus family", model: "claude-opus-5-5", effort: "high", window: "seven_day_opus", expected: 0.25 },
+  { name: "Sonnet exact model", model: "claude-sonnet-4-6", effort: "medium", scope: "Claude Sonnet 4.6", expected: 0.25 },
+  { name: "Fable family", model: "claude-fable-5-2", effort: "xhigh", scope: "Fable", expected: 0.25 },
+  { name: "Mythos governed by Fable", model: "claude-mythos-5-2", effort: "max", window: "seven_day_overage_included", expected: 0.25 },
+  { name: "Mythos governed by versioned Fable scope", model: "claude-mythos-5-2", effort: "max", scope: "Claude Fable 5.2", expected: 0.25 },
+  { name: "Mythos SDK Fable refusal", model: "claude-mythos-5-2", effort: "max", scope: "Fable", sdkBucket: "seven_day_overage_included", expected: 0 },
+  { name: "explicit Haiku", model: "claude-haiku-5-5", effort: "low", expected: 1 - 0.7 },
+  { name: "default Haiku", model: "claude-haiku-4-5-20251001", effort: "default", expected: 0 },
+  { name: "unlisted Mythos", model: "claude-mythos-5-2", effort: "high", scope: "Fable", offered: "claude-fable-5-2", expected: 0 },
+  { name: "unsupported explicit effort", model: "claude-opus-5-5", effort: "low", offeredEffort: "high", expected: 0 },
+  { name: "missing Fable quota", model: "claude-fable-5-2", effort: "high", expected: 0 },
+  { name: "spent Sonnet scope", model: "claude-sonnet-4-6", effort: "medium", scope: "Sonnet", used: 100, expected: 0 },
+  { name: "malformed Opus quota", model: "claude-opus-5-5", effort: "high", window: "seven_day_opus", used: -1, expected: 0 },
+  { name: "expired credentials", model: "claude-opus-5-5", effort: "high", expired: true, expected: 0 },
+  { name: "quota from a replaced credential", model: "claude-opus-5-5", effort: "high", replaced: true, expected: 0 },
+  { name: "paid usage", model: "claude-opus-5-5", effort: "high", paid: true, expected: 0 },
+  { name: "unknown paid usage status", model: "claude-opus-5-5", effort: "high", unknownPaid: true, expected: 0 },
+  { name: "immediate paid routing policy", model: "claude-opus-5-5", effort: "high", immediatePaid: true, expected: 0 },
+  { name: "manual exclusion", model: "claude-opus-5-5", effort: "high", excluded: true, expected: 0 },
+  { name: "CVP requirement", model: "claude-opus-5-5", effort: "high", header: ["x-meridian-require", "cvp"], expected: 0 },
+  { name: "manual pin", model: "claude-opus-5-5", effort: "high", header: ["x-meridian-profile", "return-work"], expected: 0 },
+  { name: "cold catalog shared with pinned model list", model: "claude-sonnet-4-6", effort: "medium", cold: true, expected: 1 - 0.7 },
+])("attests only exact available Claude routes over loopback: $name", async ({ model, effort, window, scope, offered, offeredEffort, used = 75, expired, replaced, header, sdkBucket, paid, unknownPaid, immediatePaid, excluded, cold, expected }) => {
+  const root = await mkdtemp(join(tmpdir(), "meridian-return-"))
+  const dir = join(root, "work")
+  const profileId = "return-work"
   const resetsAt = new Date(Date.now() + 60 * 60_000).toISOString()
-  const app = createTestApp()
+  const expiresAt = Date.now() + DAY
+  const credentials = { claudeAiOauth: { accessToken: "fixture", refreshToken: "fixture", expiresAt } }
+  const { app } = createProxyServer({ profiles: [{ id: profileId, claudeConfigDir: dir }, ...PROFILES], defaultProfile: profileId })
+  const listener = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch })
+  tokens.setCredentialStorePlatformForTests("linux")
+  const storeOverride = spyOn(tokens, "createPlatformCredentialStore").mockImplementation(options =>
+    createOwnedCredentialStore(root, options?.claudeConfigDir))
+  const network = globalThis.fetch
+  let catalogReads = 0
   try {
+    if (immediatePaid) process.env.MERIDIAN_CLAUDE_EXTRA_USAGE = "immediately"
+    await mkdir(dir)
+    await writeFile(join(dir, ".credentials.json"), JSON.stringify({ claudeAiOauth: { ...credentials.claudeAiOauth,
+      accessToken: replaced ? "replacement-fixture" : "fixture", expiresAt: expired ? Date.now() - 1 : expiresAt } }))
     const sample = await fetchOAuthUsage({ profileId, force: true,
-      store: { read: async () => ({ claudeAiOauth: { accessToken: "fixture", refreshToken: "fixture", expiresAt: Date.now() + DAY } }),
+      store: { read: async () => credentials,
         write: async () => { throw new Error("availability fixture must not renew credentials") } },
       fetchImpl: async () => Response.json({ five_hour: { utilization: 30, resets_at: resetsAt },
-        seven_day: { utilization: 70, resets_at: resetsAt }, seven_day_opus: { utilization: 75, resets_at: resetsAt } }),
+        seven_day: { utilization: 70, resets_at: resetsAt },
+        extra_usage: unknownPaid ? {} : { is_enabled: paid === true },
+        ...(window ? { [window]: { utilization: used, resets_at: resetsAt } } : {}),
+        ...(scope ? { limits: [{ kind: "weekly_scoped", scope: { model: { display_name: scope } }, percent: used, resets_at: resetsAt }] } : {}),
+      }),
     })
-    await fetchAccountModels({ cacheKey: profileId, auth: async () => ({ Authorization: "Bearer fixture" }),
-      fetchImpl: async () => Response.json({ data: [{ id: "claude-opus-5-5", capabilities: { effort: { supported: true, high: { supported: true } } } }] }),
-    })
+    if (excluded) setSetting("routingExcludedProfiles", [profileId])
+    if (sdkBucket || paid) rateLimitStore.record(profileId, {
+      status: sdkBucket ? "rejected" : "allowed", rateLimitType: sdkBucket ?? "five_hour",
+      utilization: sdkBucket ? 1 : 0.3, resetsAt: Date.parse(resetsAt), isUsingOverage: paid,
+    }, (sample?.fetchedAt ?? Date.now()) + 1)
+    const catalog = () => Response.json({ data: [{ id: offered ?? model,
+      capabilities: { effort: { supported: true, [offeredEffort ?? effort]: { supported: true } } } }] })
+    globalThis.fetch = Object.assign(async (...args: Parameters<typeof fetch>) => {
+      if (String(args[0]).startsWith(listener.url.origin)) return network(...args)
+      if (!cold || !String(args[0]).startsWith("https://api.anthropic.com/v1/models?") ||
+        new Headers(args[1]?.headers).get("authorization") !== "Bearer fixture") {
+        throw new Error("Unexpected non-loopback request in route availability test")
+      }
+      catalogReads++
+      return catalog()
+    }, { preconnect: network.preconnect })
+    if (!cold) await fetchAccountModels({ cacheKey: profileId, auth: async () => ({ Authorization: "Bearer fixture" }), fetchImpl: async () => catalog() })
 
-    const res = await app.fetch(new Request("http://localhost/profiles/route-availability?provider=claude&model=claude-opus-5-5&variant=high"))
+    const url = new URL("/profiles/route-availability", listener.url)
+    url.search = new URLSearchParams({ provider: "claude", model, variant: effort }).toString()
+    if (cold) {
+      expect(await (await fetch(url)).json()).toMatchObject({ available: false, observed_at: null })
+      const listed = await fetch(new URL("/v1/models", listener.url), { headers: { "x-meridian-profile": profileId } })
+      expect(listed.headers.get("x-meridian-models-source")).toBe("account")
+      expect(await listed.json()).toMatchObject({ data: [{ id: model }] })
+      expect(catalogReads).toBe(1)
+    }
+    const headers = new Headers()
+    if (header) headers.set(header[0], header[1])
+    const res = await fetch(url, { headers })
 
     expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ version: 1, provider: "claude", model: "claude-opus-5-5", variant: "high",
-      available: true, routable_allotment: 0.25, observed_at: sample?.fetchedAt })
+    expect(res.headers.get("cache-control")).toBe("no-store")
+    expect(await res.json()).toEqual({ version: 1, provider: "claude", model, variant: effort,
+      available: expected > 0, routable_allotment: expected, observed_at: expected > 0 ? sample?.fetchedAt : null })
     expect(sdkCalls).toBe(0)
   } finally {
+    globalThis.fetch = network
+    await listener.stop(true)
+    storeOverride.mockRestore()
+    tokens.setCredentialStorePlatformForTests(null)
     clearOAuthUsageForProfile(profileId)
     clearAccountModels(profileId)
+    await rm(root, { recursive: true, force: true })
   }
+})
+
+it.each(["gpt-6-sol", "sonnet", "claude-sonnet-test"])("keeps the ordinary quota refusal but does not attest Claude origin for %s", async (model) => {
+  process.env.MERIDIAN_CLAUDE_EXTRA_USAGE = "never"
+  const app = createTestApp()
+  const now = Date.now()
+  for (const { id } of PROFILES) {
+    rateLimitStore.record(id, { status: "allowed", rateLimitType: "seven_day", utilization: 0.97, resetsAt: now + DAY })
+  }
+  const reserve = { seven_day: { floor: 95, ceiling: 95 } }
+  setSetting("usageReserves", { work: reserve, personal: reserve, spare: reserve })
+
+  const res = await post(app, { model, stream: true, attest: true, requestId: "aba6ca87-82f1-49ed-8905-329ff6b25931" })
+
+  expect(res.status).toBe(429)
+  const error = await errorOf(res)
+  expect(error.code).toBe("no_routable_account")
+  expect(error.route_refusal).toBeUndefined()
+  expect(sdkCalls).toBe(0)
 })
 
 describe("no_routable_account when every candidate is held back", () => {
