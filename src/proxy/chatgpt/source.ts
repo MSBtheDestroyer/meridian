@@ -91,6 +91,8 @@ export interface ChatGptCredentialSource {
   isServing(): boolean
   /** The pool as the read-only usage service expects it. */
   usagePool(): CodexPoolResult
+  /** Strict, non-refreshing credential witness for every seat, waiving only plan exhaustion. */
+  refusalPool?(model: string): CodexPoolResult | undefined
   /** What to tell a client when every seat was unavailable for these reasons. */
   describeUnavailable(reasons: ReadonlySet<SeatUnavailableReason>): string
   /** Take whatever authority this mode needs. No-op for follow-external. */

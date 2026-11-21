@@ -242,6 +242,14 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
     return age >= 0 && age < EXCHANGE_TIMEOUT_MS + 5_000
   }
 
+  const usagePool = (accounts: readonly ChatGptAccount[]): CodexPoolResult => ({
+    error: null, pool: { path: storePath, accounts: accounts.map(account => ({
+      accountUserId: account.accountUserId, accountId: account.accountId, email: account.email,
+      accessToken: account.accessToken, expiresAt: account.expiresAt, organizationId: null, accountLabel: null,
+      planType: decodeCodexToken(account.accessToken)?.planType ?? null, enabled: true,
+    })) },
+  })
+
   return {
     mode: "owned",
 
@@ -296,24 +304,18 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
 
     isServing: () => readOnly || holdsLease(),
 
-    usagePool(): CodexPoolResult {
-      // Read-only, and re-read so the dashboard observes token rotation.
-      return {
-        error: null,
-        pool: {
-          path: storePath,
-          accounts: reader.readAccounts().map(account => ({
-            accountUserId: account.accountUserId,
-            accountId: account.accountId,
-            email: account.email,
-            accessToken: account.accessToken,
-            expiresAt: account.expiresAt,
-            organizationId: null,
-            accountLabel: null,
-            planType: decodeCodexToken(account.accessToken)?.planType ?? null,
-            enabled: true,
-          })),
-        },
+    usagePool: () => usagePool(reader.readAccounts()),
+    refusalPool() {
+      if (!readOnly && !holdsLease()) return
+      const at = now()
+      try {
+        const accounts = reader.readAccounts()
+        if (accounts.some(account => !account.accessToken || account.exchangeStartedAt !== null || refusalOf(account) ||
+            account.expiresAt === null || account.expiresAt - at <= ACCESS_TOKEN_BUFFER_MS)) return
+        return usagePool(accounts)
+      } catch (error) {
+        if (!(error instanceof Error)) throw error
+        return undefined
       }
     },
 

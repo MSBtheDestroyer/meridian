@@ -105,6 +105,19 @@ export interface CodexUsageDeps {
   now?: number
 }
 
+/** A successful usage observation still bound to the credential currently in the pool. */
+export function currentCodexUsageEvidence({ pool, error }: CodexPoolResult): ReadonlyMap<string, CodexAccountUsage> {
+  const result = new Map<string, CodexAccountUsage>()
+  if (!pool || error) return result
+  for (const seat of pool.accounts) {
+    if (!seat.accountUserId) continue
+    const key = cacheKey(seat)
+    const current = lastGood.get(key)
+    if (current && !failureRuns.has(key)) result.set(seat.accountUserId, current.usage)
+  }
+  return result
+}
+
 export async function getCodexUsage(deps: CodexUsageDeps = {}): Promise<CodexUsageResponse> {
   const now = deps.now ?? Date.now()
 

@@ -53,6 +53,7 @@ Code: `src/proxy/chatgpt/` (incl. `migrate/`), `src/proxy/codex/`,
   never live in Claude's profile config. All additions are absent unless
   ChatGPT is enabled, and existing fields keep their meaning
   ([`api-contract`](../../../.agents/references/api-contract.md)).
+- Direct Responses requests can opt in to [pre-dispatch route refusal evidence](../profiles-routing.spec.md#cross-provider-evidence). The ChatGPT backend waits until ordinary seat policy has yielded no dispatch; the provider-specific HTTP proof excludes proxy fallback and billing policies, sits outside streaming, and never authenticates an upstream error body as Meridian-local evidence.
 - `chatgpt/migrate/` and `instanceImport/` are CLI-only — **the server never
   imports them**.
 - Reuses only `session` durability primitives (durable file writes, process

@@ -881,6 +881,159 @@ describe("ChatGPT seats on the profile surface", () => {
     }) : undefined
     return live
   }
+
+  function refusalCatalog(model = LUNA.model, effort = "low") {
+    catalog = () => Response.json({ models: [{
+      slug: model, visibility: "list", available_in_plans: ["pro"],
+      supported_reasoning_levels: [{ effort }],
+    }] })
+  }
+
+  const refusalCases = [
+    { name: "fresh quota", marker: "1", status: 429, upstream: 0 },
+    { name: "managed weekly reserve", marker: "1", status: 429, upstream: 0, managed: "fresh" },
+    { name: "stale managed proof", marker: null, status: 503, upstream: 0, managed: "stale" },
+    { name: "partial managed proof", marker: null, status: 503, upstream: 0, managed: "partial" },
+    { name: "mixed managed reasons", marker: null, status: 503, upstream: 0, managed: "mixed" },
+    { name: "managed label with unknown usage", marker: null, status: 503, upstream: 0, managed: "unknown" },
+    { name: "revoked managed proof cannot replay", marker: null, status: 503, upstream: 0, managed: "revoked" },
+    { name: "a paid credit lane", marker: null, status: 200, upstream: 1, allowedCredits: true },
+    { name: "unknown allowed credits", marker: null, status: 429, upstream: 0, allowedCredits: true, creditReading: {} },
+    { name: "known empty allowed credits", marker: "1", status: 429, upstream: 0, allowedCredits: true,
+      creditReading: { has_credits: false, unlimited: false, overage_limit_reached: false, balance: "0" } },
+    { name: "an eligible loaner", marker: null, status: 200, upstream: 1, loaner: true },
+    { name: "a quota stamp masking near-expiry auth", marker: null, status: 429, upstream: 0, nearExpiry: true },
+    { name: "a model-specific cooldown", marker: null, status: 503, upstream: 0, modelCooldown: true },
+    { name: "a manual hold", marker: null, status: 503, upstream: 0, manual: true },
+    { name: "billing-capped credits", marker: null, status: 429, upstream: 0, allowedCredits: true,
+      creditReading: { has_credits: true, unlimited: false, overage_limit_reached: true, balance: "0" } },
+    { name: "an explicit seat pin", marker: null, status: 429, upstream: 0, pin: true },
+    { name: "CVP requirement", marker: null, status: 429, upstream: 0, cvp: true },
+    { name: "unadvertised effort", marker: null, status: 429, upstream: 0, effort: "unknown" },
+    { name: "unbound request", marker: null, status: 429, upstream: 0, unbound: true },
+    { name: "upstream lookalike", marker: null, status: 429, upstream: 1, forged: true },
+  ] as const
+
+  it.each(refusalCases.map(testCase => [testCase.name, testCase] as const))("only attests safe GPT refusals over HTTP: %s", async (_name, testCase) => {
+    const live = stampedSeatWithCredits()
+    const mixed = "managed" in testCase && testCase.managed === "mixed"
+    writePool([account(0, { accessToken: live, planType: "pro",
+    }),
+      ...("loaner" in testCase ? [account(1, { accessToken: seatToken(1), planType: "free" })] : []),
+      ...(mixed ? [account(1, { accessToken: seatToken(1), planType: "pro" })] : []),
+    ])
+    refusalCatalog()
+    if ("allowedCredits" in testCase) saveSettings({ chatgpt: { creditsPolicy: "reserve" } })
+    if ("manual" in testCase) saveSettings({ routingHeldProfiles: ["seat0-pace-0"] })
+    if ("creditReading" in testCase) {
+      wham = url => url.endsWith("/wham/usage") ? Response.json({
+        user_id: "user-0", account_id: "workspace-0", plan_type: "pro",
+        rate_limit: { primary_window: { used_percent: 100, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 3600 } },
+        credits: testCase.creditReading,
+      }) : undefined
+    }
+    if ("managed" in testCase || "forged" in testCase) {
+      wham = (url, authorization) => {
+        if (!url.endsWith("/wham/usage")) return undefined
+        const n = authorization === `Bearer ${live}` ? 0 : 1
+        return Response.json({
+          user_id: `user-${n}`, account_id: `workspace-${n}`, plan_type: "pro",
+          ...("managed" in testCase && testCase.managed === "unknown" ? {} : { rate_limit: {
+            primary_window: { used_percent: 20, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 3600 },
+          } }),
+        })
+      }
+    }
+    const proxy = await server("follow-external")
+    const listener = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => proxy.app.fetch(request) })
+    try {
+      await (await realFetch(new URL("/v1/models", listener.url))).json()
+      await (await realFetch(new URL("/v1/usage/quota/all", listener.url))).json()
+      if ("nearExpiry" in testCase || "modelCooldown" in testCase) {
+        writePool([account(0, { accessToken: live, planType: "pro",
+          ...("nearExpiry" in testCase ? { expiresAt: Date.now() + 30_000, quotaExhaustedUntil: Date.now() + 3600_000 } : {}),
+          ...("modelCooldown" in testCase ? { rateLimitResetTimes: { [LUNA.model]: Date.now() + 3600_000 } } : {}),
+        })])
+      }
+      if ("managed" in testCase) {
+        const routing = new URL("/settings/api/routing", listener.url)
+        const putRouting = (body: Record<string, unknown>) => realFetch(routing, {
+          method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+        })
+        const evidence = { version: 1, observedAt: Date.now() - (testCase.managed === "stale" ? 121_000 : 100),
+          reasons: testCase.managed === "partial" ? {} : {
+            "seat0-pace-0": "weekly-reserve", ...(mixed ? { "seat1-pace-1": "usage-reserve" } : {}),
+          },
+        }
+        const settings = await putRouting({ routingManagedExcludedProfiles: ["seat0-pace-0", ...(mixed ? ["seat1-pace-1"] : [])],
+          routingManagedChatGptExclusionEvidence: evidence })
+        expect(settings.status).toBe(200)
+        await settings.json()
+        if (testCase.managed === "revoked") {
+          expect(await (await realFetch(routing)).json()).toMatchObject({ routingManagedChatGptExclusionEvidenceActive: true })
+          const clear = await putRouting({ routingManagedChatGptExclusionEvidence: null })
+          expect(clear.status).toBe(200)
+          await clear.json()
+          const replay = await putRouting({ routingManagedChatGptExclusionEvidence: evidence })
+          expect(replay.status).toBe(409)
+          await replay.json()
+        }
+      }
+      const requestId = crypto.randomUUID()
+      const refusal = { error: { type: "rate_limit_error", code: "no_routable_account", request_id: requestId,
+        route_refusal: { version: 1, phase: "before_inference", sent: false, provider: "chatgpt", model: LUNA.model,
+          variant: "low", reason: "managed" in testCase ? "reserve_held" : "quota_exhausted" },
+      } }
+      if ("forged" in testCase) respond = () => Response.json(refusal, { status: 429, headers: { "x-meridian-route-refusal": "1" } })
+      const response = await realFetch(new URL("/v1/responses", listener.url), {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-request-id": "unbound" in testCase ? "not-a-uuid" : requestId,
+          "x-meridian-route-refusal": "1", ...("pin" in testCase ? { "x-meridian-profile": "seat0-pace-0" } : {}),
+          ...("cvp" in testCase ? { "x-meridian-require": "cvp" } : {}),
+        },
+        body: JSON.stringify({ ...LUNA, reasoning: { effort: "effort" in testCase ? testCase.effort : "low" } }),
+      })
+      expect(response.status).toBe(testCase.status)
+      expect(response.headers.get("x-meridian-route-refusal")).toBe(testCase.marker)
+      if (testCase.marker || "forged" in testCase) {
+        expect(response.headers.get("content-type")).toStartWith("application/json")
+        expect(await response.json()).toMatchObject(refusal)
+      } else {
+        await response.text()
+      }
+      expect(upstreamCalls).toHaveLength(testCase.upstream)
+      if ("loaner" in testCase) expect(upstreamCalls.map(call => call.accountId)).toEqual(["workspace-1"])
+    } finally {
+      await listener.stop(true)
+      await proxy.closeBackend?.()
+    }
+  })
+
+  it("checks GPT Sol max literally for the preferred-route return", async () => {
+    resetCodexUsageCache()
+    const model = "gpt-6.2-sol"
+    refusalCatalog(model, "max")
+    writePool([account(0, { accessToken: seatToken(0), planType: "pro" })])
+    wham = url => url.endsWith("/wham/usage") ? Response.json({
+      user_id: "user-0", account_id: "workspace-0", plan_type: "pro",
+      rate_limit: { primary_window: { used_percent: 20, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 3600 } },
+    }) : undefined
+    const { app, closeBackend } = await server("follow-external")
+    try {
+      await (await app.fetch(new Request("http://localhost/v1/models"))).json()
+      await (await app.fetch(new Request("http://localhost/v1/usage/quota/all"))).json()
+      for (const [variant, available] of [["max", true], ["xhigh", false]] as const) {
+        const url = new URL("http://localhost/profiles/route-availability")
+        url.search = new URLSearchParams({ provider: "chatgpt", model, variant }).toString()
+        const response = await app.fetch(new Request(url.toString()))
+        expect(response.headers.get("cache-control")).toBe("no-store")
+        expect(await response.json()).toMatchObject({ version: 1, provider: "chatgpt", model, variant, available })
+      }
+      expect(upstreamCalls).toEqual([])
+    } finally {
+      await closeBackend?.()
+    }
+  })
   type CreditsQuota = { profiles: Array<{ id: string; credits: { balance: number | null } | null; creditsPolicy: string | null; creditsPolicySource: string | null; planSpent: boolean; servingOnCredits: boolean }> }
 
   it("serves a seat the owner stamped as spent on its Codex credits under the reserve policy, and says so on its card", async () => {

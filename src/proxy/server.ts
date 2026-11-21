@@ -18,11 +18,12 @@ import { CATALOG_CLIENT_VERSION, chatGptModelList, createChatGptModelCatalog, ty
 import { claudeOpusReturnUsage, routeAvailability } from './routeAvailability'
 import { freshPlanExhaustion } from './freshPlanExhaustion'
 import { capacityObservationIsFresh, parseManagedExclusionEvidence, type ManagedExclusionEvidence } from './managedExclusionEvidence'
+import { CHATGPT_MANAGED_PROTECTION_REASONS, chatGptRefusalPoolKey, proveChatGptRouteRefusal } from './chatgpt/routeRefusal'
 import { createCodexClientVersion } from './chatgpt/clientVersion'
 import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
-import { chatGptNameProblem, type ChatGptProfile } from './chatgpt/profiles'
+import { chatGptNameProblem, seatWindows, type ChatGptProfile } from './chatgpt/profiles'
 import { applyChatGptRemoval, applyChatGptRename } from './chatgpt/seatOps'
-import { getCodexUsage } from './codex/service'
+import { currentCodexUsageEvidence, getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, isImageEndpoint, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
 import { createClaudeBackend } from './upstream/claude'
@@ -1288,6 +1289,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   const userRoutingExcludedProfileIds = () => parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles"))
   const managedRoutingExcludedProfileIds = () => withoutForcedProfile(parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")), forcedProfileId())
   let managedExclusionEvidence: ManagedExclusionEvidence | undefined
+  let managedChatGptExclusionEvidence: ManagedExclusionEvidence | undefined
+  let managedChatGptEvidenceHighWater = 0
+  let managedChatGptEvidencePolicy: string | undefined
   // `x-meridian-require: cvp` work answers to the cybersec switcher's managed
   // list instead of the general one: the two switchers own separate lists, so
   // an account rested from general work can still take cvp work.
@@ -10652,6 +10656,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     plog(`[PROXY] ${event.requestId} chatgpt model=${event.model ?? event.requestModel ?? "unknown"} seat=${profileId ?? "none"} status=${event.status}${event.servedOnCredits ? " credits=1" : ""} attempts=${event.attempts.length} adapted=${event.adaptations.join(",") || "none"}${usage ? ` in=${usage.inputTokens} cached=${usage.cachedInputTokens} out=${usage.outputTokens} reasoning=${usage.reasoningTokens}` : ""}${decoration.fallbackFromModel ? ` fallback_from=${decoration.fallbackFromModel}` : ""}${decoration.error ? ` error=${decoration.error}` : ""}`)
   }
 
+  const chatGptEvidencePolicy = () => {
+    const profiles = chatGptProfiles?.profiles()
+    if (!profiles) return
+    const features = getChatGptFeatures()
+    return JSON.stringify(profiles.map(profile => [profile.id, profile.seat, effectiveCreditsPolicy(features, profile.seat).policy]))
+  }
   const chatGptBackend = chatGptSource ? createChatGptBackend<Context>({
     source: chatGptSource,
     // Rebuilt rather than forwarded: dispatch has already read this body to
@@ -10680,6 +10690,42 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       if (pending) await Promise.race([pending, new Promise(resolve => setTimeout(resolve, CHATGPT_QUOTA_WAIT_MS))])
     },
     creditsPolicy: (seat) => effectiveCreditsPolicy(getChatGptFeatures(), seat).policy,
+    routeRefusalProof: (input, c) => {
+      if (forcedProfileId() || chatGptBodyOverrides.has(c) || !chatGptSource.isServing() || !chatGptProfiles || !chatGptCatalog || !chatGptUsage) return
+      const features = getChatGptFeatures()
+      const admitted = chatGptLedger.open(c, features).features
+      if (features.fallbackModel || admitted.fallbackModel || features.maxBudgetUsd > 0 || admitted.maxBudgetUsd > 0) return
+      const currentRoute = chatGptProfiles.route(undefined, "work")
+      if (currentRoute.kind !== "pool") return
+      const manual = new Set([...userRoutingExcludedProfileIds(), ...configuredRoutingHeldProfileIds()])
+      const profiles = chatGptProfiles.profiles()
+      if (profiles.some(profile => [profile.id, profile.seat, ...profile.aliases].some(id => manual.has(id)))) return
+      const bySeat = new Map(profiles.map(profile => [profile.seat, profile.id]))
+      const uncertain = new Set(chatGptExhaustion.snapshot().filter(mark => mark.reason !== "quota_spent").map(mark => mark.id))
+      const pool = chatGptSource.refusalPool?.(input.binding.model)
+      if (!pool?.pool || chatGptRefusalPoolKey(pool) !== input.poolKey) return
+      const seats = pool.pool.accounts.flatMap(account => account.accountUserId ? [account.accountUserId] : [])
+      if (seats.length !== pool.pool.accounts.length || seats.length !== bySeat.size || new Set(seats).size !== seats.length ||
+          seats.some(seat => !bySeat.has(seat))) return
+      const usageEvidence = currentCodexUsageEvidence(pool)
+      const now = Date.now()
+      const reserves = usageReserves()
+      return proveChatGptRouteRefusal(input, {
+        managed: managedChatGptEvidencePolicy === chatGptEvidencePolicy() ? managedChatGptExclusionEvidence : undefined,
+        now, seats, entries: chatGptUsage.entries, usageEvidence,
+        currentExclusions: currentRoute.excluded,
+        profile: seat => bySeat.get(seat),
+        blocked: seat => uncertain.has(seat) || chatGptProfiles.loginState(seat) !== "authenticated",
+        currentReserve: seat => {
+          const id = bySeat.get(seat)
+          const reserve = id ? reserves[id] : undefined
+          const usage = usageEvidence.get(seat)
+          return reserve && usage ? usageReserveHold(seatWindows({ usage: { ...usage, stale: false } }).windows, reserve, now) : null
+        },
+        creditsPolicy: seat => effectiveCreditsPolicy(features, seat).policy,
+        routeOffered: plan => chatGptCatalog.routeOffered(input.binding.model, input.binding.variant, plan),
+      })
+    },
     reasoningSummary: () => forcedReasoningSummary(getChatGptFeatures()),
     planWindows: (seat) => {
       const entry = chatGptUsage?.entries.find(candidate => candidate.id === seat)
@@ -11072,6 +11118,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       routingManagedExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")),
       routingHeldProfiles: configuredRoutingHeldProfileIds(),
       routingManagedReasons: parseRoutingManagedReasons(getSetting("routingManagedReasons")),
+      routingManagedChatGptExclusionEvidenceActive: managedChatGptExclusionEvidence !== undefined &&
+        capacityObservationIsFresh(managedChatGptExclusionEvidence.observedAt, Date.now()),
       allowForcingForbiddenProfile: getSetting("allowForcingForbiddenProfile") === true,
       // The force in effect: while it holds, the supervisor's lists above
       // still name the profile but do not act on it (forcedProfile.ts).
@@ -11086,7 +11134,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       cvpHolders: cvpHoldersByModel(cvpEffectiveOrder),
       // What a supervisor may rely on this build doing; read rather than
       // guessed from a version, which forks share.
-      capabilities: ["managed-exclusion-no-routable", "managed-exclusion-evidence-v1", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order", "forced-active-profile", "managed-exclusion-reasons", "usage-refresh", "profile-refresh"],
+      capabilities: ["managed-exclusion-no-routable", "managed-exclusion-evidence-v1", "managed-chatgpt-exclusion-evidence-v1", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order", "forced-active-profile", "managed-exclusion-reasons", "usage-refresh", "profile-refresh"],
       profiles: profileIds,
       saved: {
         routing: getSetting("routing") ?? null,
@@ -11113,6 +11161,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       routingHeldProfiles?: unknown
       routingManagedReasons?: unknown
       routingManagedExclusionEvidence?: unknown
+      routingManagedChatGptExclusionEvidence?: unknown
       allowForcingForbiddenProfile?: unknown
       usageReserves?: unknown
       cvpProfileOrder?: unknown
@@ -11220,10 +11269,31 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         }
       }
     }
+    let chatGptEvidence: ManagedExclusionEvidence | undefined
+    if (body.routingManagedChatGptExclusionEvidence !== undefined) {
+      if (!isSameOriginRequest(c.req.raw)) return c.json({ error: "Managed ChatGPT exclusion evidence requires a same-origin request" }, 403)
+      if (body.routingManagedChatGptExclusionEvidence !== null) {
+        const known = new Set(chatGptProfiles?.profiles().map(profile => profile.id))
+        const excluded = new Set((updates.routingManagedExcludedProfiles ?? managedRoutingExcludedProfileIds()).filter(id => known.has(id)))
+        chatGptEvidence = parseManagedExclusionEvidence(body.routingManagedChatGptExclusionEvidence, excluded, CHATGPT_MANAGED_PROTECTION_REASONS)
+        if (!chatGptEvidence || chatGptEvidence.observedAt > Date.now()) return c.json({ error: "Invalid managed ChatGPT exclusion evidence" }, 400)
+        if (chatGptEvidence.observedAt < managedChatGptEvidenceHighWater ||
+            (chatGptEvidence.observedAt === managedChatGptEvidenceHighWater && (!managedChatGptExclusionEvidence ||
+              [...chatGptEvidence.reasons].some(([id, reason]) => managedChatGptExclusionEvidence?.reasons.get(id) !== reason)))) {
+          return c.json({ error: "Newer managed ChatGPT exclusion evidence is already recorded" }, 409)
+        }
+      }
+    }
     if (Object.keys(updates).length > 0) saveSettings(updates)
-    if (body.routingManagedExclusionEvidence !== undefined || body.routingManagedExcludedProfiles !== undefined ||
+    const changedEvidenceInputs = body.routingManagedExcludedProfiles !== undefined ||
       body.routingManagedReasons !== undefined || body.routingExcludedProfiles !== undefined || body.routingHeldProfiles !== undefined ||
-      body.usageReserves !== undefined) managedExclusionEvidence = evidence
+      body.usageReserves !== undefined
+    if (body.routingManagedExclusionEvidence !== undefined || changedEvidenceInputs) managedExclusionEvidence = evidence
+    if (body.routingManagedChatGptExclusionEvidence !== undefined || changedEvidenceInputs) {
+      managedChatGptExclusionEvidence = chatGptEvidence
+      managedChatGptEvidencePolicy = chatGptEvidence ? chatGptEvidencePolicy() : undefined
+      if (chatGptEvidence) managedChatGptEvidenceHighWater = chatGptEvidence.observedAt
+    }
     // Turning forcing off ends a force in effect: the switch says no profile
     // is forced past a supervisor any more.
     if (updates.allowForcingForbiddenProfile === false && getSetting("forcedActiveProfile") !== undefined) {
