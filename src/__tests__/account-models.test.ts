@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "bun:test"
-import { accountModelsState, clearAccountModels, fetchAccountModels, toAccountModelList } from "../proxy/accountModels"
+import { accountModelReadDue, accountModelsState, accountOffersModelEffort, clearAccountModels, fetchAccountModels, toAccountModelList } from "../proxy/accountModels"
 import { buildModelList } from "../proxy/openai"
 
 const MYTHOS = {
@@ -38,6 +38,22 @@ const ok = (data: unknown[]) => () => Response.json({ data, has_more: false })
 beforeEach(() => clearAccountModels())
 
 describe("fetchAccountModels", () => {
+  it("does not claim a preferred effort after a failed account-catalog refresh", async () => {
+    const at = 1_800_000_000_000
+    const { fetchImpl } = upstream([ok([{ ...SONNET, id: "claude-opus-5-5", capabilities: {
+      effort: { supported: true, high: { supported: true }, low: { supported: false } },
+    } }]), () => new Response(null, { status: 401 })])
+    const opts = { cacheKey: "max", auth: async () => ({ Authorization: "Bearer fixture" }), fetchImpl, now: () => at }
+
+    await fetchAccountModels(opts)
+    expect(accountOffersModelEffort("max", "claude-opus-5-5", "high", at)).toBe(true)
+    expect(accountOffersModelEffort("max", "claude-opus-5-5", "low", at)).toBe(false)
+    expect(accountModelReadDue("max", at)).toBe(false)
+    await fetchAccountModels({ ...opts, force: true })
+
+    expect(accountOffersModelEffort("max", "claude-opus-5-5", "high", at)).toBe(false)
+  })
+
   it("lists the account's models with its own token and caches them per profile", async () => {
     const { calls, fetchImpl } = upstream([ok([MYTHOS, SONNET])])
     const auth = async () => ({ Authorization: "Bearer token-team" })

@@ -35,6 +35,7 @@ const anthropicModel = z.object({
   capabilities: z.record(z.string(), z.unknown()).optional(),
 })
 const anthropicModelList = z.object({ data: z.array(anthropicModel).min(1) })
+const modelCapability = z.object({ supported: z.literal(true) }).passthrough()
 
 export type AnthropicModel = z.infer<typeof anthropicModel>
 
@@ -61,6 +62,15 @@ const cache = new Map<string, CacheEntry>()
 const inflight = new Map<string, Promise<AnthropicModel[] | null>>()
 const failures = new Map<string, AccountModelsFailure>()
 
+function accountModelCacheExpired(entry: CacheEntry, now: number): boolean {
+  return now - entry.at >= (entry.models ? ACCOUNT_MODELS_TTL_MS : FAILURE_RETRY_AFTER_MS)
+}
+
+export function accountModelReadDue(profile: string, now: number): boolean {
+  const entry = cache.get(profile)
+  return !inflight.has(profile) && (!entry || accountModelCacheExpired(entry, now))
+}
+
 export interface FetchAccountModelsOpts {
   /** The profile the list belongs to. */
   readonly cacheKey: string
@@ -83,7 +93,7 @@ export interface FetchAccountModelsOpts {
 export async function fetchAccountModels(opts: FetchAccountModelsOpts): Promise<AnthropicModel[] | null> {
   const now = opts.now ?? Date.now
   const cached = cache.get(opts.cacheKey)
-  if (!opts.force && cached && now() - cached.at < (cached.models ? ACCOUNT_MODELS_TTL_MS : FAILURE_RETRY_AFTER_MS)) return cached.models
+  if (!opts.force && cached && !accountModelCacheExpired(cached, now())) return cached.models
   const pending = inflight.get(opts.cacheKey)
   if (pending) return pending
   const request = readModels(opts)
@@ -173,6 +183,14 @@ export function toAccountModelList(
 export function accountModelsState(cacheKey: string): { listedAt: number | null; failure: AccountModelsFailure | null } {
   const entry = cache.get(cacheKey)
   return { listedAt: entry?.models ? entry.at : null, failure: failures.get(cacheKey) ?? null }
+}
+
+export function accountOffersModelEffort(profile: string, model: string, effort: string, now: number): boolean {
+  const entry = cache.get(profile)
+  if (!entry?.models || failures.has(profile) || now < entry.at || now - entry.at >= ACCOUNT_MODELS_TTL_MS) return false
+  const capability = entry.models.find(item => item.id === model)?.capabilities?.effort
+  const support = modelCapability.safeParse(capability)
+  return support.success && modelCapability.safeParse(support.data[effort]).success
 }
 
 /** Forget one profile's list (a new login may be another account), or all of them. */

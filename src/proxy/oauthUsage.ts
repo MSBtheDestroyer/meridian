@@ -975,6 +975,11 @@ export function peekOAuthUsage(profileId?: string | null): OAuthUsageSnapshot | 
   return cacheByProfile.get(profileId ?? DEFAULT_KEY)
 }
 
+export function peekSuccessfulOAuthUsage(profileId: string): OAuthUsageSnapshot | undefined {
+  const snapshot = peekOAuthUsage(profileId)
+  return failureByProfile.has(profileId) || snapshot?.stale ? undefined : snapshot
+}
+
 /** Clear cached OAuth usage snapshot, failure state, and 429 cooldowns for one profile. */
 export function clearOAuthUsageForProfile(profileId?: string | null): void {
   const key = profileId ?? DEFAULT_KEY

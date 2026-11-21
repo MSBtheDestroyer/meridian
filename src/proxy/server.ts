@@ -15,7 +15,7 @@ import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
 import { computeSummary } from '../telemetry/percentiles'
 import { CATALOG_CLIENT_VERSION, chatGptModelList, createChatGptModelCatalog, type CatalogModel } from './chatgpt/catalog'
-import { chatGptRouteAvailability } from './chatgpt/routeAvailability'
+import { claudeOpusReturnUsage, routeAvailability } from './routeAvailability'
 import { freshPlanExhaustion } from './freshPlanExhaustion'
 import { capacityObservationIsFresh, parseManagedExclusionEvidence, type ManagedExclusionEvidence } from './managedExclusionEvidence'
 import { createCodexClientVersion } from './chatgpt/clientVersion'
@@ -67,7 +67,7 @@ import { AdmissionHold, parseDrainOptions, type AdmissionReservation } from "./a
 import { DrainBodyError, readDrainBody } from "./drainBody"
 import { isGenerationSubmission, onGenerationResponseSettled } from "./generationAdmission"
 import { closeServerWithGracePeriod, joinShutdownCleanup, ShutdownProgress, trackServerConnections, waitForShutdownIdle, withShutdownDeadline } from "./shutdown"
-import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage, clearOAuthUsageForProfile, quotaResetBody, redeemOAuthQuotaResetOnce } from "./oauthUsage"
+import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage, peekSuccessfulOAuthUsage, clearOAuthUsageForProfile, quotaResetBody, redeemOAuthQuotaResetOnce } from "./oauthUsage"
 import { isSameOriginRequest } from "../sameOrigin"
 import { resolveSdkWorkingDirectory } from "./cwd"
 import type { Context } from "hono"
@@ -153,7 +153,7 @@ import { UpstreamReachability, DEFAULT_OVERRIDE_TTL_MS, MAX_OVERRIDE_TTL_MS, unr
 import { resolveReachabilityThresholds } from "./upstreamReachabilityConfig"
 import type { AnthropicSseEvent } from "./openai"
 import { translateOpenAiToAnthropic, translateAnthropicToOpenAi, buildModelList, createSseTranslator, translateAnthropicSseError } from "./openai"
-import { accountModelsState, clearAccountModels, fetchAccountModels, toAccountModelList, type AccountModel } from "./accountModels"
+import { accountModelReadDue, accountModelsState, accountOffersModelEffort, clearAccountModels, fetchAccountModels, toAccountModelList, type AccountModel } from "./accountModels"
 import { cvpAccessFor, cvpReadingBody, cvpAccessOn, lastClaudeAiReadingAt, cvpActive, cyberVerificationField, cyberVerificationOf, forgetCvpAccess, normalizeCvpModel, parseRoutingRequirements, recordCvpReading, routingRequireOf, recordCvpRefusal, ROUTING_REQUIRE_HEADER, type CyberVerificationField } from "./cvpAccess"
 import { normalizeJcodeSessionId } from "./adapters/jcode"
 import { extractLettaConversationId, LETTA_CONVERSATION_HEADER } from "./adapters/letta"
@@ -239,6 +239,7 @@ import {
   perModelRefusalFamily,
   parseWeeklyReserves,
   WeeklyReserveTracker,
+  weeklyReserveHolds,
   drawsExtraUsage,
   getClaudeExtraUsagePolicy,
   orderForExtraUsage,
@@ -10721,17 +10722,55 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       onRefusalsSettled: recordChatGptRefusalOutcome,
     },
   }) : undefined
+  let returnModelRead: Promise<unknown> | undefined
   app.get("/profiles/route-availability", (c) => {
     const provider = c.req.query("provider")
     const model = c.req.query("model")
     const variant = c.req.query("variant")
     c.header("Cache-Control", "no-store")
-    if (provider !== "chatgpt" || !model || model.length > 128 || !variant || variant.length > 32) {
-      return c.json({ error: "Expected a ChatGPT provider and exact model and variant" }, 400)
+    if ((provider !== "claude" && provider !== "chatgpt") || !model || model.length > 128 || !variant || variant.length > 32) {
+      return c.json({ error: "Expected a Claude or ChatGPT provider and exact model and variant" }, 400)
+    }
+    const now = Date.now()
+    if (provider === "claude") {
+      const query = { provider, model, variant }
+      const policy = getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing"))
+      if (model !== "claude-opus-5-5" || variant !== "high" || !isPoolRouting(policy) || forcedProfileId()) {
+        return c.json(routeAvailability(query, [], now))
+      }
+      const routing = evaluateRoutingProfileAccess({
+        profiles: getEffectiveProfiles(finalConfig.profiles), defaultProfile: finalConfig.defaultProfile, purpose: "work",
+        excludedProfileIds: userRoutingExcludedProfileIds(), managedExcludedProfileIds: managedRoutingExcludedProfileIds(),
+        heldProfileIds: routingHeldProfileIds(),
+      })
+      const weekly = weeklyReserveHolds(routing.profiles.map(p => p.id),
+        parseWeeklyReserves(process.env.MERIDIAN_WEEKLY_RESERVE, getSetting("weeklyReserve")).reserves, weeklyUsageReadings, now)
+      const reserves = usageReserves()
+      let missingModelCatalog: string | undefined
+      const eligible = routing.access.kind === "allowed" ? routing.profiles.flatMap(profile => {
+        if ((profile.type ?? "claude-max") !== "claude-max" || weekly.has(profile.id) ||
+          priorityExhaustion.isExhausted(profile.id, "opus") || profileDrawsExtraUsage(profile.id)) return []
+        const snapshot = peekSuccessfulOAuthUsage(profile.id)
+        if (!snapshot) return []
+        const sdk = rateLimitStore.getAll(profile.id)
+        const reserve = reserves[profile.id]
+        if (reserve && usageReserveHold(newestClaudeWindows(snapshot, sdk), reserve, now)) return []
+        const usage = claudeOpusReturnUsage(snapshot, sdk)
+        if (!usage || !routeAvailability(query, [usage], now).available) return []
+        if (accountOffersModelEffort(profile.id, model, variant, now)) return [usage]
+        if (accountModelReadDue(profile.id, now)) missingModelCatalog ??= profile.id
+        return []
+      }) : []
+      if (eligible.length === 0 && !returnModelRead && missingModelCatalog !== undefined) {
+        const profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, missingModelCatalog)
+        returnModelRead = fetchAccountModels({ cacheKey: profile.id,
+          auth: () => resolveDesignAuthHeaders({ designToken: null, profile, credentialStore: credentialStoreForProfile(profile) }),
+        }).finally(() => { returnModelRead = undefined })
+      }
+      return c.json(routeAvailability(query, eligible, now))
     }
     const route = chatGptProfiles?.route(undefined, "work")
     const seats = new Map(chatGptSource?.seats(model).map(seat => [seat.id, seat]))
-    const now = Date.now()
     const eligible = route?.kind === "pool" && chatGptSource?.isServing() && chatGptBackend && chatGptCatalog
       ? chatGptUsage?.entries.filter(entry => {
           const seat = seats.get(entry.id)
@@ -10740,7 +10779,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             chatGptBackend.planSeatAvailable(entry.id, model) && chatGptCatalog.routeOffered(model, variant, entry.plan.slug)
         }) ?? []
       : []
-    return c.json(chatGptRouteAvailability({ provider, model, variant }, eligible, now))
+    return c.json(routeAvailability({ provider, model, variant }, eligible, now))
   })
   if (chatGptBackend) {
     chatGptObserved = () => chatGptBackend.observedLimits()

@@ -43,7 +43,8 @@ installMcpToolsMock(() => ({
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { resetActiveProfile } = await import("../proxy/profiles")
-const { __setFetchOAuthUsageOverride } = await import("../proxy/oauthUsage")
+const { __setFetchOAuthUsageOverride, clearOAuthUsageForProfile, fetchOAuthUsage } = await import("../proxy/oauthUsage")
+const { clearAccountModels, fetchAccountModels } = await import("../proxy/accountModels")
 const { rateLimitStore } = await import("../proxy/rateLimitStore")
 const { setSetting } = await import("../settings")
 
@@ -256,6 +257,33 @@ describe("early refusal for fresh, spent plan windows", () => {
       expect(await res.text()).toContain("ok from")
     }
   })
+})
+
+it("serves fresh exact preferred availability from a routable Claude account without calling inference", async () => {
+  const profileId = "work"
+  const resetsAt = new Date(Date.now() + 60 * 60_000).toISOString()
+  const app = createTestApp()
+  try {
+    const sample = await fetchOAuthUsage({ profileId, force: true,
+      store: { read: async () => ({ claudeAiOauth: { accessToken: "fixture", refreshToken: "fixture", expiresAt: Date.now() + DAY } }),
+        write: async () => { throw new Error("availability fixture must not renew credentials") } },
+      fetchImpl: async () => Response.json({ five_hour: { utilization: 30, resets_at: resetsAt },
+        seven_day: { utilization: 70, resets_at: resetsAt }, seven_day_opus: { utilization: 75, resets_at: resetsAt } }),
+    })
+    await fetchAccountModels({ cacheKey: profileId, auth: async () => ({ Authorization: "Bearer fixture" }),
+      fetchImpl: async () => Response.json({ data: [{ id: "claude-opus-5-5", capabilities: { effort: { supported: true, high: { supported: true } } } }] }),
+    })
+
+    const res = await app.fetch(new Request("http://localhost/profiles/route-availability?provider=claude&model=claude-opus-5-5&variant=high"))
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ version: 1, provider: "claude", model: "claude-opus-5-5", variant: "high",
+      available: true, routable_allotment: 0.25, observed_at: sample?.fetchedAt })
+    expect(sdkCalls).toBe(0)
+  } finally {
+    clearOAuthUsageForProfile(profileId)
+    clearAccountModels(profileId)
+  }
 })
 
 describe("no_routable_account when every candidate is held back", () => {
