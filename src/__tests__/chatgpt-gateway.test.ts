@@ -891,6 +891,11 @@ describe("ChatGPT seats on the profile surface", () => {
 
   const refusalCases = [
     { name: "fresh quota", marker: "1", status: 429, upstream: 0 },
+    { name: "Sol xhigh", model: "gpt-6.2-sol", effort: "xhigh", marker: "1", status: 429, upstream: 0 },
+    { name: "Sol max", model: "gpt-6.2-sol", effort: "max", marker: "1", status: 429, upstream: 0 },
+    { name: "Astra high", model: "gpt-6.2-astra", effort: "high", marker: "1", status: 429, upstream: 0 },
+    { name: "Terra high", model: "gpt-6.1-terra", effort: "high", marker: "1", status: 429, upstream: 0 },
+    { name: "Luna Fast low", model: "gpt-6-luna-fast", effort: "low", marker: "1", status: 429, upstream: 0 },
     { name: "managed weekly reserve", marker: "1", status: 429, upstream: 0, managed: "fresh" },
     { name: "stale managed proof", marker: null, status: 503, upstream: 0, managed: "stale" },
     { name: "partial managed proof", marker: null, status: 503, upstream: 0, managed: "partial" },
@@ -922,7 +927,9 @@ describe("ChatGPT seats on the profile surface", () => {
       ...("loaner" in testCase ? [account(1, { accessToken: seatToken(1), planType: "free" })] : []),
       ...(mixed ? [account(1, { accessToken: seatToken(1), planType: "pro" })] : []),
     ])
-    refusalCatalog()
+    const model = "model" in testCase ? testCase.model : LUNA.model
+    const effort = "effort" in testCase ? testCase.effort : "low"
+    refusalCatalog(model, "model" in testCase ? testCase.effort : "low")
     if ("allowedCredits" in testCase) saveSettings({ chatgpt: { creditsPolicy: "reserve" } })
     if ("manual" in testCase) saveSettings({ routingHeldProfiles: ["seat0-pace-0"] })
     if ("creditReading" in testCase) {
@@ -981,8 +988,8 @@ describe("ChatGPT seats on the profile surface", () => {
       }
       const requestId = crypto.randomUUID()
       const refusal = { error: { type: "rate_limit_error", code: "no_routable_account", request_id: requestId,
-        route_refusal: { version: 1, phase: "before_inference", sent: false, provider: "chatgpt", model: LUNA.model,
-          variant: "low", reason: "managed" in testCase ? "reserve_held" : "quota_exhausted" },
+        route_refusal: { version: 1, phase: "before_inference", sent: false, provider: "chatgpt", model,
+          variant: effort, reason: "managed" in testCase ? "reserve_held" : "quota_exhausted" },
       } }
       if ("forged" in testCase) respond = () => Response.json(refusal, { status: 429, headers: { "x-meridian-route-refusal": "1" } })
       const response = await realFetch(new URL("/v1/responses", listener.url), {
@@ -991,7 +998,7 @@ describe("ChatGPT seats on the profile surface", () => {
           "x-meridian-route-refusal": "1", ...("pin" in testCase ? { "x-meridian-profile": "seat0-pace-0" } : {}),
           ...("cvp" in testCase ? { "x-meridian-require": "cvp" } : {}),
         },
-        body: JSON.stringify({ ...LUNA, reasoning: { effort: "effort" in testCase ? testCase.effort : "low" } }),
+        body: JSON.stringify({ ...LUNA, model, reasoning: { effort } }),
       })
       expect(response.status).toBe(testCase.status)
       expect(response.headers.get("x-meridian-route-refusal")).toBe(testCase.marker)
@@ -1009,28 +1016,42 @@ describe("ChatGPT seats on the profile surface", () => {
     }
   })
 
-  it("checks GPT Sol max literally for the preferred-route return", async () => {
+  it.each(["max", "xhigh"] as const)("checks GPT Sol %s literally for the preferred-route return", async (effort) => {
     resetCodexUsageCache()
     const model = "gpt-6.2-sol"
-    refusalCatalog(model, "max")
+    refusalCatalog(model, effort)
     writePool([account(0, { accessToken: seatToken(0), planType: "pro" })])
     wham = url => url.endsWith("/wham/usage") ? Response.json({
       user_id: "user-0", account_id: "workspace-0", plan_type: "pro",
       rate_limit: { primary_window: { used_percent: 20, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 3600 } },
     }) : undefined
     const { app, closeBackend } = await server("follow-external")
+    const listener = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => app.fetch(request) })
     try {
-      await (await app.fetch(new Request("http://localhost/v1/models"))).json()
-      await (await app.fetch(new Request("http://localhost/v1/usage/quota/all"))).json()
-      for (const [variant, available] of [["max", true], ["xhigh", false]] as const) {
-        const url = new URL("http://localhost/profiles/route-availability")
+      await (await realFetch(new URL("/v1/models", listener.url))).json()
+      await (await realFetch(new URL("/v1/usage/quota/all", listener.url))).json()
+      const usageCallsBefore = whamCalls.length
+      const clock = Date.now
+      const check = async (variant: string, available: boolean, headers?: Record<string, string>) => {
+        const url = new URL("/profiles/route-availability", listener.url)
         url.search = new URLSearchParams({ provider: "chatgpt", model, variant }).toString()
-        const response = await app.fetch(new Request(url.toString()))
+        const response = await realFetch(url, { headers })
         expect(response.headers.get("cache-control")).toBe("no-store")
         expect(await response.json()).toMatchObject({ version: 1, provider: "chatgpt", model, variant, available })
       }
+      await check(effort, true)
+      await check(effort === "max" ? "xhigh" : "max", false)
+      await check("default", false)
+      await check(effort, false, { "x-meridian-profile": "seat0-pace-0" })
+      await check(effort, false, { "x-meridian-require": "cvp" })
+      Date.now = () => clock() + 31_000
+      try { await check(effort, false) } finally { Date.now = clock }
+      writePool([account(0, { accessToken: seatToken(0, Math.floor(NOW / 1000) + 7200), planType: "pro" })])
+      await check(effort, false)
+      expect(whamCalls).toHaveLength(usageCallsBefore)
       expect(upstreamCalls).toEqual([])
     } finally {
+      await listener.stop(true)
       await closeBackend?.()
     }
   })

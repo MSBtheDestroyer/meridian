@@ -10831,17 +10831,25 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       }
       return c.json(routeAvailability(query, eligible, checkedAt))
     }
+    const query = { provider, model, variant }
+    if (forcedProfileId() || c.req.header("x-meridian-profile") !== undefined || c.req.header(ROUTING_REQUIRE_HEADER) !== undefined) {
+      return c.json(routeAvailability(query, [], now))
+    }
     const route = chatGptProfiles?.route(undefined, "work")
-    const seats = new Map(chatGptSource?.seats(model).map(seat => [seat.id, seat]))
-    const eligible = route?.kind === "pool" && chatGptSource?.isServing() && chatGptBackend && chatGptCatalog
-      ? chatGptUsage?.entries.filter(entry => {
-          const seat = seats.get(entry.id)
-          return entry.plan !== null && seat?.eligible && seat.expiresAt !== null && seat.expiresAt > now &&
-            !route.excluded.has(entry.id) && chatGptProfiles?.loginState(entry.id) === "authenticated" &&
-            chatGptBackend.planSeatAvailable(entry.id, model) && chatGptCatalog.routeOffered(model, variant, entry.plan.slug)
-        }) ?? []
-      : []
-    return c.json(routeAvailability({ provider, model, variant }, eligible, now))
+    if (route?.kind !== "pool" || !chatGptSource?.isServing() || !chatGptBackend || !chatGptCatalog || !chatGptUsage) {
+      return c.json(routeAvailability(query, [], now))
+    }
+    const seats = new Map(chatGptSource.seats(model).map(seat => [seat.id, seat]))
+    const current = currentCodexUsageEvidence(chatGptSource.usagePool())
+    const eligible = chatGptUsage.entries.filter(entry => {
+      const seat = seats.get(entry.id)
+      const evidence = current.get(entry.id)
+      return evidence?.identityConfirmed === true && evidence.fetchedAt === entry.fetchedAt &&
+        entry.plan !== null && seat?.eligible && seat.expiresAt !== null && seat.expiresAt > now &&
+        !route.excluded.has(entry.id) && chatGptProfiles?.loginState(entry.id) === "authenticated" &&
+        chatGptBackend.planSeatAvailable(entry.id, model) && chatGptCatalog.routeOffered(model, variant, entry.plan.slug)
+    })
+    return c.json(routeAvailability(query, eligible, now))
   })
   if (chatGptBackend) {
     chatGptObserved = () => chatGptBackend.observedLimits()

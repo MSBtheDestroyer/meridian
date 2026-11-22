@@ -267,11 +267,14 @@ describe("early refusal for fresh, spent plan windows", () => {
 it.each([
   { name: "Opus family", model: "claude-opus-5-5", effort: "high", window: "seven_day_opus", expected: 0.25 },
   { name: "Sonnet exact model", model: "claude-sonnet-4-6", effort: "medium", scope: "Claude Sonnet 4.6", expected: 0.25 },
+  { name: "Terra reverse target", model: "claude-sonnet-5-5", effort: "high", scope: "Claude Sonnet 5.5", expected: 0.25 },
   { name: "Fable family", model: "claude-fable-5-2", effort: "xhigh", scope: "Fable", expected: 0.25 },
+  { name: "Astra reverse target", model: "claude-fable-5-2", effort: "high", scope: "Fable", expected: 0.25 },
   { name: "Mythos governed by Fable", model: "claude-mythos-5-2", effort: "max", window: "seven_day_overage_included", expected: 0.25 },
   { name: "Mythos governed by versioned Fable scope", model: "claude-mythos-5-2", effort: "max", scope: "Claude Fable 5.2", expected: 0.25 },
   { name: "Mythos SDK Fable refusal", model: "claude-mythos-5-2", effort: "max", scope: "Fable", sdkBucket: "seven_day_overage_included", expected: 0 },
   { name: "explicit Haiku", model: "claude-haiku-5-5", effort: "low", expected: 1 - 0.7 },
+  { name: "Haiku catalog omits effort", model: "claude-haiku-5-5", effort: "low", noEffort: true, expected: 0 },
   { name: "default Haiku", model: "claude-haiku-4-5-20251001", effort: "default", expected: 0 },
   { name: "unlisted Mythos", model: "claude-mythos-5-2", effort: "high", scope: "Fable", offered: "claude-fable-5-2", expected: 0 },
   { name: "unsupported explicit effort", model: "claude-opus-5-5", effort: "low", offeredEffort: "high", expected: 0 },
@@ -287,7 +290,7 @@ it.each([
   { name: "CVP requirement", model: "claude-opus-5-5", effort: "high", header: ["x-meridian-require", "cvp"], expected: 0 },
   { name: "manual pin", model: "claude-opus-5-5", effort: "high", header: ["x-meridian-profile", "return-work"], expected: 0 },
   { name: "cold catalog shared with pinned model list", model: "claude-sonnet-4-6", effort: "medium", cold: true, expected: 1 - 0.7 },
-])("attests only exact available Claude routes over loopback: $name", async ({ model, effort, window, scope, offered, offeredEffort, used = 75, expired, replaced, header, sdkBucket, paid, unknownPaid, immediatePaid, excluded, cold, expected }) => {
+])("attests only exact available Claude routes over loopback: $name", async ({ model, effort, window, scope, offered, offeredEffort, noEffort, used = 75, expired, replaced, header, sdkBucket, paid, unknownPaid, immediatePaid, excluded, cold, expected }) => {
   const root = await mkdtemp(join(tmpdir(), "meridian-return-"))
   const dir = join(root, "work")
   const profileId = "return-work"
@@ -322,7 +325,7 @@ it.each([
       utilization: sdkBucket ? 1 : 0.3, resetsAt: Date.parse(resetsAt), isUsingOverage: paid,
     }, (sample?.fetchedAt ?? Date.now()) + 1)
     const catalog = () => Response.json({ data: [{ id: offered ?? model,
-      capabilities: { effort: { supported: true, [offeredEffort ?? effort]: { supported: true } } } }] })
+      ...(noEffort ? {} : { capabilities: { effort: { supported: true, [offeredEffort ?? effort]: { supported: true } } } }) }] })
     globalThis.fetch = Object.assign(async (...args: Parameters<typeof fetch>) => {
       if (String(args[0]).startsWith(listener.url.origin)) return network(...args)
       if (!cold || !String(args[0]).startsWith("https://api.anthropic.com/v1/models?") ||
