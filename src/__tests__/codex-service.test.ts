@@ -136,24 +136,6 @@ function entryFor(result: CodexUsageResponse, account: CodexPoolAccount): CodexU
 }
 
 describe("codex usage service", () => {
-  test("actual unauthorized usage records refusal before projection and newer acceptance recovers it", async () => {
-    const account = poolAccount(7, { accountId: crypto.randomUUID() })
-    const key = account.accountUserId ? chatGptAuthLifecycleKey(account.accountUserId) : undefined
-    const refused = stubFetch(() => ({ status: 401 }))
-    setSystemTime(NOW)
-    try {
-      await getCodexUsage({ settings: {}, loadPool: pool([account]), fetchImpl: refused.impl, now: NOW })
-
-      expect(authLifecycleFor(key)?.unauthedReason).toBe("api_rejected")
-      resetCodexUsageCache()
-      setSystemTime(NOW + 1000)
-      const accepted = stubFetch(serveAll([account]))
-      await getCodexUsage({ settings: {}, loadPool: pool([account]), fetchImpl: accepted.impl, now: NOW + 1000 })
-      expect(authLifecycleFor(key)?.firstUnauthedAt).toBeUndefined()
-    } finally {
-      setSystemTime()
-    }
-  })
 
   beforeEach(() => resetCodexUsageCache())
   afterEach(() => resetCodexUsageCache())

@@ -32,7 +32,6 @@ import { parseRetryAfterMs } from "./retryAfter"
 import { createPlatformCredentialStore, refreshOAuthToken, type CredentialStore } from "./tokenRefresh"
 import { followedUsageSnapshot } from "./followUsage"
 import { bundledClaudeCodeVersion } from "./models"
-import { noteApiRejected, noteProviderAccepted } from "./authLifecycle"
 import { parseResetGrantMetadata, type OAuthBankedResetGrant, type OAuthBankedResets } from "./oauthResetGrants"
 
 export type { OAuthBankedResetGrant, OAuthBankedResets } from "./oauthResetGrants"
@@ -888,7 +887,6 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
   const refresh = opts?.refreshImpl ?? refreshOAuthToken
 
   async function fetchAndCacheUsage(): Promise<RawUsageResult> {
-    let startedAt = Date.now()
     try {
       let token = await tokenForCall(store, refresh, cacheKey)
       if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
@@ -907,7 +905,6 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
         const refreshed = await refresh(store)
         if (!refreshed) {
           claudeLog("oauth_usage.refresh_failed", { profile: cacheKey })
-          noteApiRejected(store.refreshKey, { startedAt })
           // Not `no_token`: the token is present, and a read-only instance
           // declines to refresh it BY DESIGN (credentialsMode.ts). Reporting
           // a missing login here would tell the operator to re-authenticate
@@ -915,7 +912,6 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
           // from touching credentials.
           return staleOr("refresh_failed", "upstream_error")
         }
-        startedAt = Date.now()
         const newToken = await readAccessToken(store)
         if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
         if (!newToken) return staleOr("no_token_after_refresh", "no_token")
@@ -932,7 +928,6 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
       }
       if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
       if ("__status" in result) {
-        if (result.__status === 401) noteApiRejected(store.refreshKey, { startedAt })
         if (result.__status === 429) {
           // Floor at the backoff, but cap at staleMaxMs: the cooldown suppresses
           // every fetch, so one longer than the stale window would age the
@@ -959,7 +954,6 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
       failureByProfile.delete(cacheKey)
       const snapshot = buildSnapshot(result)
       usageTokenDigests.set(snapshot, createHash("sha256").update(token).digest("hex"))
-      noteProviderAccepted(store.refreshKey, { startedAt })
       cacheByProfile.set(cacheKey, snapshot)
       return { snapshot, error: null }
     } catch (err) {

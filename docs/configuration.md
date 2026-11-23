@@ -47,8 +47,8 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_PASSTHROUGH_MAX_TURNS` | `CLAUDE_PROXY_PASSTHROUGH_MAX_TURNS` | *(unset — capped at 1)* | Pin the passthrough SDK turn budget. An explicit positive value wins over the one-turn cap. With early stop enabled, a budget above one still stops after a batch forwarded to the client (see [digest-turn elimination](#how-tool-calling-works-in-passthrough)), so the pin adds headroom before the tool boundary; structured-output requests retain the normal SDK completion loop. Unset it unless you still need it. |
 | `MERIDIAN_PASSTHROUGH_UNCAPTURED_TOOL_RECOVERY` | — | *(unset — confirmed CLI rejection only)* | In streaming passthrough, complete tool calls can be returned as `tool_use` when every call has a CLI dispatch rejection matching its ID and tool name: `No such tool available`, or `InputValidationError: … could not be parsed as JSON`. Input must still form a complete JSON object after the supported control-character/invalid-escape repair; schema validation failures do not count. Explicit rejection can also qualify an undeclared tool name for the client's own invalid-tool response. The rejected SDK session is evicted so the next client result replays against a fresh one. Set to `1` to **also** allow experimental uncaptured abort-window recovery without explicit rejection (no live positive gate yet); every call must then name a declared tool. Set to `0` to disable both recoveries. Non-streaming responses are unaffected. Confirmed-rejection recovery applies at any turn budget, including deferred tools; abort-window recovery requires `maxTurns=1`. Both require a complete open envelope and no cancellation. When neither applies, the `sdk_termination` error log names the blocking condition as `uncaptured_veto=…`. |
 | `MERIDIAN_SESSION_GC_LOCK_WAIT_MS` | `CLAUDE_PROXY_SESSION_GC_LOCK_WAIT_MS` | `2000` | External lifecycle-lock acquisition budget, starting only at the head of the local FIFO; minimum 100 ms. Local queue waiting does not consume this budget and is not bounded by two seconds. Each lock allows 256 waiting callers; a holder stalled for 60 seconds rejects queued/new callers without unlocking its transaction, unless the deadline itself ran late because the event loop was blocked. An answered turn whose terminal publication meets any of these errors is still delivered; its next turn replays history. Request cancellation removes queued work or cancels acquisition, never an executing durable transaction; cleanup remains uncanceled. External timeout, queue capacity and stalled-holder failures answer **503 `overloaded_error`** with distinct reasons. |
-| `MERIDIAN_SESSION_GC_MAX_PENDING` | `CLAUDE_PROXY_SESSION_GC_MAX_PENDING` | `2048` | Transcripts that may wait for deletion at once (prepared, retired or being deleted). A superseded transcript waits its grace period in this budget, so it caps deletion throughput at this many per grace period; superseded transcripts beyond it stay live. When it is full and superseded transcripts are waiting, the log says `session GC backlog saturated` (at most every 10 minutes) and healthy `/health` reports `sessionGc.saturated: true`. |
-| `MERIDIAN_SESSION_GC_MAX_DELETES` | `CLAUDE_PROXY_SESSION_GC_MAX_DELETES` | `64` | Deletions one GC run claims, in batches of 8 that run side by side. While transcripts are still due for deletion and runs make progress, the next run follows at once, for up to 5 minutes per sweep. |
+| `MERIDIAN_SESSION_GC_MAX_DELETES` | `CLAUDE_PROXY_SESSION_GC_MAX_DELETES` | `64` | Deletions one GC run claims, in batches of 8 that run side by side. While transcripts are still due for deletion and runs make progress, the next run follows at once, for up to 5 minutes per sweep. Runs also follow every managed fork publication or abandonment, so under load `MERIDIAN_SESSION_GC_MAX_PENDING` bounds the cleanup rate instead. Once the proxy is draining, no run claims a new deletion; the next process deletes what is left. |
+| `MERIDIAN_SESSION_GC_GRACE_MS` | `CLAUDE_PROXY_SESSION_GC_GRACE_MS` | session turn hold + `60000` | How long a transcript no longer pinned by a mapping waits, retired, before it may be deleted, so a request still holding it ends first. |
 | `MERIDIAN_SESSION_PROFILE_COPY_PRUNE` | `CLAUDE_PROXY_SESSION_PROFILE_COPY_PRUNE` | `0` | Opt in to removing stale cross-profile session mappings during GC. Off preserves native resume history. Returning to a pruned profile uses flattened, context-trimmed replay, which cannot restore SDK thinking. |
 | `MERIDIAN_SESSION_PROFILE_COPY_GRACE_MS` | `CLAUDE_PROXY_SESSION_PROFILE_COPY_GRACE_MS` | `86400000` (24 hours) | With several profiles, the same conversation gets its own stored session under each profile it has run on. When profile-copy pruning is enabled, on every session GC sweep a copy is removed once a newer copy of that conversation exists under another profile and the older copy has not been used for this many milliseconds. The newest copy, copies of a conversation with a request in flight, and mappings a priority route depends on are always kept. A conversation that returns to a profile while its copy exists resumes that profile's own session, unless another profile's copy holds more of the history the client sends (the conversation took turns there since), in which case it is replayed as below; after removal it is replayed into a fresh session on that account, as flattened history trimmed to the model's context window. The default covers an account's 5-hour usage window resetting and a day of switching back and forth. `0` keeps only the newest copy. Removal is paced to leave at least half of `MERIDIAN_SESSION_GC_MAX_PENDING` free for new requests, so a large store is trimmed over several sweeps. |
 | `MERIDIAN_SILENT_TURN_RECOVERY` | `CLAUDE_PROXY_SILENT_TURN_RECOVERY` | `1` | Set to `0` to stop spending a recovery turn on a [silent turn](#silent-turns). Detection and telemetry stay on either way |
@@ -60,7 +60,8 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_SUPPRESS_SCRATCHPAD` | — | `1` | Set to `0` to disable prompt-level scratchpad suppression in passthrough mode (#627, #1049) |
 | `MERIDIAN_SUPPRESS_SCRATCHPAD_ENV` | — | `0` | Set to `1` to also pass `CLAUDE_CODE_SESSION_KIND=bg` to the SDK subprocess. Disabled by default to prevent CLI 2.1.274+ from registering persistent phantom background jobs under `~/.claude/jobs/` (#1049) |
 | `MERIDIAN_SUPPRESS_IMPLICIT_ATTACHMENTS` | — | `1` | Set to `0` to stop defaulting `CLAUDE_CODE_DISABLE_ATTACHMENTS=1` in passthrough mode. Does not clear an explicitly inherited CLI setting. See [known limitations](#known-limitations). |
-| `MERIDIAN_CACHE_KEEPALIVE` | — | unset (off) | Set to `1` to keep idle one-hour-cache sessions warm with a few small cache-read requests; `0` forces it off. Wins over `cacheKeepalive` in `settings.json`. See [Prompt-cache keepalive](#prompt-cache-keepalive). |
+| `MERIDIAN_CACHE_KEEPALIVE` | — | unset (off) | Set to `1` to keep idle one-hour-cache sessions warm with a few small cache-read requests; `client` to beat only when a client asks; `0` forces it off. Wins over `cacheKeepalive` in `settings.json`. See [Prompt-cache keepalive](#prompt-cache-keepalive). |
+| `MERIDIAN_CACHE_KEEPALIVE_MAX_BEATS` | — | `3` | Keepalive requests per idle session before its cache is allowed to expire, in automatic and client mode. At least `1`. |
 | `MERIDIAN_CACHE_KEEPALIVE_MAX_IN_FLIGHT` | — | `1` | Keepalive requests allowed to run at once across all sessions, clamped to `1`–`2`. |
 | `MERIDIAN_COMPACTION_SURVIVAL` | — | `0` | Set to `1` to resume the old SDK session after a client shortens its history head into a summary. By default Meridian replays the supplied summary in a fresh SDK session so the removed context is released. Equal-length pruning still resumes. |
 | `MERIDIAN_CONFIG_DIR` | — | `~/.config/meridian` | Meridian's own config directory. Moving it moves everything inside it — see [below](#relocating-the-config-directory). |
@@ -1001,7 +1002,9 @@ interactive Claude Code.
   held until the process has exited. It skips a directory whose login is due
   for renewal within 30 minutes, starts nothing under
   `MERIDIAN_CREDENTIALS_READONLY`, and stops until restart, with a log line, if a
-  stored login changes during a run in a way no renewal explains.
+  stored login changes during a run in a way no renewal explains. An instance
+  under `MERIDIAN_FOLLOW_ACTIVE` runs no idle sweep; the followed instance does. If a transcript Meridian still needs cannot be refreshed, it runs no
+  cleanup in that directory and logs why.
 - **The first cleanup can wait a day.** Claude Code stamps `.last-cleanup`
   even when retention is off and it skips the deletion, so after you turn
   retention on, a config directory that served a request in the previous
@@ -1302,8 +1305,9 @@ When it is on:
 - About 55 minutes after the latest real turn, and 55 minutes after each
   keepalive, Meridian resumes the session's stored transcript exactly as the
   next turn would, adds a short prompt, and stops as soon as the response
-  starts. At most three keepalives per idle period (about three hours); after
-  that the cache is allowed to expire.
+  starts. At most three keepalives per idle period (about three hours;
+  `MERIDIAN_CACHE_KEEPALIVE_MAX_BEATS` changes the number); after that the
+  cache is allowed to expire.
 - The next real turn on the session ends the idle period and starts a new one.
   Side calls that share the session key (Claude Code's classifier and title
   requests) do not.
@@ -1321,6 +1325,40 @@ When it is on:
   rate.
 - Shutdown and drain stop new keepalives, abort a running one and wait for its
   Claude Code process to exit, like any other request.
+
+#### Client-requested beats
+
+With `MERIDIAN_CACHE_KEEPALIVE=client` (or `"cacheKeepalive": "client"`),
+Meridian tracks the same sessions but never beats on its own. A client that
+knows whether its user is coming back asks for each beat instead. Only the
+operator can choose this mode; in any other mode the endpoint sends nothing
+and answers `disabled`.
+
+```
+POST /v1/sessions/<session key>/cache-beat
+```
+
+`<session key>` is the exact key the client sends with its turns
+(`x-session-affinity`, `x-opencode-session`, ...). The request answers once
+the beat has finished, as `{ "session": "...", "outcome": "..." }`:
+
+| Outcome | Meaning |
+|---|---|
+| `reached` | Upstream read the cached prefix; the cache lives another hour. |
+| `retry` | The beat could not run now (no free SDK slot, account blocked, transient error). |
+| `busy` | A real turn or another beat is running for the session. |
+| `stop` | The session cannot be kept warm (cache gone, five-minute tier, mapping moved), or it has used its keepalives for this idle period. |
+| `early` | The cache was read less than 20 minutes ago, or a failed beat is still backing off; nothing was sent. |
+| `expired` | The cache had already expired; nothing was sent. |
+| `untracked` | No eligible session under that key. |
+| `disabled` | The operator has not chosen client mode. |
+
+The client chooses when to beat, but not how often: the same per-period cap
+applies (`MERIDIAN_CACHE_KEEPALIVE_MAX_BEATS`, three by default, reset by the
+next real turn), and a beat is refused within 20 minutes of the latest turn or
+beat. Every other rule above (subscription accounts only, never the last SDK
+slot, never an expired cache, never beside a real turn) still applies. A
+tracked session whose cache expires is forgotten as before.
 
 Keepalives appear in `/telemetry` with `requestSource: "cache-keepalive"`.
 They are left out of the request, error, cache-hit and cost figures and shown

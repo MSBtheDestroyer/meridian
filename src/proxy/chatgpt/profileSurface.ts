@@ -16,7 +16,7 @@
  * of the exclusions (settings, injected), the usage reading (injected), and
  * any credential - nothing here sees a token.
  */
-import { authLifecycleFor, noteApiRejected, noteCredentialObserved, noteProviderAccepted, type AuthLifecycleRecord } from "../authLifecycle"
+import { authLifecycleFor, type AuthLifecycleRecord } from "../authLifecycle"
 import type { CodexUsageResponse } from "../codex/types"
 import type { LimitDiagnosis } from "../limitDetection"
 import type { SpentRecord } from "../profileHealth"
@@ -100,17 +100,28 @@ export interface ChatGptProfileSurfaceDeps {
   spent: (profileId: string) => SpentRecord | undefined
   /** Where a free-plan seat ranks among the others for unpinned work (chatgpt/features.ts). */
   freeSeatOrder?: () => ChatGptFreeSeatOrder
+  /** The seat's own renewal interval in hours (features.ts `seatRenewalHours`); null for the default. */
+  renewalHours?: (seat: string) => number | null
 }
 
 /**
- * A seat's token state as authLifecycle.ts reads a credential. Only a seat
- * with no usable sign-in at all counts as logged out: an expired or refused
- * access token is the owner's next refresh to make, not yet a lost login.
+ * A seat's token state as a credential presence. Only a seat with no usable
+ * sign-in at all counts as logged out: an expired or refused access token is
+ * the owner's next refresh to make, not yet a lost login.
  */
 function seatLoginPresence(tokenState: ChatGptTokenState): "present" | "absent" | "unknown" {
   if (tokenState === "ok") return "present"
   if (tokenState === "no_token" || tokenState === "requires_reauth") return "absent"
   return "unknown"
+}
+
+/** When Meridian last renewed the seat, from its renewal history (credentials.ts `renewals`). */
+function lastSeatRenewalAt(profile: ChatGptProfile): number | null {
+  for (let index = profile.renewals.length - 1; index >= 0; index--) {
+    const renewal = profile.renewals[index]!
+    if (renewal.outcome === "rotated" || renewal.outcome === "kept") return renewal.at
+  }
+  return null
 }
 
 /**
@@ -146,21 +157,16 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
 
   const loginFor = (profile: ChatGptProfile) => {
     const reading = deps.usage()?.entries.find(entry => entry.id === profile.seat)
-    const key = chatGptAuthLifecycleKey(profile.seat)
-    const prior = authLifecycleFor(key)
+    // A seat's login history holds only the sign-ins Meridian performed; its
+    // renewals live in its credential store, and its logouts are its token state.
+    const lifecycle = authLifecycleFor(chatGptAuthLifecycleKey(profile.seat))
     const failureAt = reading?.failure?.lastFailureAt
     let error = reading?.error
-    if (error === "unauthorized" && failureAt) {
-      if (Math.max(prior?.authObtainedAt ?? 0, prior?.lastRefreshAt ?? 0, prior?.lastAcceptedAt ?? 0) > failureAt) error = null
-      else noteApiRejected(key, { startedAt: failureAt, at: failureAt })
-    }
-    if (reading?.fetchedAt && !reading.error && !reading.stale && !reading.failure) {
-      noteProviderAccepted(key, { startedAt: reading.fetchedAt })
-    }
+    // A refusal read before the latest sign-in or renewal was about a token since replaced.
+    if (error === "unauthorized" && failureAt && Math.max(lifecycle?.authObtainedAt ?? 0, lastSeatRenewalAt(profile) ?? 0) > failureAt) error = null
     const tokenState = chatGptTokenState(profile.unavailable, error)
     const presence = seatLoginPresence(tokenState)
-    const lifecycle = noteCredentialObserved(key, { presence })
-    const state = profileLoginState({ loggedIn: tokenState === "ok" ? true : tokenState === "refused" ? false : undefined, presence, firstUnauthedAt: lifecycle?.firstUnauthedAt })
+    const state = profileLoginState({ loggedIn: tokenState === "ok" ? true : tokenState === "refused" ? false : undefined, presence })
     return { tokenState, lifecycle, state }
   }
 
@@ -383,6 +389,11 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           // same evidence Claude's "Last Verified" rests on.
           lastCheckedAt: reading?.failure?.lastFailureAt ?? reading?.fetchedAt ?? null,
           lastSuccessAt: reading?.fetchedAt ?? null,
+          renewalRetryAt: profile.renewalRetryAt,
+          // Meridian renews only the seats in its own store, so a followed
+          // seat has neither an interval nor a history.
+          renewalHours: owner.mode === "owned" ? deps.renewalHours?.(profile.seat) ?? null : null,
+          renewals: profile.renewals,
           authProvenance: "live" as const,
           // The fields a Claude profile reports about its login. A seat's
           // provider states no login deadline, so those three stay empty.
@@ -390,12 +401,11 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           daysUntilRenewal: null,
           renewalRequiredSoon: false,
           accessTokenExpiresAt: profile.accessTokenExpiresAt,
-          renewalRetryAt: profile.renewalRetryAt,
           authObtainedAt: signIn.at,
           authObtainedVia: signIn.via,
-          lastRefreshAt: lifecycle?.lastRefreshAt ?? null,
-          firstUnauthedAt: lifecycle?.firstUnauthedAt ?? null,
-          unauthedReason: lifecycle?.unauthedReason ?? null,
+          lastRefreshAt: lastSeatRenewalAt(profile),
+          firstUnauthedAt: null,
+          unauthedReason: null,
           credentialDir: null,
         }
       })

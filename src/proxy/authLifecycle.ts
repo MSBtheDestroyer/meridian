@@ -1,116 +1,81 @@
 /**
- * When each account was logged in, when it was last renewed, and when it was
- * first found logged out.
+ * When each Claude login happened, when Meridian last renewed it, and when it
+ * was first found logged out.
  *
- * A Claude login has a deadline. The token endpoint states it with every
- * refresh as `refresh_token_expires_in`, and it counts DOWN: refreshing renews
- * the access token, never the deadline. Once the deadline passes the next
- * refresh is refused and the account stops working when its current access
- * token runs out, at most one access-token lifetime later. Measured on a live
- * fleet: deadlines read off disk weeks in advance predicted every drop that
- * followed to within those few hours.
+ * `.credentials.json` holds the current grant and nothing about its history,
+ * and Claude Code wipes it once a refresh is refused. This record is what is
+ * left afterwards to tell a login that reached its deadline from one that was
+ * revoked early. Design and rules: profiles-routing.spec.md, *Login history*.
  *
- * `.credentials.json` holds the deadline and nothing else about the login, and
- * Claude Code wipes the file the moment a refresh is refused. So after the
- * fact there was no record of when the account had been logged in, when it was
- * last renewed, or when it stopped — the questions that tell a fixed lifetime
- * from an early revocation. This module is that record.
- *
- * WHERE IT IS KEPT. Meridian's own file beside settings.json, for the reason
- * organizations.json lives there: Claude Code owns `.credentials.json`,
- * rewrites it on every refresh, and would drop any key Meridian added.
- *
- * WHAT IT IS KEYED BY. The credential store's `refreshKey`, the identity
- * tokenRefresh already dedupes refreshes on. A login belongs to a credential,
- * not to whatever the profile pointing at it happens to be called.
+ * Kept beside settings.json because Claude Code owns the credential file and
+ * would drop any key Meridian added. Keyed by the credential store's
+ * `refreshKey`: a login belongs to a credential, not to a profile name.
  *
  * Leaf module — no imports from server.ts or session/.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
-import { dirname } from "node:path"
+import { createHash } from "node:crypto"
+import { existsSync, readFileSync } from "node:fs"
 import { configPath } from "../configDir"
+import { publishFileSnapshot, withFileLock, withFileLockSync } from "./lockedFile"
 
-/** How far a deadline must move forward before it means a different login. */
-export const NEW_GRANT_MIN_JUMP_MS = 60 * 60 * 1000
+/** One login's deadline, read twice, differs by a whole-second recount. */
+export const DEADLINE_TOLERANCE_MS = 5 * 60 * 1000
 
-/** Deadlines are recomputed from a whole-second countdown on every refresh, so
- *  the same login reads a little differently each time. */
-const DEADLINE_TOLERANCE_MS = 5 * 60 * 1000
-
-/** Events kept per credential — years of logins at one a month. */
+/** Events kept per credential. */
 export const MAX_AUTH_LIFECYCLE_EVENTS = 24
-/** Renewals kept per credential — two months of renewing daily. */
-export const MAX_AUTH_RENEWALS = 64
 
 export type UnauthedReason =
-  /** The token endpoint refused the refresh token. */
+  /** The token endpoint answered `invalid_grant` for the stored refresh token. */
   | "refresh_rejected"
-  /** The credential on disk no longer carries an access token — what Claude
-   *  Code leaves behind after it is refused. */
+  /** The credential was read and carries no access token. */
   | "credentials_cleared"
-  | "api_rejected"
 
 export type AuthLifecycleEventKind =
   /** Meridian completed an interactive login. */
   | "login"
-  /** A credential with a later deadline appeared without Meridian logging in:
-   *  somebody ran a login elsewhere against the same directory. */
+  /** A refresh token Meridian did not issue appeared with a different
+   *  deadline: a login performed elsewhere. */
   | "new_grant"
-  /** The deadline moved without a new login. Not expected; kept as evidence. */
+  /** A refresh token Meridian did not issue appeared and its deadline cannot
+   *  say whether it is a new login or a rotation of the old one. */
+  | "credential_replaced"
+  /** The deadline moved while the refresh token stayed the same. */
   | "deadline_moved"
   | "logged_out"
-  /** Authentication worked again without a recorded login. */
+  /** Authentication works again for the same grant. */
   | "recovered"
 
 export interface AuthLifecycleEvent {
   at: number
   kind: AuthLifecycleEventKind
-  /** The login deadline in force when it happened. */
+  /** The deadline in force when it happened. */
   refreshTokenExpiresAt?: number
   /** For `new_grant` and `deadline_moved`: the deadline it replaced. */
   previousRefreshTokenExpiresAt?: number
   reason?: UnauthedReason
-  /** Short and never secret: an OAuth error code or an HTTP status. */
+  /** Short and never secret: an OAuth error code. */
   detail?: string
 }
-
-/**
- * One token exchange the provider saw, and what came back. `rotated` and
- * `kept` say whether a new refresh token was issued; `refused` is the provider
- * declining the grant, `unverified` an exchange whose result is unknown.
- */
-export interface AuthRenewal {
-  at: number
-  outcome: AuthRenewalOutcome
-  /** Short and never secret: why it was refused, or the failed status. */
-  detail?: string
-  /** The new access token's issue time and expiry, as far as they are known. */
-  issuedAt?: number
-  expiresAt?: number
-}
-
-export type AuthRenewalOutcome = "rotated" | "kept" | "refused" | "unverified"
 
 export interface AuthLifecycleRecord {
-  /** When the login behind the current credential happened. */
+  /** When the current grant was obtained; unknown after `credential_replaced`. */
   authObtainedAt?: number
-  /** `login` when Meridian performed it, `observed` when a new credential was
-   *  found on disk — then this is when it was noticed, not when it happened. */
+  /** `login` when Meridian performed it, `observed` when it was found on disk
+   *  (then `authObtainedAt` is when it was noticed). */
   authObtainedVia?: "login" | "observed"
-  /** Last successful token refresh. */
+  /** Last refresh of the current grant that Meridian performed. */
   lastRefreshAt?: number
-  lastAcceptedAt?: number
-  /** Last login deadline seen. Kept after Claude Code wipes the credential, so a
-   *  drop can be compared with the deadline it fell on. */
+  /** Last deadline seen; kept after the credential is wiped. */
   refreshTokenExpiresAt?: number
-  /** Set once, when authentication is first found failing; cleared by a login
-   *  or by authentication working again. */
+  /** Which refresh token the record describes: a truncated SHA-256, never the
+   *  token. A different one on disk means the credential changed hands. */
+  refreshTokenId?: string
+  /** When authentication was first found failing; cleared by a new grant or a
+   *  renewal that works. */
   firstUnauthedAt?: number
   unauthedReason?: UnauthedReason
   events: AuthLifecycleEvent[]
-  /** The latest exchanges, kept apart from `events` so frequent renewals never push a login out. */
-  renewals?: AuthRenewal[]
 }
 
 export interface AuthLifecycleUpdate {
@@ -119,29 +84,19 @@ export interface AuthLifecycleUpdate {
   changed: boolean
 }
 
+/** Identifies a refresh token without storing anything that could be used as one. */
+export function refreshTokenId(token: string | undefined): string | undefined {
+  return token ? createHash("sha256").update(token).digest("hex").slice(0, 16) : undefined
+}
+
 // --- Pure ------------------------------------------------------------------
 
 function finiteTime(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined
+  return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 8.64e15 ? value : undefined
 }
 
-const EVENT_KINDS: ReadonlySet<string> = new Set(["login", "new_grant", "deadline_moved", "logged_out", "recovered"])
-const REASONS: ReadonlySet<string> = new Set(["refresh_rejected", "credentials_cleared", "api_rejected"])
-const RENEWAL_OUTCOMES: ReadonlySet<string> = new Set(["rotated", "kept", "refused", "unverified"])
-
-function readRenewal(raw: unknown): AuthRenewal | null {
-  if (typeof raw !== "object" || raw === null) return null
-  const r = raw as Record<string, unknown>
-  const at = finiteTime(r.at)
-  if (!at || typeof r.outcome !== "string" || !RENEWAL_OUTCOMES.has(r.outcome)) return null
-  const renewal: AuthRenewal = { at, outcome: r.outcome as AuthRenewalOutcome }
-  if (typeof r.detail === "string" && r.detail.length <= 64) renewal.detail = r.detail
-  const issued = finiteTime(r.issuedAt)
-  if (issued) renewal.issuedAt = issued
-  const expires = finiteTime(r.expiresAt)
-  if (expires) renewal.expiresAt = expires
-  return renewal
-}
+const EVENT_KINDS: ReadonlySet<string> = new Set(["login", "new_grant", "credential_replaced", "deadline_moved", "logged_out", "recovered"])
+const REASONS: ReadonlySet<string> = new Set(["refresh_rejected", "credentials_cleared"])
 
 function readEvent(raw: unknown): AuthLifecycleEvent | null {
   if (typeof raw !== "object" || raw === null) return null
@@ -154,15 +109,11 @@ function readEvent(raw: unknown): AuthLifecycleEvent | null {
   const previous = finiteTime(e.previousRefreshTokenExpiresAt)
   if (previous) event.previousRefreshTokenExpiresAt = previous
   if (typeof e.reason === "string" && REASONS.has(e.reason)) event.reason = e.reason as UnauthedReason
-  if (typeof e.detail === "string" && e.detail.length <= 64) event.detail = e.detail
+  if (typeof e.detail === "string" && /^[a-z_]{1,40}$/.test(e.detail)) event.detail = e.detail
   return event
 }
 
-/**
- * Read a record map out of whatever the file holds. Hand-editable and written
- * by other versions, so anything malformed is dropped field by field rather
- * than failing the whole file.
- */
+/** Hand-editable and written by other versions: malformed fields are dropped one by one. */
 export function readAuthLifecycles(raw: unknown): Record<string, AuthLifecycleRecord> {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {}
   const out: Record<string, AuthLifecycleRecord> = {}
@@ -175,13 +126,12 @@ export function readAuthLifecycles(raw: unknown): Record<string, AuthLifecycleRe
     if (r.authObtainedVia === "login" || r.authObtainedVia === "observed") record.authObtainedVia = r.authObtainedVia
     const refreshed = finiteTime(r.lastRefreshAt)
     if (refreshed) record.lastRefreshAt = refreshed
-    const accepted = finiteTime(r.lastAcceptedAt)
-    if (accepted) record.lastAcceptedAt = accepted
     const deadline = finiteTime(r.refreshTokenExpiresAt)
     if (deadline) record.refreshTokenExpiresAt = deadline
+    if (typeof r.refreshTokenId === "string" && /^[0-9a-f]{16}$/.test(r.refreshTokenId)) record.refreshTokenId = r.refreshTokenId
     const unauthed = finiteTime(r.firstUnauthedAt)
-    if (unauthed) record.firstUnauthedAt = unauthed
-    if (typeof r.unauthedReason === "string" && REASONS.has(r.unauthedReason)) {
+    if (unauthed && typeof r.unauthedReason === "string" && REASONS.has(r.unauthedReason)) {
+      record.firstUnauthedAt = unauthed
       record.unauthedReason = r.unauthedReason as UnauthedReason
     }
     if (Array.isArray(r.events)) {
@@ -191,30 +141,18 @@ export function readAuthLifecycles(raw: unknown): Record<string, AuthLifecycleRe
       }
       record.events = record.events.slice(-MAX_AUTH_LIFECYCLE_EVENTS)
     }
-    if (Array.isArray(r.renewals)) {
-      const renewals = r.renewals.map(readRenewal).filter((renewal): renewal is AuthRenewal => renewal !== null)
-      if (renewals.length > 0) record.renewals = renewals.slice(-MAX_AUTH_RENEWALS)
-    }
     out[key] = record
   }
   return out
 }
 
-function emptyRecord(): AuthLifecycleRecord {
-  return { events: [] }
+const unchanged = (record: AuthLifecycleRecord): AuthLifecycleUpdate => ({ record, events: [], changed: false })
+
+function withEvent(record: AuthLifecycleRecord, event: AuthLifecycleEvent): AuthLifecycleUpdate {
+  return { record: { ...record, events: [...record.events, event].slice(-MAX_AUTH_LIFECYCLE_EVENTS) }, events: [event], changed: true }
 }
 
-function withEvents(record: AuthLifecycleRecord, events: AuthLifecycleEvent[]): AuthLifecycleRecord {
-  if (events.length === 0) return record
-  return { ...record, events: [...record.events, ...events].slice(-MAX_AUTH_LIFECYCLE_EVENTS) }
-}
-
-function withRenewal(record: AuthLifecycleRecord, at: number, renewal: Omit<AuthRenewal, "at"> | undefined): AuthLifecycleRecord {
-  if (!renewal) return record
-  return { ...record, renewals: [...(record.renewals ?? []), { at, ...renewal }].slice(-MAX_AUTH_RENEWALS) }
-}
-
-function markLoggedIn(record: AuthLifecycleRecord): AuthLifecycleRecord {
+function withoutLogout(record: AuthLifecycleRecord): AuthLifecycleRecord {
   const next = { ...record }
   delete next.firstUnauthedAt
   delete next.unauthedReason
@@ -222,145 +160,170 @@ function markLoggedIn(record: AuthLifecycleRecord): AuthLifecycleRecord {
 }
 
 /**
- * Fold a newly read deadline into the record.
- *
- * A deadline that jumps forward is a different login: refreshing never moves
- * it. Unless Meridian recorded that login itself, whoever ran it did so
- * elsewhere, and the record learns about it here — late, which is what
- * `authObtainedVia: "observed"` says.
+ * A different grant from the one on record: everything that described the
+ * old one goes, history excepted. Fields left out stay unknown.
  */
-function applyDeadline(record: AuthLifecycleRecord, deadline: number | undefined, at: number): AuthLifecycleUpdate {
-  if (!deadline || deadline === record.refreshTokenExpiresAt) return { record, events: [], changed: false }
-  const previous = record.refreshTokenExpiresAt
-  if (!previous) return { record: { ...record, refreshTokenExpiresAt: deadline }, events: [], changed: true }
-  // The same login, read a second apart through a cached and a fresh path.
-  if (Math.abs(deadline - previous) <= DEADLINE_TOLERANCE_MS) return { record, events: [], changed: false }
-  if (deadline - previous >= NEW_GRANT_MIN_JUMP_MS) {
-    const event: AuthLifecycleEvent = { at, kind: "new_grant", refreshTokenExpiresAt: deadline, previousRefreshTokenExpiresAt: previous }
-    const next: AuthLifecycleRecord = {
-      ...markLoggedIn(record),
-      refreshTokenExpiresAt: deadline,
-      authObtainedAt: at,
-      authObtainedVia: "observed",
-    }
-    return { record: withEvents(next, [event]), events: [event], changed: true }
-  }
-  const event: AuthLifecycleEvent = { at, kind: "deadline_moved", refreshTokenExpiresAt: deadline, previousRefreshTokenExpiresAt: previous }
-  return { record: withEvents({ ...record, refreshTokenExpiresAt: deadline }, [event]), events: [event], changed: true }
+function startGrant(
+  record: AuthLifecycleRecord,
+  grant: Pick<AuthLifecycleRecord, "authObtainedAt" | "authObtainedVia" | "refreshTokenExpiresAt" | "refreshTokenId">,
+): AuthLifecycleRecord {
+  const next: AuthLifecycleRecord = { events: record.events }
+  if (grant.authObtainedAt) next.authObtainedAt = grant.authObtainedAt
+  if (grant.authObtainedVia) next.authObtainedVia = grant.authObtainedVia
+  if (grant.refreshTokenExpiresAt) next.refreshTokenExpiresAt = grant.refreshTokenExpiresAt
+  if (grant.refreshTokenId) next.refreshTokenId = grant.refreshTokenId
+  return next
 }
 
-/** Meridian completed an interactive login. */
-export function applyLogin(
-  prev: AuthLifecycleRecord | undefined,
-  input: { at: number; refreshTokenExpiresAt?: number },
-): AuthLifecycleUpdate {
-  const event: AuthLifecycleEvent = { at: input.at, kind: "login" }
-  if (input.refreshTokenExpiresAt) event.refreshTokenExpiresAt = input.refreshTokenExpiresAt
-  const next: AuthLifecycleRecord = {
-    ...markLoggedIn(prev ?? emptyRecord()),
-    authObtainedAt: input.at,
-    authObtainedVia: "login",
-  }
-  // The old deadline belongs to the old login. Unknown beats wrong: the first
-  // refresh reports the new one.
-  if (input.refreshTokenExpiresAt) next.refreshTokenExpiresAt = input.refreshTokenExpiresAt
-  else delete next.refreshTokenExpiresAt
-  return { record: withEvents(next, [event]), events: [event], changed: true }
-}
-
-/** A refresh succeeded; `refreshTokenExpiresAt` is what it reported, if anything. */
-export function applyRefreshSucceeded(
-  prev: AuthLifecycleRecord | undefined,
-  input: { at: number; refreshTokenExpiresAt?: number; renewal?: Omit<AuthRenewal, "at"> },
-): AuthLifecycleUpdate {
-  const base = withRenewal(prev ?? emptyRecord(), input.at, input.renewal)
-  const deadline = applyDeadline({ ...base, lastRefreshAt: input.at }, input.refreshTokenExpiresAt, input.at)
-  let record = deadline.record
-  const events = [...deadline.events]
-  // A refused refresh token never works again, so success after a recorded
-  // logout means a login nobody recorded — or that the refusal was not one.
-  if (record.firstUnauthedAt) {
-    const event: AuthLifecycleEvent = { at: input.at, kind: "recovered" }
-    if (record.refreshTokenExpiresAt) event.refreshTokenExpiresAt = record.refreshTokenExpiresAt
-    if (record.unauthedReason === "api_rejected") event.detail = "renewed after its access token was refused"
-    record = withEvents(markLoggedIn(record), [event])
-    events.push(event)
-  }
-  return { record, events, changed: true }
-}
-
-/** The token endpoint refused the refresh token. Recorded once per logout. */
-export function applyRefreshRejected(
-  prev: AuthLifecycleRecord | undefined,
-  input: { at: number; detail?: string; renewal?: Omit<AuthRenewal, "at"> },
-): AuthLifecycleUpdate {
-  const base = withRenewal(prev ?? emptyRecord(), input.at, input.renewal)
-  if (base.firstUnauthedAt && base.unauthedReason === "refresh_rejected") return { record: base, events: [], changed: input.renewal !== undefined }
-  return markLoggedOut(base, input.at, "refresh_rejected", input.detail)
-}
-
-export function applyApiRejected(
-  prev: AuthLifecycleRecord | undefined,
-  input: { at: number; startedAt: number },
-): AuthLifecycleUpdate {
-  const base = prev ?? emptyRecord()
-  if (base.firstUnauthedAt || Math.max(base.authObtainedAt ?? 0, base.lastRefreshAt ?? 0, base.lastAcceptedAt ?? 0) > input.startedAt) {
-    return { record: base, events: [], changed: false }
-  }
-  return markLoggedOut(base, input.at, "api_rejected")
-}
-
-export function applyProviderAccepted(
-  prev: AuthLifecycleRecord | undefined,
-  input: { at: number; startedAt: number },
-): AuthLifecycleUpdate {
-  const base = prev ?? emptyRecord()
-  if (base.unauthedReason !== "api_rejected" || input.startedAt <= (base.firstUnauthedAt ?? 0)) {
-    return { record: base, events: [], changed: false }
-  }
-  const event: AuthLifecycleEvent = { at: input.at, kind: "recovered" }
-  return { record: withEvents({ ...markLoggedIn(base), lastAcceptedAt: input.startedAt }, [event]), events: [event], changed: true }
+function sameDeadline(a: number | undefined, b: number | undefined): boolean {
+  return a !== undefined && b !== undefined && Math.abs(a - b) <= DEADLINE_TOLERANCE_MS
 }
 
 function markLoggedOut(record: AuthLifecycleRecord, at: number, reason: UnauthedReason, detail?: string): AuthLifecycleUpdate {
   const event: AuthLifecycleEvent = { at, kind: "logged_out", reason }
   if (record.refreshTokenExpiresAt) event.refreshTokenExpiresAt = record.refreshTokenExpiresAt
   if (detail) event.detail = detail
-  const next = withEvents({ ...record, firstUnauthedAt: record.firstUnauthedAt ?? at, unauthedReason: reason }, [event])
-  return { record: next, events: [event], changed: true }
+  return withEvent({ ...record, firstUnauthedAt: at, unauthedReason: reason }, event)
+}
+
+function markRecovered(record: AuthLifecycleRecord, at: number): AuthLifecycleUpdate {
+  const event: AuthLifecycleEvent = { at, kind: "recovered" }
+  if (record.refreshTokenExpiresAt) event.refreshTokenExpiresAt = record.refreshTokenExpiresAt
+  return withEvent(withoutLogout(record), event)
+}
+
+/** Meridian completed an interactive login: a new grant, nothing of the old one kept. */
+export function applyLogin(
+  prev: AuthLifecycleRecord | undefined,
+  input: { at: number; refreshTokenExpiresAt?: number; refreshTokenId?: string },
+): AuthLifecycleUpdate {
+  const record = startGrant(prev ?? { events: [] }, {
+    authObtainedAt: input.at,
+    authObtainedVia: "login",
+    refreshTokenExpiresAt: input.refreshTokenExpiresAt,
+    refreshTokenId: input.refreshTokenId,
+  })
+  const event: AuthLifecycleEvent = { at: input.at, kind: "login" }
+  if (input.refreshTokenExpiresAt) event.refreshTokenExpiresAt = input.refreshTokenExpiresAt
+  return withEvent(record, event)
 }
 
 /**
- * What a read of the credential showed.
+ * What a successful read of the stored credential showed. Callers pass
+ * `unknown` for a read that failed, which changes nothing.
  *
- * `presence` is tokenRefresh's three-way answer, and only `absent` — read fine,
- * no access token — counts as a logout. `unknown` is a read that failed, which
- * must never log out an account that is working.
+ * The refresh token tells the cases apart. The same one is the same grant. A
+ * different one with the same deadline is the same grant rotated by another
+ * process (two logins land on one deadline only when they happen within the
+ * tolerance of each other). A different one with a different deadline, in
+ * either direction, is a new login. Where the token or a deadline is unknown
+ * on one side and what is known differs, it could be either: the old grant's
+ * facts are dropped and its login time stays unknown rather than wrong.
  */
 export function applyObservation(
   prev: AuthLifecycleRecord | undefined,
-  input: { at: number; presence: "present" | "absent" | "unknown"; refreshTokenExpiresAt?: number },
+  input: { at: number; presence: "present" | "absent" | "unknown"; refreshTokenExpiresAt?: number; refreshTokenId?: string },
 ): AuthLifecycleUpdate {
-  const base = prev ?? emptyRecord()
-  if (input.presence === "unknown") return { record: base, events: [], changed: false }
+  const base = prev ?? { events: [] }
+  if (input.presence === "unknown") return unchanged(base)
   if (input.presence === "absent") {
-    if (base.firstUnauthedAt) return { record: base, events: [], changed: false }
-    return markLoggedOut(base, input.at, "credentials_cleared")
+    return base.firstUnauthedAt ? unchanged(base) : markLoggedOut(base, input.at, "credentials_cleared")
   }
-  const deadline = applyDeadline(base, input.refreshTokenExpiresAt, input.at)
-  // A wiped credential only comes back through a login. A refused one can sit
-  // on disk with a working access token for hours, so that case waits for a
-  // refresh or a new deadline instead.
-  if (deadline.record.firstUnauthedAt && deadline.record.unauthedReason === "credentials_cleared") {
-    const event: AuthLifecycleEvent = { at: input.at, kind: "new_grant" }
-    if (deadline.record.refreshTokenExpiresAt) event.refreshTokenExpiresAt = deadline.record.refreshTokenExpiresAt
-    const record = withEvents(
-      { ...markLoggedIn(deadline.record), authObtainedAt: input.at, authObtainedVia: "observed" },
-      [event],
-    )
-    return { record, events: [...deadline.events, event], changed: true }
+
+  const id = input.refreshTokenId
+  const previousId = base.refreshTokenId
+  const deadline = input.refreshTokenExpiresAt
+  const previousDeadline = base.refreshTokenExpiresAt
+  const tokenChanged = Boolean(id && previousId && id !== previousId)
+  const tokenSame = Boolean(id && id === previousId)
+  const deadlineKept = sameDeadline(deadline, previousDeadline)
+  const deadlineChanged = Boolean(deadline && previousDeadline && !deadlineKept)
+
+  if (tokenChanged && deadlineChanged) {
+    const event: AuthLifecycleEvent = { at: input.at, kind: "new_grant", refreshTokenExpiresAt: deadline, previousRefreshTokenExpiresAt: previousDeadline }
+    return withEvent(startGrant(base, { authObtainedAt: input.at, authObtainedVia: "observed", refreshTokenExpiresAt: deadline, refreshTokenId: id }), event)
   }
-  return deadline
+  if ((tokenChanged && !deadlineKept) || (!tokenSame && deadlineChanged)) {
+    const event: AuthLifecycleEvent = { at: input.at, kind: "credential_replaced" }
+    if (deadline) event.refreshTokenExpiresAt = deadline
+    return withEvent(startGrant(base, { refreshTokenExpiresAt: deadline, refreshTokenId: id }), event)
+  }
+
+  // The same grant: the same token, a rotation of it, or nothing known that differs.
+  let record = base
+  const events: AuthLifecycleEvent[] = []
+  let changed = false
+  if (id && id !== previousId) {
+    record = { ...record, refreshTokenId: id }
+    changed = true
+  }
+  if (deadline && !deadlineKept) {
+    if (previousDeadline) {
+      events.push({ at: input.at, kind: "deadline_moved", refreshTokenExpiresAt: deadline, previousRefreshTokenExpiresAt: previousDeadline })
+    }
+    record = { ...record, refreshTokenExpiresAt: deadline, events: [...record.events, ...events].slice(-MAX_AUTH_LIFECYCLE_EVENTS) }
+    changed = true
+  }
+  // A wiped credential back on disk, or a refused refresh token rotated into a
+  // working one, can authenticate again. A refused token still on disk stays
+  // refused: its access token can keep serving for hours after the refusal.
+  if (record.unauthedReason === "credentials_cleared" || (record.unauthedReason === "refresh_rejected" && tokenChanged)) {
+    const recovered = markRecovered(record, input.at)
+    return { record: recovered.record, events: [...events, ...recovered.events], changed: true }
+  }
+  return { record, events, changed }
+}
+
+/** Meridian renewed the grant it holds. */
+export function applyRefreshSucceeded(
+  prev: AuthLifecycleRecord | undefined,
+  input: { at: number; refreshTokenExpiresAt?: number; refreshTokenId?: string },
+): AuthLifecycleUpdate {
+  const base = prev ?? { events: [] }
+  let record: AuthLifecycleRecord = { ...base, lastRefreshAt: input.at }
+  if (input.refreshTokenId) record.refreshTokenId = input.refreshTokenId
+  const events: AuthLifecycleEvent[] = []
+  const deadline = input.refreshTokenExpiresAt
+  if (deadline && !sameDeadline(deadline, base.refreshTokenExpiresAt)) {
+    if (base.refreshTokenExpiresAt) {
+      const event: AuthLifecycleEvent = { at: input.at, kind: "deadline_moved", refreshTokenExpiresAt: deadline, previousRefreshTokenExpiresAt: base.refreshTokenExpiresAt }
+      record = { ...record, events: [...record.events, event].slice(-MAX_AUTH_LIFECYCLE_EVENTS) }
+      events.push(event)
+    }
+    record.refreshTokenExpiresAt = deadline
+  }
+  // A refused refresh token never works again, so this one was not refused.
+  if (record.firstUnauthedAt) {
+    const recovered = markRecovered(record, input.at)
+    return { record: recovered.record, events: [...events, ...recovered.events], changed: true }
+  }
+  return { record, events, changed: true }
+}
+
+/** The token endpoint answered `invalid_grant` for the refresh token on record. */
+export function applyRefreshRejected(
+  prev: AuthLifecycleRecord | undefined,
+  input: { at: number; detail?: string; refreshTokenId?: string },
+): AuthLifecycleUpdate {
+  const base = prev ?? { events: [] }
+  if (input.refreshTokenId && base.refreshTokenId && input.refreshTokenId !== base.refreshTokenId) return unchanged(base)
+  if (base.firstUnauthedAt) return unchanged(base)
+  return markLoggedOut(base, input.at, "refresh_rejected", input.detail)
+}
+
+/**
+ * Whether the record says this account can no longer authenticate. A refused
+ * refresh only ends service when the access token it left behind runs out;
+ * until then the account serves and the refusal is a countdown.
+ */
+export function authLifecycleLoggedOut(
+  record: AuthLifecycleRecord | undefined,
+  accessTokenExpiresAt: number | undefined,
+  now: number,
+): boolean {
+  if (!record?.firstUnauthedAt) return false
+  if (record.unauthedReason !== "refresh_rejected") return true
+  return !accessTokenExpiresAt || accessTokenExpiresAt <= now
 }
 
 // --- Describing -------------------------------------------------------------
@@ -382,31 +345,32 @@ export function formatSpan(ms: number): string {
   return `${sign}${minutes}m`
 }
 
-/** One log line per transition, naming everything the analysis needs. */
-export function describeAuthLifecycleEvent(event: AuthLifecycleEvent, record: AuthLifecycleRecord): string {
+/** One log line per transition. `record` is the state before it. */
+export function describeAuthLifecycleEvent(event: AuthLifecycleEvent, record: AuthLifecycleRecord | undefined): string {
   const deadline = event.refreshTokenExpiresAt
   switch (event.kind) {
     case "login":
       return deadline
-        ? `logged in; the login lasts until ${iso(deadline)} (${formatSpan(deadline - event.at)})`
-        : "logged in; the login deadline arrives with the first refresh"
+        ? `logged in; the refresh deadline is ${iso(deadline)} (in ${formatSpan(deadline - event.at)})`
+        : "logged in; the refresh deadline arrives with the first refresh"
     case "new_grant":
-      return `found a new login on disk; it lasts until ${iso(deadline)}`
-        + (event.previousRefreshTokenExpiresAt ? ` (the previous one ended ${iso(event.previousRefreshTokenExpiresAt)})` : "")
+      return `found a new login on disk; its refresh deadline is ${iso(deadline)}`
+        + (event.previousRefreshTokenExpiresAt ? ` (the previous one was ${iso(event.previousRefreshTokenExpiresAt)})` : "")
+    case "credential_replaced":
+      return "found a different credential on disk; when its login happened is unknown"
     case "deadline_moved":
-      return `login deadline moved from ${iso(event.previousRefreshTokenExpiresAt)} to ${iso(deadline)} without a new login`
+      return `refresh deadline moved from ${iso(event.previousRefreshTokenExpiresAt)} to ${iso(deadline)} without a new login`
     case "recovered":
       return "authenticating again"
     case "logged_out": {
       const why = event.reason === "credentials_cleared"
-        ? "the credential was wiped"
-        : event.reason === "api_rejected" ? "upstream refused authentication after recovery"
+        ? "the stored credential has no access token"
         : `the refresh was refused${event.detail ? ` (${event.detail})` : ""}`
       const parts = [`logged out: ${why}`]
       parts.push(deadline
-        ? `login deadline ${iso(deadline)} (${deadline <= event.at ? `${formatSpan(event.at - deadline)} ago` : `${formatSpan(deadline - event.at)} early`})`
-        : "login deadline unknown")
-      if (record.authObtainedAt) parts.push(`logged in ${formatSpan(event.at - record.authObtainedAt)} earlier`)
+        ? `refresh deadline ${iso(deadline)} (${deadline <= event.at ? `${formatSpan(event.at - deadline)} ago` : `${formatSpan(deadline - event.at)} early`})`
+        : "refresh deadline unknown")
+      if (record?.authObtainedAt) parts.push(`logged in ${formatSpan(event.at - record.authObtainedAt)} earlier`)
       return parts.join("; ")
     }
   }
@@ -418,7 +382,9 @@ function lifecycleFile(): string {
   return configPath("auth-lifecycle.json")
 }
 
-/** Every record on file, keyed by credential identity. */
+const BUSY = "auth-lifecycle.json is locked by another writer. An interrupted writer's lock requires cleanup while all Meridian processes are stopped."
+
+/** Every record on file, for display. Never used to write. */
 export function authLifecycles(): Record<string, AuthLifecycleRecord> {
   const file = lifecycleFile()
   try {
@@ -433,23 +399,21 @@ export function authLifecycleFor(key: string | undefined): AuthLifecycleRecord |
   return key ? authLifecycles()[key] : undefined
 }
 
-function writeAuthLifecycles(records: Record<string, AuthLifecycleRecord>): void {
-  const file = lifecycleFile()
-  // Written whole and renamed into place: the server and a `meridian profile
-  // login` in another process both write it, and neither may read half a file.
-  const tmp = `${file}.${process.pid}.tmp`
-  try {
-    mkdirSync(dirname(file), { recursive: true })
-    writeFileSync(tmp, JSON.stringify(records, null, 2) + "\n", { mode: 0o600 })
-    renameSync(tmp, file)
-  } catch (err) {
-    console.warn(`[meridian] Failed to write ${file}: ${err instanceof Error ? err.message : err}`)
-  }
+/** Under the writer lock. A file that cannot be parsed throws, so a writer never replaces history it could not read. */
+function readForUpdate(file: string): Record<string, AuthLifecycleRecord> {
+  if (!existsSync(file)) return {}
+  return readAuthLifecycles(JSON.parse(readFileSync(file, "utf-8")))
+}
+
+function publish(file: string, records: Record<string, AuthLifecycleRecord>): void {
+  publishFileSnapshot(file, JSON.stringify(records, null, 2) + "\n")
 }
 
 export interface AuthLifecycleTransition {
   key: string
   event: AuthLifecycleEvent
+  /** The record before the transition. */
+  previous: AuthLifecycleRecord | undefined
   record: AuthLifecycleRecord
 }
 
@@ -464,72 +428,206 @@ export function onAuthLifecycleTransition(listener: TransitionListener): () => v
   }
 }
 
-function update(
-  key: string | undefined,
-  apply: (prev: AuthLifecycleRecord | undefined) => AuthLifecycleUpdate,
-): AuthLifecycleRecord | undefined {
-  if (!key) return undefined
-  const records = authLifecycles()
-  const result = apply(records[key])
-  if (!result.changed) return records[key]
-  records[key] = result.record
-  writeAuthLifecycles(records)
+function announce(key: string, previous: AuthLifecycleRecord | undefined, result: AuthLifecycleUpdate): void {
   for (const event of result.events) {
     for (const listener of listeners) {
       try {
-        listener({ key, event, record: result.record })
-      } catch {
+        listener({ key, event, previous, record: result.record })
+      } catch (err) {
         // A listener is a log line; it must never fail the refresh it reports.
+        console.warn(`[meridian] Auth lifecycle listener failed: ${err instanceof Error ? err.message : err}`)
       }
     }
   }
+}
+
+function warnUnwritten(err: unknown): void {
+  console.warn(`[meridian] Login history not updated: ${err instanceof Error ? err.message : err}`)
+}
+
+/**
+ * Read, apply and publish under one cross-process lock, so a transition
+ * another process (the server, `meridian profile login`) wrote in the meantime
+ * is never overwritten with a stale copy. A failed lock or read leaves the file
+ * as it was and returns the record as last read. Never rejects.
+ */
+async function update(
+  key: string | undefined,
+  apply: (prev: AuthLifecycleRecord | undefined) => AuthLifecycleUpdate,
+): Promise<AuthLifecycleRecord | undefined> {
+  if (!key) return undefined
+  const file = lifecycleFile()
+  let previous: AuthLifecycleRecord | undefined
+  let result: AuthLifecycleUpdate
+  try {
+    // Most reads change nothing (every page poll observes every profile), and
+    // they need no lock: nothing is written, so nothing can be lost.
+    const seen = authLifecycleFor(key)
+    if (!apply(seen).changed) return seen
+    result = await withFileLock(file, BUSY, () => {
+      const records = readForUpdate(file)
+      previous = records[key]
+      const next = apply(previous)
+      if (next.changed) publish(file, { ...records, [key]: next.record })
+      return next
+    })
+  } catch (err) {
+    warnUnwritten(err)
+    return authLifecycleFor(key)
+  }
+  announce(key, previous, result)
   return result.record
 }
 
-export function noteAuthLogin(key: string | undefined, input: { refreshTokenExpiresAt?: number; at?: number } = {}): void {
-  update(key, prev => applyLogin(prev, { at: input.at ?? Date.now(), refreshTokenExpiresAt: input.refreshTokenExpiresAt }))
+// Request paths (a token refresh, a /profiles/list read) hand their history
+// writes to this queue instead of awaiting them: the file lock fails closed,
+// so a lock left by an interrupted writer would otherwise stall every one of
+// them for the full lock wait. One write at a time, in order.
+let queue: Promise<unknown> = Promise.resolve()
+const queuedObservations = new Set<string>()
+
+function enqueue(write: () => Promise<unknown>): void {
+  queue = queue.then(write).catch(warnUnwritten)
+}
+
+/** Resolves once every queued history write has finished. */
+export async function settleAuthLifecycleWrites(): Promise<void> {
+  await queue
+}
+
+/** Queue `write` without awaiting it; the history is best-effort. */
+export function recordInBackground(write: () => Promise<unknown>): void {
+  enqueue(write)
+}
+
+export function noteAuthLogin(
+  key: string | undefined,
+  input: { refreshTokenExpiresAt?: number; refreshToken?: string; at?: number } = {},
+): Promise<AuthLifecycleRecord | undefined> {
+  return update(key, prev => applyLogin(prev, {
+    at: input.at ?? Date.now(),
+    refreshTokenExpiresAt: input.refreshTokenExpiresAt,
+    refreshTokenId: refreshTokenId(input.refreshToken),
+  }))
 }
 
 export function noteRefreshSucceeded(
   key: string | undefined,
-  input: { refreshTokenExpiresAt?: number; at?: number; renewal?: Omit<AuthRenewal, "at"> } = {},
-): void {
-  update(key, prev => applyRefreshSucceeded(prev, { at: input.at ?? Date.now(), refreshTokenExpiresAt: input.refreshTokenExpiresAt, renewal: input.renewal }))
+  input: { refreshTokenExpiresAt?: number; refreshToken?: string; at?: number } = {},
+): Promise<AuthLifecycleRecord | undefined> {
+  return update(key, prev => applyRefreshSucceeded(prev, {
+    at: input.at ?? Date.now(),
+    refreshTokenExpiresAt: input.refreshTokenExpiresAt,
+    refreshTokenId: refreshTokenId(input.refreshToken),
+  }))
 }
 
-export function noteRefreshRejected(key: string | undefined, input: { detail?: string; at?: number; renewal?: Omit<AuthRenewal, "at"> } = {}): void {
-  update(key, prev => applyRefreshRejected(prev, { at: input.at ?? Date.now(), detail: input.detail, renewal: input.renewal }))
-}
-
-export function noteApiRejected(key: string | undefined, input: { startedAt: number; at?: number }): void {
-  update(key, prev => applyApiRejected(prev, { at: input.at ?? Date.now(), startedAt: input.startedAt }))
-}
-
-export function noteProviderAccepted(key: string | undefined, input: { startedAt: number; at?: number }): void {
-  update(key, prev => applyProviderAccepted(prev, { at: input.at ?? Date.now(), startedAt: input.startedAt }))
+export function noteRefreshRejected(
+  key: string | undefined,
+  input: { detail?: string; refreshToken?: string; at?: number } = {},
+): Promise<AuthLifecycleRecord | undefined> {
+  return update(key, prev => applyRefreshRejected(prev, {
+    at: input.at ?? Date.now(),
+    detail: input.detail,
+    refreshTokenId: refreshTokenId(input.refreshToken),
+  }))
 }
 
 /** Returns the record as it stands after the observation. */
 export function noteCredentialObserved(
   key: string | undefined,
-  input: { presence: "present" | "absent" | "unknown"; refreshTokenExpiresAt?: number; at?: number },
-): AuthLifecycleRecord | undefined {
-  return update(key, prev => applyObservation(prev, {
-    at: input.at ?? Date.now(),
-    presence: input.presence,
-    refreshTokenExpiresAt: input.refreshTokenExpiresAt,
-  }))
+  input: { presence: "present" | "absent" | "unknown"; refreshTokenExpiresAt?: number; refreshTokenId?: string; at?: number },
+): Promise<AuthLifecycleRecord | undefined> {
+  if (input.presence === "unknown") return Promise.resolve(authLifecycleFor(key))
+  return update(key, observation({ ...input, presence: input.presence }))
 }
 
-/** Carry a record across a profile rename that moved its credentials. */
+function observation(
+  input: { presence: "present" | "absent"; refreshTokenExpiresAt?: number; refreshTokenId?: string; at?: number },
+): (prev: AuthLifecycleRecord | undefined) => AuthLifecycleUpdate {
+  const at = input.at ?? Date.now()
+  return prev => applyObservation(prev, {
+    at,
+    presence: input.presence,
+    refreshTokenExpiresAt: input.refreshTokenExpiresAt,
+    refreshTokenId: input.refreshTokenId,
+  })
+}
+
+/**
+ * The record this observation leads to, without waiting for it to be written:
+ * the write is queued. A request that reads the history must not wait on the
+ * history file's lock.
+ */
+export function observeCredentialInBackground(
+  key: string | undefined,
+  input: { presence: "present" | "absent" | "unknown"; refreshTokenExpiresAt?: number; refreshTokenId?: string; at?: number },
+): AuthLifecycleRecord | undefined {
+  if (!key) return undefined
+  const seen = authLifecycleFor(key)
+  if (input.presence === "unknown") return seen
+  const apply = observation({ ...input, presence: input.presence })
+  let next: AuthLifecycleUpdate
+  try {
+    next = apply(seen)
+  } catch (err) {
+    warnUnwritten(err)
+    return seen
+  }
+  if (!next.changed) return seen
+  // Every poll repeats the same observation while a write is pending.
+  if (!queuedObservations.has(key)) {
+    queuedObservations.add(key)
+    enqueue(async () => {
+      try { await update(key, apply) }
+      finally { queuedObservations.delete(key) }
+    })
+  }
+  return next.record
+}
+
+/**
+ * Carry a record across a profile rename that moved its credentials. Runs
+ * inside the synchronous rename, so it waits for the lock synchronously.
+ */
 export function renameAuthLifecycleKey(from: string | undefined, to: string | undefined): void {
   if (!from || !to || from === to) return
-  const records = authLifecycles()
-  const record = records[from]
-  if (!record) return
-  delete records[from]
-  records[to] = record
-  writeAuthLifecycles(records)
+  const file = lifecycleFile()
+  try {
+    withFileLockSync(file, BUSY, () => {
+      const records = readForUpdate(file)
+      const record = records[from]
+      if (!record) return
+      delete records[from]
+      records[to] = record
+      publish(file, records)
+    })
+  } catch (err) {
+    warnUnwritten(err)
+  }
+}
+
+/**
+ * Forget the records of credentials that no longer exist, such as a removed
+ * profile's. Runs inside the synchronous removal, so it waits for the lock
+ * synchronously; a busy lock leaves the records for the next removal.
+ */
+export function removeAuthLifecycleKeys(keys: readonly (string | undefined)[]): void {
+  const doomed = keys.filter((key): key is string => typeof key === "string" && key.length > 0)
+  if (doomed.length === 0) return
+  const file = lifecycleFile()
+  try {
+    if (!existsSync(file)) return
+    withFileLockSync(file, BUSY, () => {
+      const records = readForUpdate(file)
+      const present = doomed.filter(key => key in records)
+      if (present.length === 0) return
+      for (const key of present) delete records[key]
+      publish(file, records)
+    })
+  } catch (err) {
+    warnUnwritten(err)
+  }
 }
 
 /** Drop every listener — for tests. */

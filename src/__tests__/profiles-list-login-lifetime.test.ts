@@ -71,8 +71,9 @@ describe("/profiles/list login lifetime", () => {
   test.skipIf(process.platform === "darwin")("a healthy configured default is not reconciled against a dead active account", async () => {
     const now = Date.now()
     const alive = profileDir("configured-default", { accessToken: "present", expiresAt: now + HOUR })
-    const dead = profileDir("configured-dead", { accessToken: "present", expiresAt: now + HOUR })
-    noteRefreshRejected(createPlatformCredentialStore({ claudeConfigDir: dead }).refreshKey, { at: now, detail: "invalid_grant" })
+    // A refused renewal ends service once the access token it left has run out.
+    const dead = profileDir("configured-dead", { accessToken: "present", expiresAt: now - 1 })
+    await noteRefreshRejected(createPlatformCredentialStore({ claudeConfigDir: dead }).refreshKey, { at: now, detail: "invalid_grant" })
     setActiveProfile("active-dead")
     try {
       const { app } = createProxyServer({ port: 0, host: "127.0.0.1", profiles: [
@@ -89,62 +90,11 @@ describe("/profiles/list login lifetime", () => {
     }
   })
 
-  for (const stream of [false, true]) {
-    test.skipIf(process.platform === "darwin")(`a terminal ${stream ? "streaming" : "non-streaming"} retry refusal is fenced against the refreshed attempt`, async () => {
-      const at = Date.now()
-      setSystemTime(at)
-      const id = `api-retry-refused-${stream}`
-      const dir = profileDir(id, { accessToken: "present", expiresAt: at + HOUR })
-      const { app } = createProxyServer({ port: 0, host: "127.0.0.1", profiles: [{ id, claudeConfigDir: dir }] })
-      queryError = "401 authentication invalid"
-      const refresh = spyOn(tokens, "refreshOAuthToken").mockImplementation(async store => {
-        setSystemTime(at + 10)
-        noteRefreshSucceeded(store?.refreshKey, { at: at + 10 })
-        return true
-      })
-      try {
-        const response = await app.fetch(new Request("http://localhost/v1/messages", {
-          method: "POST", headers: { "Content-Type": "application/json", "x-meridian-profile": id },
-          body: JSON.stringify({ model: "claude-opus-5-5", stream, max_tokens: 16, messages: [{ role: "user", content: "fixture" }] }),
-        }))
-        await response.text()
-
-        expect(authLifecycleFor(createPlatformCredentialStore({ claudeConfigDir: dir }).refreshKey)?.unauthedReason).toBe("api_rejected")
-        expect(refresh).toHaveBeenCalledTimes(1)
-      } finally {
-        refresh.mockRestore()
-        queryError = undefined
-        setSystemTime()
-      }
-    })
-
-    test.skipIf(process.platform === "darwin")(`a terminal ${stream ? "streaming" : "non-streaming"} OAuth refusal overrides later local checks`, async () => {
-      const now = Date.now()
-      const id = `api-rejected-${stream}`
-      const dir = profileDir(id, { accessToken: "still-present", expiresAt: now + HOUR, refreshTokenExpiresAt: now + HOUR })
-      const { app } = createProxyServer({ port: 0, host: "127.0.0.1", profiles: [{ id, claudeConfigDir: dir }] })
-      queryError = "Failed to authenticate: OAuth session expired"
-      try {
-        const response = await app.fetch(new Request("http://localhost/v1/messages", {
-          method: "POST", headers: { "Content-Type": "application/json", "x-meridian-profile": id },
-          body: JSON.stringify({ model: "claude-opus-4-7", stream, max_tokens: 16, messages: [{ role: "user", content: "fixture" }] }),
-        }))
-        await response.text()
-
-        const listed = await (await app.fetch(new Request("http://localhost/profiles/list"))).json()
-
-        expect(listed).toMatchObject({ profiles: [{ loggedIn: false, unauthedReason: "api_rejected" }] })
-      } finally {
-        queryError = undefined
-      }
-    })
-  }
-
-  test.skipIf(process.platform === "darwin")("a rejected grant outranks a positive local check and blocks switching", async () => {
+  test.skipIf(process.platform === "darwin")("a rejected grant whose access token ran out outranks a positive local check and blocks switching", async () => {
     const now = Date.now()
-    const dir = profileDir("rejected", { accessToken: "still-present", refreshToken: "rejected-refresh", expiresAt: now + HOUR, refreshTokenExpiresAt: now - HOUR })
+    const dir = profileDir("rejected", { accessToken: "still-present", refreshToken: "rejected-refresh", expiresAt: now - 1, refreshTokenExpiresAt: now - HOUR })
     const store = createPlatformCredentialStore({ claudeConfigDir: dir })
-    noteRefreshRejected(store.refreshKey, { at: now, detail: "invalid_grant" })
+    await noteRefreshRejected(store.refreshKey, { at: now, detail: "invalid_grant" })
     const { app } = createProxyServer({ port: 0, host: "127.0.0.1", profiles: [{ id: "rejected", claudeConfigDir: dir }] })
 
     const listed = await (await app.fetch(new Request("http://localhost/profiles/list"))).json()

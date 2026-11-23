@@ -21,7 +21,7 @@ import { homedir, platform, userInfo } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { promisify } from "node:util"
 import { claudeLog } from "../logger"
-import { authLifecycleFor, noteRefreshRejected, noteRefreshSucceeded } from "./authLifecycle"
+import { authLifecycleFor, noteRefreshRejected, noteRefreshSucceeded, recordInBackground, refreshTokenId } from "./authLifecycle"
 import { isCredentialsReadOnly, refuseCredentialWrite } from "./credentialsMode"
 import { planReadingDue, readPlanUpdate, resetPlanRecheck, runCredentialMaintenance } from "./planRecheck"
 
@@ -305,6 +305,8 @@ export interface StoredCredentialSnapshot {
   presence: StoredCredentialPresence
   refreshTokenExpiresAt?: number
   accessTokenExpiresAt?: number
+  /** Which refresh token is stored, as authLifecycle identifies it; never the token. */
+  refreshTokenId?: string
 }
 
 function validStoredExpiry(value: unknown): number | undefined {
@@ -326,6 +328,7 @@ export async function readStoredCredentialSnapshot(store: CredentialStore): Prom
     presence: typeof accessToken === "string" && accessToken.length > 0 ? "present" : "absent",
     refreshTokenExpiresAt: validStoredExpiry(oauth?.refreshTokenExpiresAt),
     accessTokenExpiresAt: validStoredExpiry(oauth?.expiresAt),
+    refreshTokenId: refreshTokenId(typeof oauth?.refreshToken === "string" ? oauth.refreshToken : undefined),
   }
 }
 
@@ -425,11 +428,11 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
   if (!response.ok) {
     const body = await response.text().catch(() => "")
     claudeLog("token_refresh.bad_response", { status: response.status, body })
-    // 400/401 is the token endpoint refusing the grant. Anything else — a
-    // throttle, an outage — says nothing about whether the login is alive.
-    if (response.status === 400 || response.status === 401) {
-      await noteRefreshRefused(store, refreshToken, response.status, body)
-    }
+    // Only RFC 6749 `invalid_grant` says the refresh token itself is no good.
+    // `invalid_request`, `invalid_client`, a throttle or an outage says nothing
+    // about whether the login is alive.
+    const code = oauthErrorCode(body)
+    if (code === "invalid_grant") recordInBackground(() => noteRefreshRefused(store, refreshToken, code))
     return false
   }
 
@@ -501,9 +504,8 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
     refreshTokenExpiresAt,
     backfilledPlan: Object.keys(planUpdate?.fields ?? {}),
   })
-  noteRefreshSucceeded(store.refreshKey, {
-    refreshTokenExpiresAt: credentials.claudeAiOauth.refreshTokenExpiresAt,
-  })
+  const { refreshTokenExpiresAt: renewedDeadline, refreshToken: renewedToken } = credentials.claudeAiOauth
+  recordInBackground(() => noteRefreshSucceeded(store.refreshKey, { refreshTokenExpiresAt: renewedDeadline, refreshToken: renewedToken }))
   return true
 }
 
@@ -527,40 +529,40 @@ export function oauthErrorCode(body: string): string | undefined {
   return typeof code === "string" && /^[a-z_]{1,40}$/.test(code) ? code : undefined
 }
 
-/** How long a Claude Code process that rotated the token first takes to write its replacement down. */
+/** How long a Claude Code process that rotated the token first may take to write its replacement down. */
 export const ROTATION_SETTLE_MS = 750
 
 /**
- * Record a refused refresh as a logout — unless the token we sent is no longer
- * the one on disk. Claude Code refreshes the same credential from its own
- * processes (`claude auth status`, the SDK itself), and a token rotated there a
- * moment earlier is refused for that reason alone: the account is fine, and
- * the next read picks up the replacement.
- *
- * That process may still be writing when the refusal arrives, so a token that
- * looks unrotated is read once more after ROTATION_SETTLE_MS. Only the first
- * refusal pays that: once a logout is on record, there is nothing to confirm.
+ * Record an `invalid_grant` as a logout only when the refused refresh token is
+ * provably still the stored one. Claude Code refreshes the same credential
+ * from its own processes, and a token rotated there a moment earlier is
+ * refused for that reason alone. The store is read twice, ROTATION_SETTLE_MS
+ * apart, because the rotating process may still be writing. A read that fails
+ * or returns nothing proves nothing, so it records nothing: unknown stays
+ * unknown.
  */
-async function noteRefreshRefused(
-  store: CredentialStore,
-  sentRefreshToken: string,
-  status: number,
-  body: string,
-): Promise<void> {
-  const detail = oauthErrorCode(body) ?? `http_${status}`
+async function noteRefreshRefused(store: CredentialStore, sentRefreshToken: string, detail: string): Promise<void> {
   if (!store.refreshKey || authLifecycleFor(store.refreshKey)?.firstUnauthedAt) return
-  const rotatedElsewhere = async (): Promise<boolean> => {
-    const onDisk = (await store.read().catch(() => null))?.claudeAiOauth?.refreshToken
-    return Boolean(onDisk) && onDisk !== sentRefreshToken
-  }
-  if (!(await rotatedElsewhere())) {
-    await new Promise(resolve => setTimeout(resolve, ROTATION_SETTLE_MS))
-    if (!(await rotatedElsewhere())) {
-      noteRefreshRejected(store.refreshKey, { detail })
-      return
+  const stillStored = async (): Promise<boolean | undefined> => {
+    let onDisk: CredentialsFile | null
+    try {
+      onDisk = await store.read()
+    } catch {
+      return undefined
     }
+    const token = onDisk?.claudeAiOauth?.refreshToken
+    return typeof token === "string" && token.length > 0 ? token === sentRefreshToken : undefined
   }
-  claudeLog("token_refresh.rotated_elsewhere", { status })
+  let verdict = await stillStored()
+  if (verdict === true) {
+    await new Promise(resolve => setTimeout(resolve, ROTATION_SETTLE_MS))
+    verdict = await stillStored()
+  }
+  if (verdict === true) {
+    await noteRefreshRejected(store.refreshKey, { detail, refreshToken: sentRefreshToken })
+    return
+  }
+  claudeLog(verdict === false ? "token_refresh.rotated_elsewhere" : "token_refresh.refusal_unverified", { detail })
 }
 
 /**

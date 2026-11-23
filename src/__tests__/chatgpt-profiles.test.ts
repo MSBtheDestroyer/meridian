@@ -156,22 +156,7 @@ describe("profile surface routing", () => {
     activeSeat: () => activeSeat, excluded: () => excluded, spent: () => undefined,
   })
 
-  it("keeps a rejected ChatGPT login out of the list and activation candidates", () => {
-    const id = `login-rejected-${process.pid}__ws-aaaaaa`
-    const s = createChatGptProfileSurface({
-      source: { ...source, seats: () => [seat(id, "rejected@example.invalid")] },
-      observed: () => new Map(), usage: () => null, reserved: () => new Set(), names: () => undefined,
-      activeSeat: () => undefined, excluded: () => [], spent: () => undefined,
-    })
-    noteRefreshRejected(chatGptAuthLifecycleKey(id), { at: NOW, detail: "rejected" })
-
-    const entry = s.listEntries()[0]
-
-    expect(entry?.loggedIn).toBe(false)
-    expect(s.activate(id)).toMatchObject({ ok: false, status: 409, code: "needs_login" })
-  })
-
-  it("keeps unauthorized usage out of activation and routing through a later transient failure", () => {
+  it("keeps unauthorized usage out of activation and routing until a reading succeeds", () => {
     const id = `usage-unauthorized-${process.pid}__ws-bbbbbb`
     const at = Date.now()
     let reading: CodexUsageEntry = {
@@ -189,13 +174,9 @@ describe("profile surface routing", () => {
     expect(s.activate(id)).toMatchObject({ ok: false, status: 409, code: "needs_login" })
     const refusedRoute = s.route(undefined, "work")
     expect(refusedRoute.kind === "pool" && refusedRoute.excluded.has(id)).toBe(true)
-    reading = { ...reading, error: "rate_limited", failure: { reason: "rate_limited", consecutiveFailures: 2, lastFailureAt: at + 1 } }
-    expect(s.activate(id)).toMatchObject({ ok: false, code: "needs_login" })
     reading = { ...reading, error: null, failure: null, fetchedAt: at + 2 }
     expect(s.listEntries()[0]?.loggedIn).toBe(true)
     expect(s.activate(id).ok).toBe(true)
-    reading = { ...reading, error: "unauthorized", fetchedAt: null, failure: { reason: "unauthorized", consecutiveFailures: 1, lastFailureAt: at } }
-    expect(s.listEntries()[0]?.loggedIn).toBe(true)
   })
 
   it("defaults to the owner's pick and follows the pointer once set", () => {
@@ -496,21 +477,6 @@ describe("a seat's login lifecycle", () => {
     source: { mode: "follow-external", seats: () => [seat(SEAT_ID, "l@x.test", { expiresAt: NOW + 3_600_000, signedInAt: NOW - 30 * 86_400_000, eligible: tokenState.unavailable === null, reason: (tokenState.unavailable ?? undefined) as ChatGptSeatView["reason"] })] } as unknown as ChatGptCredentialSource,
     observed: () => new Map(), usage: () => null, reserved: () => new Set(), names: () => undefined,
     activeSeat: () => undefined, excluded: () => [], spent: () => undefined,
-  })
-
-  it("is logged out once the seat has no usable sign-in, and back in once it signs in again", () => {
-    tokenState = { unavailable: "requires_reauth" }
-    const out = surface.listEntries()[0]!
-    expect(out.unauthedReason).toBe("credentials_cleared")
-    expect(typeof out.firstUnauthedAt).toBe("number")
-    expect(out).toMatchObject({ authObtainedAt: NOW - 30 * 86_400_000, authObtainedVia: "token" })
-    // Recorded once, not re-stamped on every poll.
-    expect(surface.listEntries()[0]!.firstUnauthedAt).toBe(out.firstUnauthedAt)
-    tokenState = { unavailable: null }
-    const back = surface.listEntries()[0]!
-    // The sign-in Meridian saw come back outranks the one the token states.
-    expect(back).toMatchObject({ firstUnauthedAt: null, unauthedReason: null, authObtainedVia: "observed", accessTokenExpiresAt: NOW + 3_600_000 })
-    expect(back.authObtainedAt).not.toBe(NOW - 30 * 86_400_000)
   })
 
   it("does not call an expired access token a lost sign-in", () => {

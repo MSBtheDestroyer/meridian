@@ -16,7 +16,7 @@
  * auth.openai.com, and no production account appears in it.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { existsSync, mkdtempSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { acquireWriterLease } from "../proxy/chatgpt/lease"
@@ -25,8 +25,7 @@ import {
   type ChatGptAccount,
   type ChatGptCredentialStore,
 } from "../proxy/chatgpt/credentials"
-import { chatGptAuthLifecycleKey, createChatGptRefresher, type RefreshOutcome } from "../proxy/chatgpt/refresh"
-import { authLifecycleFor } from "../proxy/authLifecycle"
+import { createChatGptRefresher, MAX_SEAT_RENEWALS, type RefreshOutcome } from "../proxy/chatgpt/refresh"
 
 const LEASE_MODULE = join(import.meta.dir, "../proxy/chatgpt/lease.ts")
 const STORE_MODULE = join(import.meta.dir, "../proxy/chatgpt/credentials.ts")
@@ -436,34 +435,6 @@ describe("ChatGPT refresh - nothing it says contains a credential", () => {
   })
 })
 
-describe("ChatGPT refresh - the seat's login lifecycle", () => {
-  async function seededAs(accountUserId: string): Promise<ChatGptCredentialStore> {
-    const store = await seededStore()
-    store.commitAccount(accountUserId, () => seat({ accountUserId }))
-    return store
-  }
-
-  it("stamps a successful refresh", async () => {
-    const store = await seededAs("seat-lifecycle-ok")
-    const mock = endpoint(() => tokenResponse({ access_token: "fresh", refresh_token: "rotated", expires_in: 3600 }))
-    await createChatGptRefresher({ store, fetchImpl: mock.fetchImpl, now: () => 1_700_000_000_000 }).refreshAccount("seat-lifecycle-ok")
-    expect(authLifecycleFor(chatGptAuthLifecycleKey("seat-lifecycle-ok"))?.lastRefreshAt).toBe(1_700_000_000_000)
-  })
-
-  it("records a refused refresh as the moment the seat was logged out, once", async () => {
-    const store = await seededAs("seat-lifecycle-refused")
-    const mock = endpoint(() => tokenResponse({ error: "invalid_grant" }, 400))
-    const refresher = createChatGptRefresher({ store, fetchImpl: mock.fetchImpl, now: () => 1_700_000_000_000 })
-    await refresher.refreshAccount("seat-lifecycle-refused")
-    const record = authLifecycleFor(chatGptAuthLifecycleKey("seat-lifecycle-refused"))!
-    expect(record).toMatchObject({ firstUnauthedAt: 1_700_000_000_000, unauthedReason: "refresh_rejected" })
-    expect(record.events.at(-1)).toMatchObject({ kind: "logged_out", detail: "rejected" })
-    // Every later attempt reports the same lost login, not a new one.
-    await refresher.refreshAccount("seat-lifecycle-refused")
-    expect(authLifecycleFor(chatGptAuthLifecycleKey("seat-lifecycle-refused"))!.events).toHaveLength(record.events.length)
-  })
-})
-
 // Which refusal it was is what tells a login that aged out from one spent by a
 // second process, and nothing kept it: the 2026-10-02 refusals could not be
 // told apart afterwards. The three causes are the ones the Codex CLI itself
@@ -477,7 +448,7 @@ describe("ChatGPT refresh - why a refresh was refused", () => {
     console.error = (...args: unknown[]) => { written.push(args.join(" ")) }
     try {
       const outcome = await createChatGptRefresher({ store, fetchImpl: async () => response }).refreshAccount(id)
-      return { outcome, written: written.join("\n"), event: authLifecycleFor(chatGptAuthLifecycleKey(id))?.events.at(-1) }
+      return { outcome, written: written.join("\n") }
     } finally {
       console.error = original
     }
@@ -491,9 +462,8 @@ describe("ChatGPT refresh - why a refresh was refused", () => {
   causes.forEach(([code, cause], index) => {
     it(`records ${code} as "${cause}", and nothing of the body`, async () => {
       const message = "the token ending 9f04 can no longer be used"
-      const { outcome, written, event } = await refuseWith(`seat-cause-${index}`, tokenResponse({ error: { code, message } }, 401))
+      const { outcome, written } = await refuseWith(`seat-cause-${index}`, tokenResponse({ error: { code, message } }, 401))
       expect(outcome).toMatchObject({ status: "requires-reauth", reason: "rejected", cause })
-      expect(event).toMatchObject({ kind: "logged_out", detail: `rejected: ${cause}` })
       expect(written).toContain(`(rejected: ${cause})`)
       for (const secret of [STORED_REFRESH, message, code]) {
         expect(written).not.toContain(secret)
@@ -503,56 +473,67 @@ describe("ChatGPT refresh - why a refresh was refused", () => {
   })
 
   it("says only that it was refused when the provider names something else", async () => {
-    const { outcome, event } = await refuseWith("seat-cause-other", tokenResponse({ error: { code: STORED_REFRESH } }, 401))
+    const { outcome } = await refuseWith("seat-cause-other", tokenResponse({ error: { code: STORED_REFRESH } }, 401))
     expect(outcome).toEqual({ status: "requires-reauth", accountUserId: "seat-cause-other", reason: "rejected" })
-    expect(event).toMatchObject({ kind: "logged_out", detail: "rejected" })
   })
 
   it("records the status of a provider failure, which says nothing about the login", async () => {
-    const { outcome, event } = await refuseWith("seat-cause-503", tokenResponse({ error: "overloaded" }, 503))
+    const { outcome } = await refuseWith("seat-cause-503", tokenResponse({ error: "overloaded" }, 503))
     expect(outcome).toMatchObject({ status: "requires-reauth", reason: "unverifiable", cause: "HTTP 503" })
-    expect(event).toMatchObject({ kind: "logged_out", detail: "unverifiable: HTTP 503" })
   })
 })
 
 // A seat's renewal history is the evidence for how renewal frequency affects
 // how long its sign-in lasts: one entry per exchange the provider saw, with
-// what came back. It is kept apart from the login events so a seat renewed
-// daily does not push its sign-in and logout out of the record.
+// what came back, kept on the seat's own record in the store.
 describe("ChatGPT refresh - the seat's renewal history", () => {
   const AT = 1_700_000_000_000
   const DAY_MS = 24 * 3_600_000
   const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url")
 
-  async function refreshOnce(id: string, reply: () => Response) {
+  async function refreshOnce(reply: () => Response) {
     const store = await seededStore()
-    store.commitAccount(id, () => seat({ accountUserId: id }))
     const mock = endpoint(reply)
     const refresher = createChatGptRefresher({ store, fetchImpl: mock.fetchImpl, now: () => AT })
-    const outcome = await refresher.refreshAccount(id)
-    return { refresher, mock, outcome, renewals: () => authLifecycleFor(chatGptAuthLifecycleKey(id))?.renewals }
+    const outcome = await refresher.refreshAccount(SEAT)
+    return { store, refresher, mock, outcome }
   }
 
   it("records a renewal that rotated the refresh token, with the new token's issue and expiry times", async () => {
     const accessToken = `${part({ alg: "none" })}.${part({ iat: AT / 1000, exp: (AT + 10 * DAY_MS) / 1000 })}.sig`
-    const { renewals } = await refreshOnce("seat-history-rotated", () => tokenResponse({ access_token: accessToken, refresh_token: "rotated", expires_in: 10 * DAY_MS / 1000 }))
-    expect(renewals()).toEqual([{ at: AT, outcome: "rotated", issuedAt: AT, expiresAt: AT + 10 * DAY_MS }])
+    await refreshOnce(() => tokenResponse({ access_token: accessToken, refresh_token: "rotated", expires_in: 10 * DAY_MS / 1000 }))
+    expect(onDisk()?.renewals).toEqual([{ at: AT, outcome: "rotated", issuedAt: AT, expiresAt: AT + 10 * DAY_MS }])
   })
 
   it("records a renewal that kept the refresh token", async () => {
-    const { renewals } = await refreshOnce("seat-history-kept", () => tokenResponse({ access_token: "opaque", expires_in: 3600 }))
-    expect(renewals()).toEqual([{ at: AT, outcome: "kept", expiresAt: AT + 3_600_000 }])
+    await refreshOnce(() => tokenResponse({ access_token: "opaque", expires_in: 3600 }))
+    expect(onDisk()?.renewals).toEqual([{ at: AT, outcome: "kept", expiresAt: AT + 3_600_000 }])
   })
 
-  it("records a refusal with its cause, and nothing for the attempts that never reached the provider", async () => {
-    const { refresher, mock, renewals } = await refreshOnce("seat-history-refused", () => tokenResponse({ error: { code: "refresh_token_reused" } }, 401))
-    await refresher.refreshAccount("seat-history-refused")
+  it("records a refusal with its cause beside the stamp, and nothing for the attempts that never reached the provider", async () => {
+    const { refresher, mock } = await refreshOnce(() => tokenResponse({ error: { code: "refresh_token_reused" } }, 401))
+    expect(await refresher.refreshAccount(SEAT)).toMatchObject({ status: "requires-reauth", reason: "interrupted" })
     expect(mock.calls).toHaveLength(1)
-    expect(renewals()).toEqual([{ at: AT, outcome: "refused", detail: "rejected: refresh token already used" }])
+    expect(onDisk()).toMatchObject({ exchangeStartedAt: AT, renewals: [{ at: AT, outcome: "refused", cause: "refresh token already used" }] })
   })
 
   it("records a provider failure as unverified, with its status", async () => {
-    const { renewals } = await refreshOnce("seat-history-503", () => tokenResponse({ error: "overloaded" }, 503))
-    expect(renewals()).toEqual([{ at: AT, outcome: "unverified", detail: "unverifiable: HTTP 503" }])
+    await refreshOnce(() => tokenResponse({ error: "overloaded" }, 503))
+    expect(onDisk()).toMatchObject({ exchangeStartedAt: AT, renewals: [{ at: AT, outcome: "unverified", cause: "HTTP 503" }] })
+  })
+
+  it("keeps only the latest renewals, and drops a malformed entry it reads back", async () => {
+    const store = await seededStore()
+    const old = Array.from({ length: MAX_SEAT_RENEWALS }, (_, i) => ({ at: AT - (i + 1) * DAY_MS, outcome: "kept" as const }))
+    store.commitAccount(SEAT, current => ({ ...current!, renewals: old }))
+    await createChatGptRefresher({ store, fetchImpl: endpoint(() => tokenResponse({ access_token: "opaque", expires_in: 3600 })).fetchImpl, now: () => AT }).refreshAccount(SEAT)
+    const renewals = onDisk()!.renewals!
+    expect(renewals).toHaveLength(MAX_SEAT_RENEWALS)
+    expect(renewals.at(-1)).toEqual({ at: AT, outcome: "kept", expiresAt: AT + 3_600_000 })
+
+    const raw = JSON.parse(readFileSync(storePath, "utf8")) as { accounts: Array<Record<string, unknown>> }
+    raw.accounts[0]!.renewals = [{ at: AT, outcome: "sideways" }, { outcome: "kept" }, { at: AT, outcome: "refused", cause: "x".repeat(65) }]
+    writeFileSync(storePath, JSON.stringify(raw))
+    expect(onDisk()?.renewals).toEqual([{ at: AT, outcome: "refused" }])
   })
 })

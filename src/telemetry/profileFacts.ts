@@ -63,6 +63,41 @@ function expiryFacts(p, now) {
   return facts;
 }
 
+var LOGIN_SOURCE = {
+  login: ' (signed in through Meridian)',
+  observed: ' (when Meridian found it on disk; the sign-in itself may be earlier)',
+  token: ' (the sign-in its access token states)'
+};
+
+// Meridian's login history for the stored credential. A refused renewal is a
+// countdown while the access token it left behind still works; only after
+// that, or when the credential has no access token, is the account logged out.
+function loginFacts(p, now) {
+  var facts = [];
+  if (p.firstUnauthedAt) {
+    var since = new Date(p.firstUnauthedAt).toLocaleString();
+    var refused = p.unauthedReason === 'refresh_rejected';
+    var accessLeft = p.accessTokenExpiresAt ? p.accessTokenExpiresAt - now : 0;
+    if (refused && accessLeft > 0) {
+      facts.push({ label: 'Renewal refused', value: 'stops in ' + expirySpan(accessLeft), tone: 'warn',
+        title: 'Anthropic refused to renew the login at ' + since + '. It keeps serving until its access token expires at '
+          + new Date(p.accessTokenExpiresAt).toLocaleString() + '; log in again before then.' });
+    } else {
+      facts.push({ label: 'Logged out', value: expirySpan(now - p.firstUnauthedAt) + ' ago', tone: 'err',
+        title: 'Since ' + since + (refused ? ': Anthropic refused to renew the login, and its access token has expired.'
+          : ': the stored credential has no access token.') });
+    }
+  }
+  return facts;
+}
+
+function loginAgeFact(p, now) {
+  if (!p.authObtainedAt) return [];
+  var renewed = p.lastRefreshAt ? '. Last renewed by Meridian ' + new Date(p.lastRefreshAt).toLocaleString() : '';
+  return [{ label: 'Logged in', value: expirySpan(now - p.authObtainedAt) + ' ago', tone: '',
+    title: new Date(p.authObtainedAt).toLocaleString() + (LOGIN_SOURCE[p.authObtainedVia] || '') + renewed }];
+}
+
 function isChatGptProfile(p) {
   return !!p && (p.provider === 'chatgpt' || p.type === 'chatgpt');
 }
@@ -91,11 +126,6 @@ function formatResets(resets, now) {
   return count + ' (' + (parts.length === 1 ? 'expires ' : 'expire ') + parts.join(', ') + ')';
 }
 
-var LOGIN_SOURCE = {
-  observed: ' (when Meridian found it)',
-  token: ' (the sign-in its access token states)'
-};
-
 var CHATGPT_TOKEN_STATUS = {
   expired: '\\u2717 Access token expired',
   refused: '\\u2717 Token refused by chatgpt.com',
@@ -117,24 +147,47 @@ function ownerName(owner) {
   return owner.name + (owner.account ? ' \\u00b7 account ' + owner.account : '');
 }
 
-// What Meridian recorded about the login, right under Status: a recorded
-// logout replaces the stored deadlines, which no longer describe a login that
-// can serve; otherwise the deadlines, then when the login happened.
-function loginFacts(p, now) {
-  if (p.firstUnauthedAt) {
-    var seat = isChatGptProfile(p);
-    var why = p.unauthedReason === 'refresh_rejected'
-      ? (seat ? ' \\u2014 the sign-in could not be renewed' : ' \\u2014 Anthropic refused to renew the login')
-      : p.unauthedReason === 'credentials_cleared'
-        ? (seat ? ' \\u2014 the seat has no usable sign-in' : ' \\u2014 the stored login was wiped')
-        : '';
-    return [{ label: 'Logged out', value: expirySpan(now - p.firstUnauthedAt) + ' ago', tone: 'err',
-      title: 'Since ' + new Date(p.firstUnauthedAt).toLocaleString() + why }];
-  }
-  var facts = expiryFacts(p, now);
-  if (p.authObtainedAt) {
-    facts.push({ label: 'Logged in', value: expirySpan(now - p.authObtainedAt) + ' ago', tone: '',
-      title: new Date(p.authObtainedAt).toLocaleString() + (LOGIN_SOURCE[p.authObtainedVia] || '') });
+// One entry of an owned seat's renewal history (/profiles/list \`renewals\`),
+// in words: what came back from the provider, and why when it refused.
+var CHATGPT_RENEWAL_OUTCOME = {
+  rotated: 'renewed, new refresh token',
+  kept: 'renewed, same refresh token',
+  refused: 'refused',
+  unverified: 'failed'
+};
+
+function renewalWords(r) {
+  return (CHATGPT_RENEWAL_OUTCOME[r.outcome] || r.outcome) + (r.cause ? ' (' + r.cause + ')' : '');
+}
+
+// The renewal facts of a seat Meridian renews itself: its interval, and the
+// latest renewal with the ones before it in the explanation.
+function renewalFacts(p) {
+  var facts = [];
+  var own = typeof p.renewalHours === 'number';
+  facts.push({
+    label: 'Renewal',
+    value: own ? 'every ' + p.renewalHours + 'h' : 'on the token\\u2019s 8th day',
+    tone: '',
+    title: own
+      ? 'This seat\\u2019s own interval: Meridian renews it ' + p.renewalHours + ' hours after its access token was issued, never later than a request would.'
+      : 'Meridian renews the seat 80% into its access token\\u2019s life, the 8th of its 10 days. Renew every sets this seat\\u2019s own interval.'
+  });
+  var renewals = Array.isArray(p.renewals) ? p.renewals : [];
+  if (renewals.length > 0) {
+    var last = renewals[renewals.length - 1];
+    var earlier = renewals.slice(-6, -1).reverse().map(function (r) {
+      return new Date(r.at).toLocaleString() + ' ' + renewalWords(r);
+    });
+    facts.push({
+      label: 'Last renewal',
+      value: renewalWords(last) + ', ' + timeAgo(last.at),
+      tone: last.outcome === 'refused' || last.outcome === 'unverified' ? 'warn' : '',
+      title: new Date(last.at).toLocaleString()
+        + (typeof last.expiresAt === 'number' ? '; its token is valid until ' + new Date(last.expiresAt).toLocaleString() : '')
+        + '. ' + renewals.length + ' renewal' + (renewals.length === 1 ? '' : 's') + ' recorded'
+        + (earlier.length > 0 ? '; before it: ' + earlier.join('; ') : '') + '.'
+    });
   }
   return facts;
 }
@@ -157,7 +210,8 @@ function profileFacts(p) {
     facts.push({ label: 'Next renewal', value: retryIn > 0 ? 'in ' + expirySpan(retryIn) : 'now', tone: '',
       title: 'chatgpt.com refused the access token; Meridian renews it on its own at ' + new Date(p.renewalRetryAt).toLocaleString() });
   }
-  facts = facts.concat(loginFacts(p, Date.now()));
+  var now = Date.now();
+  facts = facts.concat(loginFacts(p, now), expiryFacts(p, now), loginAgeFact(p, now));
   if (p.email) facts.push({ label: 'Email', value: p.email, tone: '', cached: authStale });
   if (p.organizationName) facts.push({ label: 'Organization', value: p.organizationName, tone: '' });
   if (p.accountType) facts.push({ label: 'Account', value: p.accountType, tone: '' });
@@ -208,6 +262,7 @@ function profileFacts(p) {
         : 'Meridian reads this seat\\u2019s login from ' + p.owner.name + ' and never changes it: sign-in, renewal and removal happen there.'
     });
   }
+  if (chatgpt && p.owner && p.owner.name === 'meridian') facts = facts.concat(renewalFacts(p));
   if (chatgpt && CHATGPT_OWNER_STATE[p.unavailable]) {
     facts.push({ label: 'Owner state', value: CHATGPT_OWNER_STATE[p.unavailable], tone: '' });
   }

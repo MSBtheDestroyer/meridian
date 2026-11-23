@@ -31,8 +31,6 @@ import { adaptResponsesBody, type BodyAdaptation, type ReasoningSummaryLevel } f
 import { buildCodexImagesRequest, buildCodexRequest } from "../chatgpt/request"
 import { isModelRefusal, sniffChatGptFailure, type ChatGptFailureKind } from "../chatgpt/stream"
 import { aggregateResponsesStream, tapResponsesStream, type ChatGptUsage, type TapSummary } from "../chatgpt/tap"
-import { noteApiRejected, noteProviderAccepted } from "../authLifecycle"
-import { chatGptAuthLifecycleKey } from "../chatgpt/refresh"
 import { chatGptCooldownUntil, chatGptCreditsFromHeaders, chatGptRateLimitFromHeaders, creditsCanServe, type ChatGptRateLimit } from "../chatgpt/windows"
 import type { CodexCredits, CodexUsageWindow } from "../codex/types"
 import type { ChatGptCreditsPolicy, ChatGptFreeSeatOrder } from "../chatgpt/features"
@@ -609,7 +607,6 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
           }
 
           if (!sniffed.failure) {
-            noteProviderAccepted(chatGptAuthLifecycleKey(seat), { startedAt: authAttemptStartedAt })
             const until = chatGptCooldownUntil(rateLimit, now())
             if (until !== null) exhaustion.mark(seat, until, "quota_spent")
             if (cacheKey) affinity.set(cacheKey, { profileId: seat, requestId: undefined })
@@ -663,7 +660,6 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
             requestId, seat, kind: failureKind, status: upstream.status,
             until: bench(seat, failureKind, rateLimit), rateLimit, startedAt: authAttemptStartedAt,
           }
-          if (failureKind === "requires_reauth") noteApiRejected(chatGptAuthLifecycleKey(seat), { startedAt: authAttemptStartedAt })
           refusals.push(refusal)
           if (onCredits) reserveRefusedUntil.set(reserveKey(seat, model), refusal.until)
           hooks?.onSeatRefused?.(refusal)

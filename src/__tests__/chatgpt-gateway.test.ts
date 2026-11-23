@@ -636,16 +636,6 @@ describe("offered models follow the backend's catalog", () => {
 })
 
 describe("ChatGPT seats on the profile surface", () => {
-  it("health excludes a recorded dead login that the native seat source still calls eligible", async () => {
-    const rejected = account(0)
-    writePool([rejected, account(1)])
-    noteRefreshRejected(chatGptAuthLifecycleKey(rejected.accountUserId), { detail: "rejected" })
-    const { app } = await server("follow-external")
-
-    const response = await app.fetch(new Request("http://localhost/health"))
-
-    expect(await response.json()).toMatchObject({ chatgpt: { accounts: 2, eligible: 1, ready: 1, unavailable: { requires_reauth: 1 } } })
-  })
 
   type ListBody = { profiles: Array<Record<string, unknown>>; activeProfile: string | null; activeProfiles?: { claude: string | null; chatgpt: string | null } }
   type QuotaBody = { profiles: Array<{ id: string; type: string; isActive: boolean; windows: Array<{ type: string; utilization: number | null; resetsAt: number | null }>; windowsReported: string[] | null; windowSource: string | null; error: string | null; spent: unknown }>; activeProfile: string | null; activeProfiles?: { chatgpt: string | null } }
@@ -1609,31 +1599,27 @@ describe("owned mode signs its own seats in", () => {
         const listed = async () => {
           await proxy.app.fetch(new Request("http://localhost/v1/usage/quota/all"))
           const list = await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as {
-            profiles: Array<{ seat?: string; loggedIn: boolean; tokenState?: string; firstUnauthedAt?: number | null }>
+            profiles: Array<{ seat?: string; loggedIn: boolean; tokenState?: string; firstUnauthedAt?: number | null; renewals?: unknown[] }>
           }
           return list.profiles.find(p => p.seat === seat)!
         }
-        const kinds = () => (authLifecycleFor(chatGptAuthLifecycleKey(seat))?.events ?? []).map(e => e.kind)
         expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok" })
 
         const pass = proxy.chatGpt!.renewDue()
         while (!started) await new Promise(resolve => setTimeout(resolve, 5))
         expect(JSON.parse(readFileSync(storePath, "utf8")).accounts[0].exchangeStartedAt).not.toBeNull()
-        expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok" })
-        expect(kinds()).toEqual([])
+        expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok", renewals: [] })
 
         if (ending === "renewed") {
           answer(Response.json({ access_token: token(Date.now()), refresh_token: "rt-renewed", expires_in: 10 * 86_400 }))
           expect(await pass).toBe(true)
-          expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok" })
-          expect(kinds()).toEqual([])
+          expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok", renewals: [{ outcome: "rotated" }] })
         } else {
           answer(new Response(JSON.stringify({ error: { code: "refresh_token_reused" } }), { status: 401, headers: { "content-type": "application/json" } }))
           expect(await pass).toBe(false)
-          expect(await listed()).toMatchObject({ loggedIn: false, tokenState: "requires_reauth" })
-          const events = authLifecycleFor(chatGptAuthLifecycleKey(seat))!.events
-          expect(events.map(e => e.kind)).toEqual(["logged_out"])
-          expect(events[0]).toMatchObject({ reason: "refresh_rejected", detail: "rejected: refresh token already used" })
+          const after = await listed()
+          expect(after).toMatchObject({ loggedIn: false, tokenState: "requires_reauth" })
+          expect(after.renewals).toEqual([{ at: expect.any(Number), outcome: "refused", cause: "refresh token already used" }])
         }
       } finally {
         proxy.chatGpt!.release()
@@ -1692,7 +1678,6 @@ describe("owned mode signs its own seats in", () => {
       const after = await listed()
       expect(after).toMatchObject({ loggedIn: true, tokenState: "ok" })
       expect(after.renewalRetryAt ?? null).toBeNull()
-      expect(authLifecycleFor(chatGptAuthLifecycleKey(seat))!.events.at(-1)).toMatchObject({ kind: "recovered", detail: "renewed after its access token was refused" })
     } finally {
       proxy.chatGpt!.release()
     }
@@ -1747,8 +1732,10 @@ describe("owned mode signs its own seats in", () => {
       accountUserId: `user-${n}__workspace-${n}`, accountId: `workspace-${n}`, email: `s${n}@example.test`,
       refreshToken: `rt-${n}`, accessToken: signedIn, expiresAt, tokenRotatedAt: NOW, exchangeStartedAt: null,
     })
-    writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [seat(0, Date.now() + 3_600_000)] }), { mode: 0o600 })
+    const history = [{ at: NOW, outcome: "kept", expiresAt: NOW + 3_600_000 }]
+    writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [{ ...seat(0, Date.now() + 3_600_000), renewals: history }] }), { mode: 0o600 })
     const before = readFileSync(storePath, "utf8")
+    saveSettings({ chatgpt: { seatRenewalHours: { "user-0__workspace-0": 6 } } })
     let refreshes = 0
     const serve = globalThis.fetch
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -1769,7 +1756,10 @@ describe("owned mode signs its own seats in", () => {
         const res = await post(proxy.app, path, { profile: "s0-kspace-0" })
         expect([path, res.status]).toEqual([path, 403])
       }
+      // Its own renewal interval long past, the seat is still not renewed here.
       expect(await proxy.chatGpt!.renewDue()).toBe(false)
+      const listed = await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as { profiles: Array<{ seat?: string; renewalHours?: number | null; renewals?: unknown[] }> }
+      expect(listed.profiles.find(p => p.seat === "user-0__workspace-0")).toMatchObject({ renewalHours: 6, renewals: history })
 
       // A token the owner has not renewed is not renewed here either.
       writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [seat(0, Date.now() - 1000)] }), { mode: 0o600 })
