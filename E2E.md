@@ -8188,6 +8188,16 @@ platform with real parallel Claude Code runs through the proxy:
   drains in back-to-back sweeps.
 - Stop time (`close()`) of a proxy with a large retired backlog.
 
+**This fork** (lifecycle journal in `sessions.db`, claims in batches of eight,
+a sweep continues while deletions are due for up to five minutes, and a
+draining proxy claims nothing new, 65ca1cfc): the gate and
+`proxy-session-gc-capacity.test.ts` assert those semantics instead. The gate
+expects every orphan deleted by the deleting sweep, or none with
+`DRAINING=1`; it has no bulk writer for upstream's JSON lifecycle file.
+**Measured 2026-11-23** (re-integration onto 1.94.0, Linux, Bun 1.4.4, load
+about 25): 300 orphans, 300 deleted in 13.9 s (46 ms each); `DRAINING=1`, 0
+deleted, 300 left retired.
+
 ## Windows session garbage collection (#895 / #896)
 
 ```powershell
