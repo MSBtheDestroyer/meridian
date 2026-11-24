@@ -65,7 +65,7 @@ import {
   type CacheKeepaliveRecipe,
 } from "./cacheKeepaliveRunner"
 import { AbortableSemaphore, getProcessSdkSemaphore, type SemaphoreLease } from "./concurrency"
-import { InflightRegistry, isLoopbackPeer, onResponseDone, type InflightHandle } from "./inflight"
+import { InflightRegistry, isLoopbackHost, isLoopbackPeer, onResponseDone, type InflightHandle } from "./inflight"
 import { plog, setProxyDiagnosticSink, setProxyLogSilent } from "./operationalLog"
 import { AdmissionHold, parseDrainOptions, type AdmissionReservation } from "./admissionHold"
 import { DrainBodyError, readDrainBody } from "./drainBody"
@@ -11573,9 +11573,40 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return undefined
   }
 
-  // Event hooks (hooks.ts). `saved` is what the form edits; `environment`
-  // names the env targets by label only, since a command line or webhook URL
-  // may carry a credential. `recent` is the last deliveries, newest first.
+  // Event hooks (hooks.ts). `saved` is what the form edits: the webhooks.
+  // Command targets run a shell as this user, so HTTP can neither set nor
+  // read them: they come from settings.json `hooks.commands` or
+  // MERIDIAN_HOOK_COMMAND, and are listed by fixed label only, like the env
+  // targets. `recent` is the last deliveries, newest first, by status only.
+  //
+  // A saved webhook URL can hold a token and is where event data leaves this
+  // host, and the public URL steers relays, so every hook route answers only
+  // a management client: one of this server's own pages or a client without
+  // an Origin (sameOrigin.ts), AND either the configured MERIDIAN_API_KEY
+  // (requireAuth on /settings/*) or, with no key, a client on this machine
+  // talking to its loopback address. Same-origin alone is not enough: a page
+  // under a name that resolves to 127.0.0.1 is same-origin with itself, but
+  // its Host is not a loopback name. A reverse proxy on this machine is
+  // refused by its forwarding headers or its public Host (isLoopbackHost).
+  const hookManagement = async (c: Context, next: () => Promise<void>) => {
+    c.header("Cache-Control", "no-store")
+    if (!isSameOriginRequest(c.req.raw)) return c.json({ error: "Event hook settings require a same-origin request" }, 403)
+    if (!authEnabled()) {
+      let remoteAddress: string | undefined
+      try {
+        remoteAddress = getConnInfo(c).remote.address
+      } catch {
+        // Served by something other than @hono/node-server: no peer to trust.
+        remoteAddress = undefined
+      }
+      if (!isLoopbackPeer(remoteAddress, c.req.raw.headers) || !isLoopbackHost(c.req.header("host"))) {
+        return c.json({ error: "Event hook settings need MERIDIAN_API_KEY, or a request from this machine to its loopback address (http://127.0.0.1:<port>)" }, 403)
+      }
+    }
+    await next()
+  }
+  app.use("/settings/api/hooks", hookManagement)
+  app.use("/settings/api/hooks/*", hookManagement)
   app.get("/settings/api/hooks", (c) => {
     const environment = hookEnvironment()
     const envPublicUrl = env("PUBLIC_URL")
@@ -11584,10 +11615,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // accepted one is echoed back.
     const envPublicUrlNormalized = envPublicUrl ? normalizePublicUrl(envPublicUrl) : undefined
     return c.json({
-      saved: getSetting("hooks") ?? {},
+      saved: { webhooks: getSetting("hooks")?.webhooks ?? [] },
+      commands: resolveHookTargets({ commands: getSetting("hooks")?.commands }, {})
+        .map(target => ({ target: hookTargetLabel(target), events: target.events ?? null })),
       environment: {
-        webhook: environment.url?.trim() ? hookTargetLabel({ kind: "webhook", value: environment.url.trim() }) : null,
-        command: environment.command?.trim() ? hookTargetLabel({ kind: "command", value: environment.command.trim() }) : null,
+        webhook: environment.url?.trim() ? hookTargetLabel({ kind: "webhook", value: environment.url.trim(), source: "env" }) : null,
+        command: environment.command?.trim() ? hookTargetLabel({ kind: "command", value: environment.command.trim(), source: "env" }) : null,
       },
       publicUrl: {
         saved: getSetting("publicUrl") ?? null,
@@ -11607,9 +11640,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     try { body = await c.req.json() as Record<string, unknown> } catch { return c.json({ error: "Invalid JSON" }, 400) }
     const updates: Partial<MeridianSettings> = {}
     if (body.hooks !== undefined) {
+      if (typeof body.hooks === "object" && body.hooks !== null && "commands" in body.hooks) {
+        return c.json({ error: "Command hooks run shell commands, so they are set only in settings.json (hooks.commands) or MERIDIAN_HOOK_COMMAND, never over HTTP" }, 403)
+      }
       const parsed = parseHookSettings(body.hooks)
       if (!parsed.ok) return c.json({ error: parsed.error }, 400)
-      updates.hooks = parsed.value
+      const commands = getSetting("hooks")?.commands
+      updates.hooks = { ...parsed.value, ...(commands ? { commands } : {}) }
     }
     if (body.publicUrl !== undefined) {
       if (body.publicUrl === null || body.publicUrl === "") {

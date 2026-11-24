@@ -309,9 +309,11 @@ ${profileBarHtml}
   <h1 style="margin-top:40px">Event Hooks</h1>
   <p class="subtitle" style="max-width:720px;line-height:1.6">
     Tell other programs when something happens here. A <strong style="color:var(--text)">webhook</strong> gets each
-    event as a JSON <code>POST</code>; a <strong style="color:var(--text)">command</strong> runs through the shell with
-    the event as JSON on stdin, never on its command line. Each delivery is tried once, with a 5s (webhook) or 10s
-    (command) limit. The command's first line of output is shown below, so it must not print secrets.
+    event as a JSON <code>POST</code> and is edited here. A <strong style="color:var(--text)">command</strong> runs
+    through the shell as Meridian's user, with the event as JSON on stdin, so it is set only on this machine: in
+    <code>settings.json</code> (<code>hooks.commands</code>) or <code>MERIDIAN_HOOK_COMMAND</code>, and runs only for
+    the sign-in events below, never for the test button. Each delivery is tried once, with a 5s (webhook) or 10s
+    (command) limit. Below are their statuses only; what a command prints goes to Meridian's log on this machine.
     <code>oauth.callback.listening</code> and <code>oauth.callback.closed</code> announce a sign-in redirect listener
     and its public address, <code>&lt;public URL&gt;/callback/&lt;id&gt;</code>: a relay on the browser's machine can
     forward the provider's loopback redirect there, so a sign-in started from another machine finishes by itself.
@@ -1292,9 +1294,15 @@ function renderHooks() {
   h += '<div style="color:var(--muted);font-size:13px;margin:6px 0 8px">Webhooks</div>'
     + hookRows('webhooks', 'url', 'https://hooks.example/meridian')
     + '<button class="reset-btn" id="hooks-add-webhook">Add webhook</button>';
-  h += '<div style="color:var(--muted);font-size:13px;margin:16px 0 8px">Commands</div>'
-    + hookRows('commands', 'command', '/path/to/program --flag')
-    + '<button class="reset-btn" id="hooks-add-command">Add command</button>';
+  const commands = cfg.commands || [];
+  h += '<div style="color:var(--muted);font-size:13px;margin:16px 0 8px">Commands (settings.json, read-only here)</div>'
+    + (commands.length
+      ? commands.map(function (c) {
+        return '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">'
+          + '<strong style="color:var(--text);font-family:var(--mono, monospace);font-size:12px">' + telemetryEsc(c.target) + '</strong>'
+          + hookEventsNote(c.events) + '</div>';
+      }).join('')
+      : '<div class="pricing-note" style="margin-top:0">None. Add one to <code>hooks.commands</code> in settings.json, or set MERIDIAN_HOOK_COMMAND.</div>');
 
   const envTargets = [cfg.environment && cfg.environment.webhook, cfg.environment && cfg.environment.command].filter(Boolean);
   if (envTargets.length) {
@@ -1328,8 +1336,7 @@ function renderHooks() {
 
   el.querySelectorAll('input[data-hook-kind]').forEach(function (input) {
     input.addEventListener('input', function () {
-      const entry = hooksState.draft[input.dataset.hookKind][Number(input.dataset.hookI)];
-      entry[input.dataset.hookKind === 'webhooks' ? 'url' : 'command'] = input.value;
+      hooksState.draft[input.dataset.hookKind][Number(input.dataset.hookI)].url = input.value;
     });
   });
   el.querySelectorAll('button[data-hook-remove]').forEach(function (btn) {
@@ -1339,7 +1346,6 @@ function renderHooks() {
     });
   });
   document.getElementById('hooks-add-webhook').addEventListener('click', function () { hooksState.draft.webhooks.push({ url: '' }); renderHooks(); });
-  document.getElementById('hooks-add-command').addEventListener('click', function () { hooksState.draft.commands.push({ command: '' }); renderHooks(); });
   document.getElementById('hooks-public-url').addEventListener('input', function (e) { hooksState.publicUrl = e.target.value; });
   document.getElementById('hooks-save').addEventListener('click', saveHooks);
   document.getElementById('hooks-test').addEventListener('click', testHooks);
@@ -1354,14 +1360,20 @@ function setHooksMsg(text, isError) {
 
 async function loadHooks() {
   const res = await fetch('/settings/api/hooks');
-  const cfg = await res.json();
+  const cfg = await res.json().catch(function () { return {}; });
+  if (!res.ok) {
+    // Refused by the management boundary (no API key and not on this
+    // machine's loopback address): say so instead of drawing an empty form.
+    document.getElementById('hooks-body').innerHTML = '<div class="pricing-note" style="margin-top:0">'
+      + telemetryEsc(cfg.error || 'Event hook settings are not available here.') + '</div>';
+    return;
+  }
   const saved = cfg.saved || {};
   hooksState = {
     cfg: cfg,
     publicUrl: (cfg.publicUrl && cfg.publicUrl.saved) || '',
     draft: {
       webhooks: (saved.webhooks || []).map(function (w) { return { url: w.url, events: w.events }; }),
-      commands: (saved.commands || []).map(function (c) { return { command: c.command, events: c.events }; }),
     },
   };
   renderHooks();
@@ -1373,7 +1385,6 @@ async function saveHooks() {
     publicUrl: hooksState.publicUrl.trim() || null,
     hooks: {
       webhooks: hooksState.draft.webhooks.filter(function (w) { return w.url.trim(); }).map(function (w) { return Object.assign({ url: w.url.trim() }, keep(w)); }),
-      commands: hooksState.draft.commands.filter(function (c) { return c.command.trim(); }).map(function (c) { return Object.assign({ command: c.command.trim() }, keep(c)); }),
     },
   };
   const res = await fetch('/settings/api/hooks', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -1392,7 +1403,7 @@ async function testHooks() {
   const data = await res.json().catch(function () { return {}; });
   await loadHooks();
   const deliveries = data.deliveries || [];
-  setHooksMsg(deliveries.length ? deliveries.length + ' target(s) tried; results below.' : 'No target takes hooks.test. Save a target first.', false);
+  setHooksMsg(deliveries.length ? deliveries.length + ' target(s) tried; results below.' : 'No webhook takes hooks.test. Save one first; commands run only for sign-in events.', false);
 }
 
 async function loadLayout() {

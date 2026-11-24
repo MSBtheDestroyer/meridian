@@ -17,7 +17,7 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_PORT` | `CLAUDE_PROXY_PORT` | `3456` | Port to listen on |
 | `MERIDIAN_HOST` | `CLAUDE_PROXY_HOST` | `127.0.0.1` | Host to bind to |
 | `MERIDIAN_PUBLIC_URL` | `CLAUDE_PROXY_PUBLIC_URL` | unset | The address people reach this instance at, e.g. `https://meridian.example`. Public OAuth callback URLs are built on it. Wins over `publicUrl` saved at `/settings`; with neither, the address a sign-in was started from is used. See [Event hooks](#event-hooks) |
-| `MERIDIAN_HOOK_COMMAND` | `CLAUDE_PROXY_HOOK_COMMAND` | unset | One more [event hook](#event-hooks) command, receiving every event, beside those saved at `/settings` |
+| `MERIDIAN_HOOK_COMMAND` | `CLAUDE_PROXY_HOOK_COMMAND` | unset | One more [event hook](#event-hooks) command, run for the sign-in callback events, beside those in `settings.json` `hooks.commands` |
 | `MERIDIAN_HOOK_URL` | `CLAUDE_PROXY_HOOK_URL` | unset | One more [event hook](#event-hooks) webhook, receiving every event, beside those saved at `/settings` |
 | `MERIDIAN_PASSTHROUGH` | `CLAUDE_PROXY_PASSTHROUGH` | unset | Forward tool calls to client instead of executing |
 | `MERIDIAN_MAX_CONCURRENT` | `CLAUDE_PROXY_MAX_CONCURRENT` | `10` | Maximum SDK queries running concurrently within one Meridian process. The budget is shared by every proxy instance in the process, and is re-read whenever an instance starts — so raising or lowering it takes effect for a later instance without a restart. Embedders that need a distinct budget can pass `maxConcurrent` in `ProxyConfig`, which opts that instance out of the shared pool. |
@@ -398,7 +398,7 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `GET /settings` | Routing, SDK feature toggles, model pricing, telemetry storage, update-check, site-header and page layout UI |
 | `GET/PUT /settings/api/updates` | Read or set `checkForUpdates` (JSON `{"checkForUpdates": true}`); takes effect on the running proxy. Also reports each loaded plugin's installed and latest version in `plugins`; turning it on also sends loaded plugins' npm package names to the registry |
 | `GET/PUT /settings/api/header` | Read or set `showHostname` (JSON `{"showHostname": true}`): name the machine beside the header's status; takes effect on the running proxy |
-| `GET/PUT /settings/api/hooks`, `POST /settings/api/hooks/test` | [Event hooks](#event-hooks) and the public URL (JSON); `test` sends a `hooks.test` event |
+| `GET/PUT /settings/api/hooks`, `POST /settings/api/hooks/test` | [Event hooks](#event-hooks) webhooks and the public URL (JSON); `test` sends a `hooks.test` event to webhooks. Management clients only: `MERIDIAN_API_KEY`, or without one this machine at its loopback address |
 | `GET /callback/<id>/<path>` | A loopback OAuth redirect, relayed from another machine (see [Event hooks](#event-hooks)). No API key; unknown ids are 404 |
 | `GET/PUT /settings/api/layout` | Read or set the web pages' `layout`: `contained` (default, a centered column) or `wide` (spans the window, more cards per row). JSON `{"layout": "wide"}`, `null` to unset; applies on the next page load |
 | `GET /plugins` | Plugin management page (`/plugins/list`, `POST /plugins/reload` for JSON/actions) |
@@ -1455,14 +1455,19 @@ ANTHROPIC_API_KEY=your-secret-key ANTHROPIC_BASE_URL=http://meridian-host:3456 o
 
 ## Event hooks
 
-Meridian can tell other programs when something happens. Configure targets on `/settings` -> **Event Hooks** (saved as `hooks` in `settings.json`), or add one of each kind with `MERIDIAN_HOOK_URL` and `MERIDIAN_HOOK_COMMAND`. Targets are re-read for every event; no restart is needed.
+Meridian can tell other programs when something happens. Targets are re-read for every event; no restart is needed. With no target configured, nothing is sent and nothing runs.
+
+- **Webhooks** are edited on `/settings` -> **Event Hooks** (saved as `hooks.webhooks` in `settings.json`), or one more is given with `MERIDIAN_HOOK_URL`.
+- **Commands** are local operator configuration only: `hooks.commands` in `settings.json`, edited on the machine, or `MERIDIAN_HOOK_COMMAND`. No HTTP request can create, edit, enable or remove one (a request naming `commands` is refused with 403; one that omits them keeps them), and `/settings` lists them read-only as `command #<n>` (their position in `hooks.commands`) or `command MERIDIAN_HOOK_COMMAND`.
+- A command runs only for the events Meridian raises itself as a ChatGPT browser sign-in opens and closes its redirect listener (`oauth.callback.listening`, `oauth.callback.closed`). It never runs for `hooks.test`, so **Send test event** reaches webhooks only.
+- The hook settings routes answer only a management client: one of Meridian's own pages (or a client without an `Origin`), and either `MERIDIAN_API_KEY` when one is configured or, without a key, a request from Meridian's own machine to its loopback address (`http://127.0.0.1:<port>`, not through a reverse proxy: a request carrying `Forwarded`, `X-Forwarded-For` or `X-Real-IP`, or a `Host` other than exactly `localhost`, `127.x.y.z` or `[::1]` with an optional port, is refused). A reverse proxy on the same machine that strips its forwarding headers and rewrites `Host` to a loopback address cannot be told apart from a local client, so do not configure one that way in front of an instance without `MERIDIAN_API_KEY`. Elsewhere `/settings` shows why the card is unavailable.
 
 | Target | Delivery |
 | --- | --- |
 | Webhook | `POST <url>`, `Content-Type: application/json`, headers `X-Meridian-Event` and `X-Meridian-Delivery`. Any 2xx is success. Redirects are not followed. 5s limit |
 | Command | Run through the system shell with the event as JSON on **stdin**, never in argv; `MERIDIAN_HOOK_EVENT` and `MERIDIAN_HOOK_DELIVERY` are set. Exit 0 is success. 10s limit, then its process group is stopped |
 
-Each delivery is tried once. At most 16 run at once; past that an event is dropped for that target. The last 25 deliveries, with the command's first line of output (or the webhook's status), are shown on `/settings` and in `[hooks]` log lines, so a command must not print secrets. Logs name a webhook by host and a command by program name only.
+Each delivery is tried once. At most 16 run at once; past that an event is dropped for that target. `/settings` shows the last 25 deliveries by status only (`exit 0`, `HTTP 502`, `no answer in 10s, stopped`): what a command prints or a webhook answers is never returned over HTTP. Its first line goes to the `[hooks]` log line on this machine, so a command must still not print secrets. A webhook is named by host and a command by its position or `MERIDIAN_HOOK_COMMAND`, never by any part of its command line.
 
 Every event is one JSON object:
 

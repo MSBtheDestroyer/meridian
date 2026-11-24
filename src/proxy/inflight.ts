@@ -112,6 +112,32 @@ export function isLoopbackPeer(remoteAddress: string | undefined, headers: Heade
 }
 
 /**
+ * A Host header that is exactly a loopback authority: `localhost`,
+ * 127.0.0.0/8 in dotted decimal or `[::1]`, optionally `:<port>` (1-65535).
+ * Nothing else is accepted - no userinfo, path, query, fragment, trailing dot
+ * or other spelling of an address - so the value is matched as written rather
+ * than parsed as a URL, which would accept `127.0.0.1/x` or `u@127.0.0.1`.
+ */
+const OCTET = "(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)"
+const LOOPBACK_HOST_AUTHORITY = new RegExp(`^(?:localhost|127\\.${OCTET}\\.${OCTET}\\.${OCTET}|\\[::1\\])(?::([1-9]\\d{0,4}))?$`, "i")
+
+/**
+ * Whether a request's Host header names this machine's loopback address.
+ * With isLoopbackPeer it tells a client on this machine from a browser page
+ * under a foreign name that merely resolves to 127.0.0.1: such a page sends
+ * its own name as Host. A reverse proxy on this machine is refused by
+ * isLoopbackPeer when it adds forwarding headers (Caddy, nginx and most
+ * others do by default) and here when it keeps the public Host; one that
+ * strips both is indistinguishable from a local client and is trusted as one.
+ */
+export function isLoopbackHost(host: string | undefined): boolean {
+  if (!host) return false
+  const match = LOOPBACK_HOST_AUTHORITY.exec(host)
+  if (!match) return false
+  return match[1] === undefined || Number(match[1]) <= 65535
+}
+
+/**
  * The same response, with `onDone` called once its body has been fully read,
  * cancelled or has failed; at once for a response without a body.
  */

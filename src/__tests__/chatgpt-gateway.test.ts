@@ -132,6 +132,17 @@ function snapshotPoolDir() {
   return { bytes: readFileSync(poolPath), entries: readdirSync(poolDir).sort() }
 }
 
+// The hook settings routes answer only a management client; with no API key
+// that is a request on this machine to its loopback address.
+const LOOPBACK_PEER = { incoming: { socket: { remoteAddress: "127.0.0.1" } } }
+function hookRoute(app: { fetch: (request: Request, env?: unknown) => Response | Promise<Response> }, method: string, path: string, body?: unknown) {
+  return app.fetch(new Request(`http://127.0.0.1${path}`, {
+    method,
+    headers: { host: "127.0.0.1:3456", ...(body === undefined ? {} : { "content-type": "application/json" }) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  }), LOOPBACK_PEER)
+}
+
 async function server(mode: string | undefined, plugin?: string) {
   if (mode === undefined) delete process.env.MERIDIAN_CHATGPT_CREDENTIALS
   else process.env.MERIDIAN_CHATGPT_CREDENTIALS = mode
@@ -186,7 +197,7 @@ afterEach(() => {
   __setFetchOAuthUsageOverride(null)
   saveSettings({
     chatGptActiveSeat: undefined, chatGptProfileNames: undefined, chatGptProfileAliases: undefined, profileOrder: undefined,
-    routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined, routingHeldProfiles: undefined, usageReserves: undefined, chatgpt: undefined,
+    routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined, routingHeldProfiles: undefined, usageReserves: undefined, chatgpt: undefined, hooks: undefined, publicUrl: undefined,
   })
   globalThis.fetch = realFetch
   delete process.env.MERIDIAN_CHATGPT_CREDENTIALS
@@ -1304,7 +1315,9 @@ describe("owned mode signs its own seats in", () => {
     try {
       const startedRes = await post(proxy.app, "/profiles/chatgpt/connect/start", {})
       const started = await startedRes.json() as { connectId: string; authorizeUrl: string; announcements: unknown[] }
-      expect(started.announcements).toEqual([{ target: "command cat", ok: true, detail: "laptop: forwarding 127.0.0.1:1455" }])
+      // What the command printed stays in the log; the response carries its status.
+      expect(started.announcements).toEqual([{ target: "command MERIDIAN_HOOK_COMMAND", ok: true, detail: "exit 0" }])
+      expect(JSON.stringify(started)).not.toContain("laptop")
       const listening = JSON.parse(readFileSync(events, "utf8").trim()) as { event: string; callback: { id: string; url: string; redirect: { port: number } } }
       expect(listening).toMatchObject({ event: "oauth.callback.listening", callback: { redirect: { port: 1455 } } })
       expect(listening.callback.url).toBe(`https://meridian.example/callback/${listening.callback.id}`)
@@ -1338,25 +1351,95 @@ describe("owned mode signs its own seats in", () => {
     }
   })
 
-  it("keeps hook settings behind validation and reports the environment's targets by label only", async () => {
+  it("keeps hook settings behind validation and names every target by a fixed label only", async () => {
     process.env.MERIDIAN_HOOK_COMMAND = "TOKEN=secret-value /opt/bin/vibeterm-oauth-relay --flag"
     const proxy = await server("owned")
     try {
-      const put = (body: unknown) => proxy.app.fetch(new Request("http://localhost/settings/api/hooks", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }))
+      const put = (body: unknown) => hookRoute(proxy.app, "PUT", "/settings/api/hooks", body)
       expect((await put({ hooks: { webhooks: [{ url: "ftp://x" }] } })).status).toBe(400)
       expect((await put({ publicUrl: "https://u:p@host.example" })).status).toBe(400)
       expect((await put({ hooks: { webhooks: [{ url: "https://hooks.example/a" }] }, publicUrl: "https://meridian.example/" })).status).toBe(200)
-      const text = await (await proxy.app.fetch(new Request("http://localhost/settings/api/hooks"))).text()
+      const text = await (await hookRoute(proxy.app, "GET", "/settings/api/hooks")).text()
       expect(text).not.toContain("secret-value")
+      expect(text).not.toContain("oauth-relay")
       expect(JSON.parse(text)).toMatchObject({
         saved: { webhooks: [{ url: "https://hooks.example/a" }] },
-        environment: { webhook: null, command: "command vibeterm-oauth-relay" },
+        environment: { webhook: null, command: "command MERIDIAN_HOOK_COMMAND" },
         publicUrl: { saved: "https://meridian.example", env: null, effective: "https://meridian.example" },
       })
       expect((await put({ hooks: {}, publicUrl: null })).status).toBe(200)
       expect(getSetting("publicUrl")).toBeUndefined()
     } finally {
       delete process.env.MERIDIAN_HOOK_COMMAND
+    }
+  })
+
+  it("never lets HTTP create, edit, remove, read or run a command target", async () => {
+    const marker = join(dir, "command-ran")
+    const proxy = await server("owned")
+    try {
+      saveSettings({ hooks: { commands: [{ command: `TOKEN=saved-secret touch '${marker}'`, events: ["oauth.callback.closed", "hooks.test"] }] } })
+      const saved = getSetting("hooks")?.commands
+      const put = (body: unknown) => hookRoute(proxy.app, "PUT", "/settings/api/hooks", body)
+      expect((await put({ hooks: { commands: [] } })).status).toBe(403)
+      expect((await put({ hooks: { webhooks: [], commands: [{ command: "true" }] } })).status).toBe(403)
+      expect(getSetting("hooks")?.commands).toEqual(saved)
+      // Saving webhooks, or nothing, keeps the operator's commands.
+      expect((await put({ hooks: { webhooks: [{ url: "https://hooks.example/b" }] } })).status).toBe(200)
+      expect((await put({ hooks: {} })).status).toBe(200)
+      expect(getSetting("hooks")?.commands).toEqual(saved)
+
+      const listed = await (await hookRoute(proxy.app, "GET", "/settings/api/hooks")).text()
+      expect(listed).not.toContain("saved-secret")
+      expect(listed).not.toContain(marker)
+      expect(JSON.parse(listed).commands).toEqual([{ target: "command #1", events: ["oauth.callback.closed", "hooks.test"] }])
+
+      // The test action reaches webhooks only, even a command that lists hooks.test.
+      const tested = await (await hookRoute(proxy.app, "POST", "/settings/api/hooks/test")).json() as { deliveries: unknown[] }
+      expect(tested.deliveries).toEqual([])
+      expect(existsSync(marker)).toBe(false)
+
+      // Writers of other settings cannot set hooks either.
+      for (const path of ["/settings/api/routing", "/settings/api/telemetry"]) {
+        await proxy.app.fetch(new Request(`http://localhost${path}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ hooks: { commands: [{ command: "true" }] }, publicUrl: "https://elsewhere.example" }),
+        }))
+      }
+      expect(getSetting("hooks")?.commands).toEqual(saved)
+      expect(getSetting("publicUrl")).toBeUndefined()
+    } finally {
+      saveSettings({ hooks: undefined })
+    }
+  })
+
+  it("answers hook settings only to a management client", async () => {
+    const proxy = await server("owned")
+    const attempt = (headers: Record<string, string>, peer: string | undefined) => Promise.all([
+      proxy.app.fetch(new Request("http://127.0.0.1/settings/api/hooks", { headers }), peer ? { incoming: { socket: { remoteAddress: peer } } } : undefined),
+      proxy.app.fetch(new Request("http://127.0.0.1/settings/api/hooks", { method: "PUT", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ publicUrl: "https://elsewhere.example" }) }), peer ? { incoming: { socket: { remoteAddress: peer } } } : undefined),
+      proxy.app.fetch(new Request("http://127.0.0.1/settings/api/hooks/test", { method: "POST", headers }), peer ? { incoming: { socket: { remoteAddress: peer } } } : undefined),
+    ]).then(responses => responses.map(response => response.status))
+    try {
+      // No API key configured: only this machine, at its loopback address.
+      expect(await attempt({ host: "127.0.0.1:3456" }, "127.0.0.1")).toEqual([200, 200, 200])
+      expect(await attempt({ host: "localhost:3456" }, "::1")).toEqual([200, 200, 200])
+      expect(await attempt({ host: "127.0.0.1:3456" }, "192.168.1.20")).toEqual([403, 403, 403])
+      expect(await attempt({ host: "127.0.0.1:3456" }, undefined)).toEqual([403, 403, 403])
+      expect(await attempt({ host: "meridian.example" }, "127.0.0.1")).toEqual([403, 403, 403])
+      expect(await attempt({ host: "127.0.0.1:3456", "x-forwarded-for": "203.0.113.9" }, "127.0.0.1")).toEqual([403, 403, 403])
+      expect(await attempt({ host: "127.0.0.1:3456", origin: "https://elsewhere.example" }, "127.0.0.1")).toEqual([403, 403, 403])
+      saveSettings({ publicUrl: undefined })
+
+      // With a key, the key is the authentication, from anywhere.
+      process.env.MERIDIAN_API_KEY = "test-management-key"
+      expect(await attempt({ host: "meridian.example" }, "192.168.1.20")).toEqual([401, 401, 401])
+      expect(await attempt({ host: "meridian.example", "x-api-key": "test-management-key" }, "192.168.1.20")).toEqual([200, 200, 200])
+      expect(await attempt({ host: "meridian.example", "x-api-key": "test-management-key", origin: "https://elsewhere.example" }, "192.168.1.20")).toEqual([403, 403, 403])
+    } finally {
+      delete process.env.MERIDIAN_API_KEY
+      saveSettings({ publicUrl: undefined })
     }
   })
 
