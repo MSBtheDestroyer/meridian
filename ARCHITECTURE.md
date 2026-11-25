@@ -317,11 +317,14 @@ src/
 │   │   ├── storeDatabase.ts   ← SQLite database behind the session store and lifecycle journal (WAL, off-loop commits)
 │   │   └── durableFileSystem.ts ← Durable file operations
 │   ├── sessionStore.ts        ← Shared session store (cross-proxy session resume)
+│   ├── sessionGcLimits.ts     ← Session GC deletion, shutdown and backlog limits and their resolution (PURE)
 │   ├── profiles.ts            ← Multi-profile support: resolve, list, switch auth contexts (leaf)
 │   ├── profileCli.ts          ← CLI commands for profile management (leaf, I/O)
 │   ├── authLifecycle.ts       ← Credential-keyed login, renewal, refusal and recovery records (leaf, I/O)
 │   ├── profileLoginState.ts   ← Shared effective login decision and Claude metadata reconciliation (leaf)
 │   ├── profileConfigStore.ts  ← cross-process profile writer lock and atomic snapshots (leaf, I/O)
+│   ├── lockedFile.ts          ← Cross-process writer lock and atomic snapshot publication for Meridian's own files (leaf, I/O)
+│   ├── authLifecycle.ts       ← Per-credential login history: logins, renewals, logouts (leaf, I/O)
 │   ├── profileLogin.ts        ← Browser re-authentication state, redirect/paste completion and status
 │   ├── profileAdd.ts          ← Browser profile creation and isolated credential persistence
 │   ├── profileOAuthBody.ts    ← Runtime schemas for browser OAuth request bodies (pure)
@@ -404,7 +407,7 @@ server.ts (HTTP layer)
 
 2. **`session/cache.ts` owns all mutable session state.** No other module should create or manage LRU caches for sessions.
 
-3. **`errors.ts`, `retryAfter.ts`, `toolInputJson.ts`, `models.ts`, `tools.ts`, `messages.ts`, `profiles.ts`, `profileCli.ts`, `buildInfo.ts`, `updateCheck.ts`, `pluginUpdateCheck.ts`, `sseFailureSniff.ts` are leaf modules.** They must not import from `server.ts`, `session/`, or `adapter.ts`. `buildInfo.ts`, `retryAfter.ts` and `toolInputJson.ts` are additionally pure — every export is a function of its arguments (plus `process.env` for `buildInfo.ts`), so the registry I/O lives in `updateCheck.ts` and `pluginUpdateCheck.ts` instead. `sseFailureSniff.ts` keeps pure framing separate from reader/queue lifecycle helpers; account selection, publication and durable settlement remain in `server.ts`.
+3. **`errors.ts`, `retryAfter.ts`, `toolInputJson.ts`, `models.ts`, `tools.ts`, `messages.ts`, `profiles.ts`, `profileCli.ts`, `buildInfo.ts`, `updateCheck.ts`, `pluginUpdateCheck.ts`, `sseFailureSniff.ts`, `sessionGcLimits.ts` are leaf modules.** They must not import from `server.ts`, `session/`, or `adapter.ts`. `buildInfo.ts`, `retryAfter.ts`, `toolInputJson.ts` and `sessionGcLimits.ts` are additionally pure — every export is a function of its arguments (plus `process.env` for `buildInfo.ts`), so the registry I/O lives in `updateCheck.ts` and `pluginUpdateCheck.ts` instead. `sseFailureSniff.ts` keeps pure framing separate from reader/queue lifecycle helpers; account selection, publication and durable settlement remain in `server.ts`.
 
 4. **`server.ts` owns Hono route registration and orchestration.** Hono
    middleware stays at the proxy boundary. Standard `Request`/`Response`
@@ -462,7 +465,8 @@ Agent-specific behavior is isolated behind the `AgentAdapter` interface (`adapte
 | `getSessionId(c)` | Extract session ID from request headers |
 | `getAgentMode(c, body)` | Normalize an adapter-specific primary/subagent declaration |
 | `getRootSessionId(c, body)` | Optional conversation root for account routing (sticky and priority assignment): a subagent with a session key of its own stays on its parent's account (Claude Code's Agent tool) |
-| `isAuxiliaryRequest(c, body)` | Declare a side call that shares the conversation's session key: it skips session lookup, publication and the turn lease (Claude Code's auto-mode classifier, progress captions and tool-less side calls) |
+| `isAuxiliaryRequest(c, body)` | Declare a side call that shares the conversation's session key: it skips publication and the turn lease and never touches the mapping (Claude Code's auto-mode classifier, progress captions and tool-less side calls; Oh My Pi's side calls) |
+| `forksAuxiliaryRequests` | The client's side calls send the conversation's own system prompt and tools: one that only adds user text after a completed turn resumes the conversation's session as an unpublished fork that leases only its own target (`auxiliaryLineage`); every other side call replays fresh (Oh My Pi) |
 | `extractWorkingDirectory(body)` | Parse working directory from request body |
 | `normalizeContent(content)` | Normalize message content for hashing |
 | `getBlockedBuiltinTools()` | SDK tools replaced by agent's MCP equivalents |
@@ -641,9 +645,46 @@ mapping replays once when the plugin first supplies primary-agent identity.
 The cache and shared store publish the digest with the mapping; `server.ts`
 uses the existing execution-history replay boundary. Dynamic file-tree and
 diagnostic context within the same agent retains ordinary resume, as do
-clients without this explicit identity. Editing instructions without changing
-the primary agent remains subject to the native resume limitation. Prompt text
-is never added to the store.
+clients without this explicit identity. Prompt text is never added to the
+store.
+
+The native CLI records the system prompt on a conversation's first request and
+resends that record on every resume (Claude Code's `--system-prompt-snapshot`,
+on by default), even when a later request passes different text. Editing an
+instruction file therefore does not reach a resumed conversation by itself.
+`adapters/opencodeInstructionSections.ts` splits OpenCode's system prompt into
+one section per `Instructions from: <path>` file, and
+`session/instructionSections.ts` publishes a sha256 digest of each section's
+path and text with the mapping (`instructionSections`). A fresh SDK session
+publishes the sections it rendered; a resume keeps the stored digests and
+compares them against the current sections. The environment, MCP and skill
+parts of the prompt are never hashed, so their per-turn churn keeps ordinary
+resume. A mapping published without digests adopts the current sections as its
+baseline.
+
+When a resumed turn finds sections changed, it appends one `<system-reminder>`
+to that turn's SDK input carrying each new or changed file whole (removals are
+stated by naming the files that still apply), and publishes the current
+digests, so the reminder is sent once. The cached prefix is kept: the turn
+writes only the reminder to cache instead of rewriting the conversation. The
+reminder is SDK input only. Lineage, message hashes and the SDK UUID mapping
+are computed from the client's messages, which it never enters, so resume
+proof is unchanged. It is appended after any `tool_result` blocks, which must
+open a user turn. Each reminder adds to the transcript, so a client that wants
+removed or contradicting rules gone entirely uses the reset below.
+
+An explicit reset (`systemPromptReset.ts`: the `x-meridian-system-prompt-reset`
+request header, or `POST /v1/sessions/:key/system-prompt-reset`, which arms the
+next publishing turn of that client key in this process) takes the existing
+execution-replay boundary with reason `system_prompt_reset`: the client history
+replays into a fresh SDK session, which renders the current system prompt.
+Claude Code offers no switch that re-renders a recorded prompt in place. Both
+candidates were probed against CLI 2.1.322 on a resumed Meridian session:
+`CLAUDE_CODE_HOST_PROMPT_SUPERSEDES_RECORD=1` left the model answering from the
+recorded prompt, and one launch with `--system-prompt-snapshot off` rendered
+the new prompt for that turn only. The next ordinary launch resent the
+original record. Turning the snapshot off for every turn would rewrite the
+cache whenever a dynamic prompt part changed, so it is not used.
 
 ### Lineage Verification
 
@@ -882,6 +923,8 @@ Existing v1 digests cannot establish a v2 prefix. Their next request on an upgra
 A trailing user tool-result slot may gain new content while every stored block remains an exact prefix. Lineage verification allows that continuation and sends only the appended canonical blocks; duplicate result IDs, edits and meaningful removals still replay. This supports text, images and other appended content without treating an ordinary user-message edit as an append-only tool continuation.
 
 The OpenCode adapter separately recognizes complete `user-prompt-submit-hook` JSON envelopes for UserPromptSubmit additional context and common SDK hook-control fields, including `continue`. These per-turn blocks remain in the original SDK request but are excluded from durable lineage comparisons when a durable block remains. Unknown/malformed envelopes, surrounding prose, hook-only messages and assistant-authored lookalikes remain significant. Other adapters do not inherit this rule. A subset of arbitrary user blocks is never sufficient proof of a continuation.
+
+The Claude Code adapter has a rule of its own, for mid-conversation `system` turns only. claude-cli ends a tool-result request with one, and on some models appends a reminder that it sends with that request and never again (`claude-fable-5-1` on 2.1.284 through 2.1.301). Only the exact known batching reminder at the end of a `system` turn is excluded from lineage; every other block remains significant, including durable instructions after a cache breakpoint. The turn keeps its position, and user and assistant turns are never trimmed. A `system` turn holding the reminder alone (seen on 2.1.294) is left out of the lineage only when it ends the request, so no other message moves; the reply's SDK message UUID is then recorded at the lineage's length, where the client puts the reply next time. A reminder-only turn anywhere else is kept whole. This trailing drop is the only owner-approved exception (2026-11-22, #1396) to #879's rule that lineage canonicalization preserves message count; no other adapter may drop a message. The original request still reaches the SDK with the reminder in it. The E2E.md section "Claude Code system turns across tool rounds" has the captured shapes.
 
 Structured resume deltas are delivered in one SDK user input, matching text-delta delivery. SDK streamed inputs are independently answered live turns; splitting a growing request's appended context from its final question can yield concatenated answers. The shared pure coalescer preserves result wrappers and media order, and also backs fresh replay framing.
 

@@ -272,6 +272,7 @@ function toolCallItem(
 
 /** What one Codex turn says about the conversation it belongs to. */
 export interface CodexThreadIdentity {
+  threadId?: string
   /** Conversation key for session resume — the codex adapter's `x-codex-session`. */
   sessionKey?: string
   /** Concurrency declaration for a turn that is not the thread the user drives. */
@@ -364,7 +365,9 @@ export function resolveCodexThreadIdentity(
     ?? parseCodexTurnMetadata(codexTurnMetadataFromBody(body))
   const identity: CodexThreadIdentity = {}
 
-  const threadKey = nonEmptyString(metadata?.thread_id) ?? nonEmptyString(body.prompt_cache_key)
+  const threadId = nonEmptyString(metadata?.thread_id)
+  if (threadId) identity.threadId = threadId
+  const threadKey = threadId ?? nonEmptyString(body.prompt_cache_key)
 
   const kind = nonEmptyString(metadata?.request_kind)
   const kindTag = kind && kind !== CODEX_TURN_KIND ? codexTag(kind) : undefined

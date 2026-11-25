@@ -19,10 +19,13 @@
  *             The event never goes on the command line: argv is readable by
  *             every process on the machine, a pipe is not.
  *
- * Targets come from settings.json (`hooks`, edited on /settings) plus
- * MERIDIAN_HOOK_URL and MERIDIAN_HOOK_COMMAND, which add one target each and
- * are shown read-only. They are re-read for every event, so an edit applies to
- * the next one without a restart.
+ * Webhooks come from settings.json (`hooks.webhooks`, edited on /settings)
+ * plus MERIDIAN_HOOK_URL. Commands come only from what the operator configured
+ * on this machine - settings.json `hooks.commands` or MERIDIAN_HOOK_COMMAND -
+ * because one runs a shell as Meridian's user: no HTTP route writes them, and
+ * they run only for COMMAND_HOOK_EVENTS, never for the test button. Targets
+ * are re-read for every event, so an edit applies to the next one without a
+ * restart.
  *
  * DELIVERY IS BOUNDED AND NEVER RETRIED. A webhook gets 5 seconds and a
  * command 10, then it is abandoned (a command's whole process group is
@@ -33,10 +36,13 @@
  * the drop is recorded.
  *
  * NO EVENT CARRIES A SECRET: no code, state, verifier, token or API key. Logs
- * name a webhook by its host and a command by its program name, never the full
+ * name a webhook by its host and a command by its position, never the full
  * URL (webhook URLs often carry a token in the path) or the command line
- * (which may set credentials in its environment). A command's first line of
- * output IS logged and shown on /settings, so a hook must not print secrets.
+ * (which may set credentials in its environment). What a target answers - a
+ * command's output, a webhook's response body - is never returned over HTTP:
+ * a delivery's `detail` is its status only (`exit 0`, `HTTP 502`, `no answer
+ * in 10s, stopped`). The first line of that answer goes to this process's own
+ * log, so a hook must still not print secrets.
  *
  * Leaf module: node builtins and the settings type only.
  */
@@ -47,6 +53,14 @@ import type { MeridianHookSettings } from "../settings"
 
 export const HOOK_EVENTS = ["oauth.callback.listening", "oauth.callback.closed", "hooks.test"] as const
 export type HookEventName = (typeof HOOK_EVENTS)[number]
+
+/**
+ * The only events a command target is run for: ones Meridian raises itself,
+ * as a ChatGPT browser sign-in opens and closes its redirect listener. A
+ * command never runs for `hooks.test`, so the settings page's test button,
+ * an HTTP request, reaches webhooks only.
+ */
+export const COMMAND_HOOK_EVENTS: readonly HookEventName[] = ["oauth.callback.listening", "oauth.callback.closed"]
 
 /** How many targets of each kind settings.json may hold, and how long a value may be. */
 export const HOOK_LIMITS = { webhooks: 10, commands: 10, urlLength: 2048, commandLength: 4096 } as const
@@ -68,7 +82,12 @@ export interface HookTarget {
   /** Events this target receives; every event when absent or empty. */
   events?: HookEventName[]
   source: "settings" | "env"
+  /** A saved command's 1-based position in settings.json `hooks.commands`, its only name. */
+  position?: number
 }
+
+/** What one delivery came to: `detail` is status only, `said` the target's first line, for the log only. */
+type DeliveryResult = { ok: boolean; detail: string; said?: string }
 
 export interface HookDelivery {
   at: number
@@ -133,24 +152,13 @@ function lines(text: string): string[] {
 const firstLine = (text: string) => lines(text)[0] ?? ""
 const lastLine = (text: string) => lines(text).at(-1) ?? ""
 
-const COMMAND_WRAPPERS = new Set(["exec", "env", "nohup", "command", "nice", "time"])
-
 /**
- * The program a command line runs, for logs: `HOME=/x exec /a/b/relay --flag`
- * is `relay`. Assignments, wrappers and their flags are skipped and no
- * argument is ever shown, because a command line is where people put secrets.
+ * How a target is named in logs and on /settings: a webhook by host, a command
+ * by where it is configured. No part of a command line is ever shown: shell
+ * text cannot be parsed reliably enough to prove a fragment holds no secret
+ * (`KEY="a b" relay` splits inside the value), so the name is fixed.
  */
-export function hookProgramName(command: string): string {
-  for (const raw of command.trim().split(/\s+/)) {
-    const token = raw.replace(/^['"]+|['"]+$/g, "")
-    if (!token || token.startsWith("-") || COMMAND_WRAPPERS.has(token) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) continue
-    return token.split(/[\\/]/).pop() || "(command)"
-  }
-  return "(command)"
-}
-
-/** How a target is named in logs and on /settings: a webhook by host, a command by program. */
-export function hookTargetLabel(target: Pick<HookTarget, "kind" | "value">): string {
+export function hookTargetLabel(target: Pick<HookTarget, "kind" | "value" | "source" | "position">): string {
   if (target.kind === "webhook") {
     try {
       return `webhook ${new URL(target.value).host}`
@@ -158,7 +166,7 @@ export function hookTargetLabel(target: Pick<HookTarget, "kind" | "value">): str
       return "webhook (invalid URL)"
     }
   }
-  return `command ${hookProgramName(target.value)}`
+  return target.source === "env" ? "command MERIDIAN_HOOK_COMMAND" : `command #${target.position ?? "?"}`
 }
 
 function validWebhookUrl(value: string): boolean {
@@ -237,8 +245,10 @@ export function resolveHookTargets(saved: MeridianHookSettings | undefined, envi
   for (const entry of Array.isArray(saved?.webhooks) ? saved.webhooks : []) {
     if (typeof entry?.url === "string" && validWebhookUrl(entry.url)) targets.push({ kind: "webhook", value: entry.url, events: eventsOf(entry.events), source: "settings" })
   }
-  for (const entry of Array.isArray(saved?.commands) ? saved.commands : []) {
-    if (typeof entry?.command === "string" && entry.command.trim()) targets.push({ kind: "command", value: entry.command, events: eventsOf(entry.events), source: "settings" })
+  for (const [index, entry] of (Array.isArray(saved?.commands) ? saved.commands : []).entries()) {
+    if (typeof entry?.command === "string" && entry.command.trim()) {
+      targets.push({ kind: "command", value: entry.command, events: eventsOf(entry.events), source: "settings", position: index + 1 })
+    }
   }
   const url = environment.url?.trim()
   if (url && validWebhookUrl(url)) targets.push({ kind: "webhook", value: url, source: "env" })
@@ -289,7 +299,7 @@ export function createHookDispatcher(options: HookDispatcherOptions): HookDispat
     recent.length = Math.min(recent.length, RECENT_LIMIT)
   }
 
-  const deliverWebhook = async (url: string, event: HookEventName, id: string, body: string): Promise<{ ok: boolean; detail: string }> => {
+  const deliverWebhook = async (url: string, event: HookEventName, id: string, body: string): Promise<DeliveryResult> => {
     let response: Response
     try {
       response = await fetchImpl(url, {
@@ -309,10 +319,10 @@ export function createHookDispatcher(options: HookDispatcherOptions): HookDispat
       const code = errorCode(error)
       return { ok: false, detail: code === "TimeoutError" || code === "AbortError" ? `no answer in ${webhookTimeoutMs / 1000}s` : `unreachable (${code})` }
     }
-    const answer = firstLine(await readSome(response, RESPONSE_LIMIT).catch(() => ""))
-    if (response.status >= 200 && response.status < 300) return { ok: true, detail: answer || `HTTP ${response.status}` }
+    const said = firstLine(await readSome(response, RESPONSE_LIMIT).catch(() => ""))
+    if (response.status >= 200 && response.status < 300) return { ok: true, detail: `HTTP ${response.status}`, said }
     const redirected = response.status >= 300 && response.status < 400 ? " (redirects are not followed)" : ""
-    return { ok: false, detail: `HTTP ${response.status}${redirected}${answer ? `: ${answer}` : ""}` }
+    return { ok: false, detail: `HTTP ${response.status}${redirected}`, said }
   }
 
   const stop = (child: ChildProcess, signal: NodeJS.Signals) => {
@@ -326,7 +336,7 @@ export function createHookDispatcher(options: HookDispatcherOptions): HookDispat
     }
   }
 
-  const deliverCommand = (command: string, event: HookEventName, id: string, body: string): Promise<{ ok: boolean; detail: string }> =>
+  const deliverCommand = (command: string, event: HookEventName, id: string, body: string): Promise<DeliveryResult> =>
     new Promise(resolve => {
       let child: ChildProcess
       try {
@@ -346,7 +356,7 @@ export function createHookDispatcher(options: HookDispatcherOptions): HookDispat
       let timedOut = false
       let settled = false
       let killTimer: ReturnType<typeof setTimeout> | undefined
-      const finish = (result: { ok: boolean; detail: string }) => {
+      const finish = (result: DeliveryResult) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
@@ -373,11 +383,10 @@ export function createHookDispatcher(options: HookDispatcherOptions): HookDispat
           return
         }
         if (code === 0) {
-          finish({ ok: true, detail: firstLine(stdout) || "exit 0" })
+          finish({ ok: true, detail: "exit 0", said: firstLine(stdout) })
           return
         }
-        const said = lastLine(stderr) || firstLine(stdout)
-        finish({ ok: false, detail: `exit ${code ?? signal ?? "?"}${said ? `: ${said}` : ""}` })
+        finish({ ok: false, detail: `exit ${code ?? signal ?? "?"}`, said: lastLine(stderr) || firstLine(stdout) })
       })
     })
 
@@ -395,11 +404,12 @@ export function createHookDispatcher(options: HookDispatcherOptions): HookDispat
     inFlight++
     const started = now()
     const attempt = target.kind === "webhook" ? deliverWebhook(target.value, event, id, body) : deliverCommand(target.value, event, id, body)
-    const settle = (result: { ok: boolean; detail: string }) => {
+    const settle = (result: DeliveryResult) => {
       record.ok = result.ok
       record.detail = sanitize(result.detail)
       record.ms = now() - started
-      log(`[hooks] ${event} -> ${label}: ${result.ok ? "ok" : "failed"} in ${record.ms}ms${record.detail ? `: ${record.detail}` : ""}`)
+      const said = result.said ? sanitize(result.said) : ""
+      log(`[hooks] ${event} -> ${label}: ${result.ok ? "ok" : "failed"} in ${record.ms}ms${record.detail ? `: ${record.detail}` : ""}${said ? ` (said: ${said})` : ""}`)
     }
     const done = attempt
       .then(settle, (error: unknown) => settle({ ok: false, detail: `failed (${errorCode(error)})` }))
@@ -412,7 +422,9 @@ export function createHookDispatcher(options: HookDispatcherOptions): HookDispat
       let targets: HookTarget[]
       let instance: HookInstance
       try {
-        targets = options.targets().filter(target => !target.events?.length || target.events.includes(event))
+        targets = options.targets()
+          .filter(target => target.kind !== "command" || COMMAND_HOOK_EVENTS.includes(event))
+          .filter(target => !target.events?.length || target.events.includes(event))
         instance = options.instance()
       } catch (error) {
         log(`[hooks] ${event}: could not read hook targets (${errorCode(error)})`)

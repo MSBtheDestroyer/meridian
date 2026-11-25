@@ -16,9 +16,14 @@ import { profileProvidersCss, profileProvidersJs } from "./profileProviders"
 import { profileLoginStatesCss, profileLoginStatesJs } from "./profileLoginStates"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "./profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT, isUnusableJs } from "./profileSpent"
+import { freeResetView } from "./freeResets"
 import { domPatchJs } from "./domPatch"
 import { profileCardStatusCss, profileCardStatusJs } from "./profileCardStatus"
+import { ICON_REFRESH_SVG, profileActionsCss, profileActionsJs } from "./profileActions"
 import { textSelectionJs } from "./textSelection"
+import { profileTableCss, profileTableJs } from "./profileTable"
+import { profileTableFactsJs } from "./profileTableFacts"
+import { profileTableRoutingJs } from "./profileTableRouting"
 
 export const landingHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -94,6 +99,10 @@ export const landingHtml = `<!DOCTYPE html>
   .profile-card.spend-fading:hover > *, .profile-card.spend-spent:hover > * { filter: none; opacity: 1; }
   .profile-card.active.spend-fading > .profile-head, .profile-card.active.spend-spent > .profile-head { filter: none; opacity: 1; }
   .profile-card.active.spend-fading > .card-strip, .profile-card.active.spend-spent > .card-strip { filter: none; opacity: 1; }
+  .profile-card.spend-fading > .profile-head:focus-within, .profile-card.spend-spent > .profile-head:focus-within { filter: none; opacity: 1; }
+  /* A refresh's outcome is what someone just asked for, and its states are
+     told apart by colour, so the fade never reaches it. */
+  .profile-card.spend-fading > .refresh-outcome, .profile-card.spend-spent > .refresh-outcome { filter: none; opacity: 1; }
   .profile-card.needs-login { border-color: var(--red); }
   .profile-card.needs-login .prof-dot { background: var(--red); }
   .spend-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
@@ -107,6 +116,16 @@ export const landingHtml = `<!DOCTYPE html>
   ${profileProvidersCss}
   ${profileLoginStatesCss}
   ${profileCardStatusCss}
+  ${profileActionsCss}
+  ${profileTableCss}
+  /* Refresh: a small control at the end of the card's name row. The card
+     itself is the switch button, so the click handler lets it opt out. */
+  .profile-refresh {
+    background: var(--bg); color: var(--muted); border: 1px solid var(--border); border-radius: 4px;
+    padding: 3px 5px; margin-left: 8px; cursor: pointer; display: inline-flex; align-items: center; flex-shrink: 0; align-self: center;
+  }
+  .profile-refresh:hover, .profile-refresh:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+  @media (max-width: 720px) { .profile-refresh { min-width: 32px; min-height: 32px; justify-content: center; } }
   /* The name row carries every badge the card can earn - Active, the plan
      chip, pool position, exhausted/refused, needs login, spent - and on a
      narrow card they do not fit beside the cost. The row wraps its badges
@@ -213,7 +232,21 @@ export const landingHtml = `<!DOCTYPE html>
   .spent-banner { font-size: 12px; line-height: 1.45; color: var(--text); margin-bottom: 10px;
     padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(248,81,73,0.35); background: rgba(248,81,73,0.1); }
   .spent-banner strong { color: var(--red); }
-  .spent-banner-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .spent-banner-sub { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+  /* The banner is the out-of chip's tooltip, on hover or focus, hung from the
+     name row and spanning the card as .prof-pop does. It lies over the
+     figures, so the banner's red tint is layered on an opaque surface. */
+  .spent-tip { display: inline-flex; }
+  .spent-tip .pool-chip { cursor: help; }
+  .spent-tip .pool-chip:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+  .spent-banner.spent-pop { position: absolute; top: calc(100% + 8px); left: -14px; right: -14px; z-index: 20; margin: 0;
+    background: linear-gradient(rgba(248,81,73,0.1), rgba(248,81,73,0.1)), var(--surface);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.35); font-weight: 400; letter-spacing: 0; text-align: left; cursor: default;
+    opacity: 0; visibility: hidden; transition: opacity 0.12s; }
+  .spent-tip:hover .spent-pop, .spent-tip:focus-within .spent-pop { opacity: 1; visibility: visible; }
+  @media (max-width: 720px) {
+    .spent-banner.spent-pop { left: -4px; right: -4px; }
+  }
   .usage-row .w-pct { width: 38px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
   .usage-row .w-reset { color: var(--muted); font-size: 11px; width: 76px; text-align: right; }
   .no-usage { font-size: 12px; color: var(--muted); padding: 4px 0; }
@@ -234,6 +267,10 @@ export const landingHtml = `<!DOCTYPE html>
   .credits-row .w-credits.serving { color: var(--yellow); }
   .credits-row .w-credits-note { color: var(--muted); font-size: 11px; text-align: right; min-width: 0; overflow-wrap: anywhere; }
   .credits-row .w-credits-note.credits-pace { flex: 1; text-align: left; }
+  /* Banked free resets, one row per kind: green while one can be redeemed, muted otherwise. */
+  .resets-row .w-label { width: auto; min-width: 64px; white-space: nowrap; }
+  .resets-row .w-credits { color: var(--green); }
+  .resets-row.held .w-credits { color: var(--muted); }
   .pool-chip.on-credits, .pool-chip.reserved { color: var(--yellow); background: rgba(210,153,34,0.15); }
 
   /* Traffic strip — one compact surface */
@@ -321,6 +358,18 @@ var GENERAL_WINDOW_TYPES=${JSON.stringify(GENERAL_WINDOW_TYPES)};
 var FADE_FROM=${FADE_FROM};
 var SPENT_AT=${SPENT_AT};
 ${isUnusableJs}
+// Shared with /profiles (freeResets.ts), so both pages count an account's resets alike.
+var freeResetView=${freeResetView.toString()};
+// One row per kind, since each clears something different; the row is muted
+// while nothing of its kind can be redeemed, and its note says why.
+function freeResetRows(resets){
+  if(!resets)return '';
+  return resets.groups.map(function(g){
+    return '<div class="usage-row credits-row resets-row'+(g.muted?' held':'')+'" title="'+esc(g.title)+'"><span class="w-label">'+esc(g.shortName)+'</span>'
+      +'<span class="w-credits">'+esc(g.value)+'</span>'
+      +'<span class="w-credits-note">'+esc(g.note)+'</span></div>';
+  }).join('');
+}
 function generalUtilization(windows,provider){
   var everyWindow=provider==='chatgpt';
   var worst=null;
@@ -399,9 +448,14 @@ ${profileProvidersJs}
 ${profileLoginStatesJs}
 ${domPatchJs}
 ${profileCardStatusJs}
+${profileActionsJs}
 ${textSelectionJs}
+${profileTableJs("home")}
+${profileTableFactsJs}
+${profileTableRoutingJs}
 
 var providersPresent=[];
+var lastRouting=null;
 // How many cards the login-state chips count; below two they are not drawn.
 var loginTotal=0;
 
@@ -416,6 +470,7 @@ function cardShown(group,state,updating){
 // page, so a drag still saves their place in the order. A heading shows while
 // any card of its provider does.
 function applyProviderFilter(){
+  if(meridianProfileTable.isTable()&&lastData){render.apply(null,lastData);return}
   var root=document.getElementById('content');
   var cards=root.querySelectorAll('.profile-card[data-group]');
   var groupShown={};var shown=0;
@@ -504,7 +559,7 @@ function profileCost(byProfile,p){
   return sum;
 }
 
-function infoIcon(entry,type){
+function infoFacts(entry){
   var facts=profileFacts(entry);
   var rows='';
   for(var i=0;i<facts.length;i++){
@@ -516,11 +571,15 @@ function infoIcon(entry,type){
     rows+='<span class="prof-pop-label">'+esc(f.label)+'</span>'
       +'<span class="prof-pop-value'+tone+'"'+title+'>'+esc(f.value)+cached+explanation+'</span>';
   }
+  return rows;
+}
+
+function infoIcon(entry,type){
   return '<span class="prof-info">'
     +'<span class="prof-info-dot" tabindex="0" role="button" aria-label="Details for '+esc(entry.id)+'">i</span>'
     +'<span class="prof-pop" role="tooltip">'
     +'<span class="prof-pop-type">'+esc(type||'claude-max')+'</span>'
-    +'<span class="prof-pop-grid">'+rows+'</span>'
+    +'<span class="prof-pop-grid">'+infoFacts(entry)+'</span>'
     +'<a class="prof-pop-link" href="'+esc(profileHref(entry.id))+'">Open in Profiles \\u2192</a>'
     +'</span></span>';
 }
@@ -566,7 +625,8 @@ function profileSection(q,s,pl,h){
     var quota=quotaByProfile[p.id]||{};
     return computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,provider:p.entry&&p.entry.provider}).fraction;
   }
-  profs=sortProfilesForView(profs,viewSort,spentOf);
+  var tableMode=meridianProfileTable.isTable();
+  if(!tableMode)profs=sortProfilesForView(profs,viewSort,spentOf);
   // One grid, a group per provider. Grouping keeps the order each card
   // arrived in, so the view sort above applies within every group.
   var groups=meridianProviders.group(profs,function(p){return meridianProviders.providerOf(p.entry||p)});
@@ -587,6 +647,7 @@ function profileSection(q,s,pl,h){
   for(var g=0;g<slots.length;g++)if(cardShown(slots[g].provider,loginStates[g],updatingOf(slots[g].item))){groupShown[slots[g].provider]=true;anyCardShown=true}
   var reorderable=multi&&!meridianReorder.envPinned()&&viewSort==='configured';
   var cards='';
+  var tableRows=[];
   var shown=[];
   var pos=0;
   for(var i=0;i<slots.length;i++){
@@ -594,7 +655,7 @@ function profileSection(q,s,pl,h){
     var update=updateOf(slot.item);
     var updating=!!(update&&update.state==='updating');
     var cardHidden=!cardShown(slot.provider,loginStates[i],updating);
-    if(grouped&&slot.place===0)cards+=meridianProviders.headingHtml(slot.group,!groupShown[slot.provider]);
+    if(!tableMode&&grouped&&slot.place===0)cards+=meridianProviders.headingHtml(slot.group,!groupShown[slot.provider]);
     var p=slot.item;var cost=profileCost(byProfile,p);
     var chat=isChatGptProfile(p.entry);
     var quota=quotaByProfile[p.id]||{};
@@ -602,6 +663,47 @@ function profileSection(q,s,pl,h){
     var spend=computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,provider:p.entry&&p.entry.provider});
     if(!p.configured&&wins.length===0&&!cost)continue;
     shown.push(p);
+    var isPriority=pl&&pl.routing==='priority';
+    var follow=pl&&pl.follow;
+    // A ChatGPT seat has an active pointer of its own that neither priority
+    // routing nor follow mode takes over, so it is switchable in every mode.
+    var switchable=multi&&p.configured&&!p.isActive&&(chat||(!isPriority&&!follow));
+    var showsActive=p.isActive&&!(isPriority&&!chat);
+    var credits=chat?codexCreditsView(quota.credits,quota):null;
+    var resets=chat?null:freeResetView(quota.bankedResets,Date.now(),quota);
+    var sp=spentByProfile[p.id];
+    if(tableMode){
+      var entry=p.entry||p;
+      var exhausted=(pl?.exhausted||[]).find(function(e){return e.id===p.id});
+      var spentLabel=sp?'Out of '+(sp.diagnosis?.bucket?winLabel(sp.diagnosis.bucket):'its limit')
+        :exhausted?(exhausted.reason==='billing_error'?'Subscription refused':exhausted.reason==='requires_reauth'?'Token refused':'Exhausted')
+        :spend.reason==='usage'?'Spent':null;
+      var spentDetail=sp?[(sp.diagnosis?.rationale||''),sp.until?'Back '+resetIn(sp.until):'','Usage is the last successful read'].filter(Boolean).join(' · ')
+        :exhausted?.until&&exhausted.reason!=='billing_error'?'Retry '+resetIn(exhausted.until):null;
+      var routingDetail=meridianTableRouting(entry,quota,lastRouting);
+      var freeRoute=chat?profileFacts(entry).find(function(f){return f.label==='Routing'}):null;
+      if(freeRoute)routingDetail=[routingDetail,freeRoute.value].filter(Boolean).join('; ');
+      var name=p.label||p.id;
+      var cells=meridianTableFacts({profile:entry,quota:quota,name:name,provider:slot.provider,
+        login:p.configured?loginStates[i]:h?.auth?.loggedIn?'authenticated':null,active:showsActive,forced:entry.forced,
+        resetView:resets,spentLabel:spentLabel,spentDetail:spentDetail,routingDetail:routingDetail});
+      if(p.configured)cells.name.html='<a href="'+esc(profileHref(p.id))+'">'+esc(name)+'</a>';
+      if(cost)cells.cost={value:cost.estimatedUsd,html:esc(usd(cost.estimatedUsd))+'<span class="profile-table-note">'+cost.requests+' requests · 24h</span>'};
+      if(credits)cells.credits={value:quota.credits?.unlimited?null:quota.credits?.balance??null,html:esc(credits.value)+'<span class="profile-table-note">'
+        +esc(credits.serving?'Serving on credits':credits.policy||credits.note)+'</span>'};
+      if(chat&&typeof entry.resets?.available==='number')cells.chatgptReset={value:entry.resets.available,html:esc(formatResets(entry.resets,Date.now()))};
+      var detailsId='table-account-'+p.id;
+      var details=document.getElementById(detailsId);
+      var otherWindows=wins.filter(function(w){return w.type!=='five_hour'&&w.type!=='seven_day'}).map(function(w){
+        return '<div>'+esc(winLabel(w.type))+' · '+Math.round(w.utilization*100)+'%'+(w.resetsAt?' · '+esc(resetIn(w.resetsAt)):'')+'</div>';
+      }).join('');
+      tableRows.push({id:p.id,hidden:cardHidden,cells:cells,
+        actionsHtml:(switchable?'<button type="button" data-table-activate="'+esc(p.id)+'" aria-label="Activate '+esc(name)+'">Activate</button>':'')+refreshButton(p),
+        detailHtml:refreshOutcome(p.id)+meridianCardStatus.updateHtml(update)
+          +(p.entry||otherWindows?'<details id="'+esc(detailsId)+'"'+(details?.open?' open':'')+'><summary>Account details</summary>'
+            +(p.entry?'<span class="prof-pop-grid">'+infoFacts(p.entry)+'</span>':'')+otherWindows+'</details>':'')});
+      continue;
+    }
     var rows='';
     for(var j=0;j<wins.length;j++){
       var w=wins[j];var pct=Math.round(w.utilization*100);
@@ -630,21 +732,16 @@ function profileSection(q,s,pl,h){
       rows='<div class="no-usage">'+(gap?'no reading \u2014 '+esc(gap):'no usage data yet')+'</div>';
     }
     // The same facts as the /profiles card's credits block, from the same view.
-    var credits=chat?codexCreditsView(quota.credits,quota):null;
     if(credits)rows+='<div class="usage-row credits-row" title="'+esc(credits.note)+'"><span class="w-label">credits</span>'
       +'<span class="w-credits'+(credits.serving?' serving':'')+'">'+esc(credits.value)+'</span>'
       +'<span class="w-credits-note">'+esc(credits.serving?'serving on credits':credits.policy||credits.note)+'</span></div>'
       +(credits.pace?'<div class="usage-row credits-row" title="'+esc(credits.pace.title)+'">'
         +'<span class="w-credits-note credits-pace">'+esc(credits.pace.text)+'</span></div>':'');
-    var isPriority=pl&&pl.routing==='priority';
+    // Redeeming one is deliberate and lives on /profiles; the card only counts them.
+    if(!chat)rows+=freeResetRows(resets);
     // active+priority keeps the active profile meaningful - switching it is how
     // you move traffic, so the card stays clickable, unlike in pure priority.
     var isActivePriority=pl&&pl.routing==='active+priority';
-    var follow=pl&&pl.follow;
-    // A ChatGPT seat has an active pointer of its own that neither priority
-    // routing nor follow mode takes over, so it is switchable in every mode.
-    var switchable=multi&&p.configured&&!p.isActive&&(chat||(!isPriority&&!follow));
-    var showsActive=p.isActive&&!(isPriority&&!chat);
     var badge='';
     var cardStrip=showsActive?'<div class="card-strip">Active</div>':switchable?'<div class="card-strip strip-hint">Click to activate</div>':'';
     if(follow&&p.isActive&&!chat)badge+=' <span class="pool-chip">'+(follow.activeProfile?'following '+esc(follow.url):'local — '+esc(follow.url)+' unreachable')+(follow.stale?' · stale':'')+'</span>';
@@ -659,8 +756,8 @@ function profileSection(q,s,pl,h){
       var orderIdx=poolOrder.indexOf(p.id);
       if(orderIdx>=0)badge+='<span class="pool-chip">'+(isActivePriority||chat?'#'+(orderIdx+1)+' fallback':'#'+(orderIdx+1)+' in pool')+'</span>';
       var exh=(pl.exhausted||[]).filter(function(e){return e.id===p.id})[0];
-      // Suppressed when a refusal is being reported below: both say the same
-      // thing, and the banner says it better.
+      // Suppressed when a refusal is being reported: both say the same
+      // thing, and the out-of chip with its tooltip says it better.
       if(exh&&!spentByProfile[p.id]){\n        // A billing refusal has no reset to wait for — the pool re-probes on the
         // same timer, but nothing changes until a human fixes the account.
         // Showing it as 'resets in 9m' promises a recovery that never comes.
@@ -671,23 +768,23 @@ function profileSection(q,s,pl,h){
             :' <span class="pool-chip exhausted">exhausted · resets '+resetIn(exh.until)+'</span>';
       }
     }
+    var forced=p.entry&&p.entry.forced;
+    if(forced)badge+=' <span class="pool-chip reserved" title="You activated this profile although a routing supervisor keeps it out of work; it stays active until '+esc(new Date(forced.until).toLocaleString())+' or until you release it on Profiles">forced</span>';
     if(credits&&credits.serving)badge+=' <span class="pool-chip on-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
     var rsv=quota.reserve;
     if(rsv&&rsv.held)badge+=' <span class="pool-chip reserved" title="'+esc((rsv.reason||'over its allowance')+(rsv.opensAt!=null&&rsv.opensAt>Date.now()?' · opens '+resetIn(rsv.opensAt):''))+'">held · reserve</span>';
-    var sp=spentByProfile[p.id];
-    var spentBanner='';
     if(sp){\n      var spBucket=(sp.diagnosis&&sp.diagnosis.bucket)?winLabel(sp.diagnosis.bucket):'its limit';
       var spGuess=(sp.diagnosis&&sp.diagnosis.reported)?'':' (guess)';
+      var spWhy=(sp.diagnosis&&sp.diagnosis.rationale)||'';
       var refused=refusalSubject(p.entry);
-      badge+=' <span class="pool-chip exhausted">out of '+esc(spBucket+spGuess)+'</span>';
-      // A full-width line immediately above the usage bars, not a chip beside
-      // the name: measured in review, a 10px chip wraps to four lines in a
-      // narrow card and loses to the large "67%" rendered right below it -
-      // which is the exact misreading this whole feature exists to stop.
-      spentBanner='<div class="spent-banner" title="'+esc((sp.diagnosis&&sp.diagnosis.rationale)||'')+'">'
+      var spTipId=esc('spent-tip-'+p.id);
+      // The chip says it in the name row; the banner explaining it is the
+      // chip's tooltip, so the card does not carry it permanently.
+      badge+=' <span class="spent-tip"><span class="pool-chip exhausted" tabindex="0" aria-describedby="'+spTipId+'">out of '+esc(spBucket+spGuess)+'</span>'
+        +'<span class="spent-banner spent-pop" id="'+spTipId+'" role="tooltip">'
         +'<strong>⚠ '+refused.vendor+' is refusing this '+refused.noun+'</strong> - out of '+esc(spBucket+spGuess)
         +(sp.until?', back '+resetIn(sp.until):'')
-        +'<div class="spent-banner-sub">figures below are the last successful read, not live</div></div>';
+        +'<span class="spent-banner-sub">'+(spWhy?esc(spWhy)+'; ':'')+'figures below are the last successful read, not live</span></span></span>';
     }
     var access=spend.reason==='unusable'?profileAccessHelp(p.entry||p):null;
     if(access)badge+=' '+(p.configured
@@ -712,18 +809,20 @@ function profileSection(q,s,pl,h){
       +(switchable?' data-profile="'+esc(p.id)+'" role="button" tabindex="0"':'')+'>'
       +cardStrip
       +'<div class="profile-head"><span class="profile-name">'+(draggable?meridianReorder.handleHtml(p.id,pos,slot.place,slot.size):'')+'<span class="prof-dot"></span>'+(p.entry?infoIcon(p.entry,p.type):'')+''+esc(p.label||p.id)+' '+meridianProviders.badgeHtml(slot.provider,'provider-pill')+badge+'</span>'
-      +'<span class="profile-cost">'+usd(cost?cost.estimatedUsd:0)+'</span></div>'
+      +'<span class="profile-cost">'+usd(cost?cost.estimatedUsd:0)+'</span>'+refreshButton(p)+'</div>'
       +'<div class="profile-sub">'+(cost?cost.requests+' request'+(cost.requests===1?'':'s')+' · est. API value · 24h':'no traffic · 24h')+'</div>'
-      +meridianCardStatus.updateHtml(update)+spentBanner+rows+'</div>';
+      +refreshOutcome(p.id)
+      +meridianCardStatus.updateHtml(update)+rows+'</div>';
     if(p.configured)pos++;
   }
-  if(!cards)return {html:'',shown:shown};
-  return {shown:shown,html:'<div class="section"><div class="section-head"><div class="section-title">'+(profs.length===1?'Account':'Accounts')+'</div>'+sortTabs(profs.length)+'</div>'
+  if(!cards&&!tableRows.length)return {html:'',shown:shown};
+  return {shown:shown,html:'<div class="section" data-key="accounts"><div class="section-head"><div class="section-title">'+(profs.length===1?'Account':'Accounts')+'</div>'+(!tableMode?sortTabs(profs.length):'')+'</div>'
+    +meridianProfileTable.toolbarHtml()
     +'<div class="chip-row">'+meridianProviders.chipsHtml(groups)+meridianLoginStates.chipsHtml(meridianLoginStates.counts(loginStates),loginTotal)+'</div>'
-    +(multi?meridianReorder.noteHtml(reorderable,configured.some(isChatGptProfile),grouped):'')
+    +(multi&&!tableMode?meridianReorder.noteHtml(reorderable,configured.some(isChatGptProfile),grouped):'')
     +(grouped?meridianProviders.noneShownHtml(meridianProviders.anyShown(providersPresent)):'')
     +(loginTotal>1?meridianLoginStates.noneShownHtml(!meridianProviders.anyShown(providersPresent)||anyCardShown):'')
-    +'<div class="profile-grid">'+cards+'</div></div>'};
+    +(tableMode?(anyCardShown?meridianProfileTable.tableHtml(tableRows):''):'<div class="profile-grid">'+cards+'</div>')+'</div>'};
 }
 
 function strip(items){
@@ -744,10 +843,11 @@ async function refresh(){
       fetch('/profiles/list').then(r=>r.json()).catch(function(){return null}),
       fetch('/settings/api/routing').then(r=>r.json()).catch(function(){return null})
     ]);
-    if(infoPopOpen())return;
+    if(infoPopOpen()||meridianProfileTable.dragging())return;
+    if(routing&&!routing.error)lastRouting=routing;
     meridianReorder.adopt(routing);
     render(health,stats,quota,profiles);
-  }catch(e){if(!infoPopOpen())document.getElementById('content').innerHTML='<div style="color:var(--red);padding:40px;text-align:center">Could not connect</div>'}
+  }catch(e){if(!infoPopOpen()&&!meridianProfileTable.dragging())document.getElementById('content').innerHTML='<div style="color:var(--red);padding:40px;text-align:center">Could not connect</div>'}
 }
 
 function tokens(v){if(v==null)return '—';if(v>=1e6)return (v/1e6).toFixed(1)+'M';if(v>=1e3)return (v/1e3).toFixed(1)+'k';return String(v)}
@@ -789,11 +889,17 @@ function render(h,s,q,pl){
   if(refocusLoginChip){var loginChip=document.querySelector('.provider-chip[data-login-chip="'+refocusLoginChip+'"]');if(loginChip)loginChip.focus()}
 }
 
-function switchProfile(id){
-  fetch('/profiles/active',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:id})})
-    .then(function(r){return r.json()})
-    .then(function(data){if(data.success){refresh();if(window.meridianHeaderRefresh)window.meridianHeaderRefresh()}else if(data.error)alert(data.error)})
-    .catch(function(){});
+// A refusal opens the shared dialog saying why and who (profileActions.ts).
+function switchProfile(id){return meridianProfileActions.activate(id,refresh)}
+var ICON_REFRESH='${ICON_REFRESH_SVG}';
+// Every profile has something to re-read: a login, usage, its model list.
+function refreshButton(p){
+  var busy=meridianProfileActions.refreshing(p.id);
+  return '<button type="button" class="profile-refresh'+(busy?' spinning':'')+'" data-refresh="'+esc(p.id)+'" title="Refresh this profile: login, usage, models" aria-label="Refresh '+esc(p.label||p.id)+'"'+(busy?' disabled':'')+'>'+ICON_REFRESH+'</button>';
+}
+function refreshOutcome(id){return meridianProfileActions.outcomeHtml(id)}
+function refreshProfile(id){
+  meridianProfileActions.refreshProfile(id,function(finished){if(finished)return refresh();if(lastData)render.apply(null,lastData)});
 }
 // The handle sits inside a card that is itself a switch button, so without
 // this every grab of the handle would also change the active account.
@@ -817,9 +923,13 @@ document.getElementById('content').addEventListener('click',function(e){
     return;
   }
   if(onHandle(e))return;
+  var refreshBtn=e.target.closest('.profile-refresh');
+  if(refreshBtn){if(!refreshBtn.disabled)refreshProfile(refreshBtn.dataset.refresh);return}
+  var activate=e.target.closest('[data-table-activate]');
+  if(activate){switchProfile(activate.dataset.tableActivate);return}
   // The card is itself the switch button, so the icon inside one has to opt
   // out of it or reading an account would move all traffic to that account.
-  if(e.target.closest('.prof-info'))return;
+  if(e.target.closest('.prof-info, .spent-tip'))return;
   // Same for a link to the account's /profiles entry: following it is not a switch.
   if(e.target.closest('a'))return;
   var tab=e.target.closest('.sort-tab');
@@ -833,15 +943,16 @@ document.getElementById('content').addEventListener('click',function(e){
 document.getElementById('content').addEventListener('keydown',function(e){
   if(e.key!=='Enter'&&e.key!==' ')return;
   if(onHandle(e))return;
-  if(e.target.closest('.prof-info')||e.target.closest('a'))return;
+  if(e.target.closest('.prof-info, .spent-tip, .profile-refresh')||e.target.closest('a'))return;
   var card=e.target.closest('.profile-card.switchable');
   if(card&&card.dataset.profile){e.preventDefault();switchProfile(card.dataset.profile)}
 });
 viewSort=readStoredSort()||viewSort;
+meridianProfileTable.init(document.getElementById('content'),function(){if(lastData)render.apply(null,lastData)});
 meridianReorder.init({onSaved:refresh});
 refresh();
 function pollRefresh(){
-  if(document.visibilityState!=='visible'||meridianReorder.dragging()||infoPopOpen())return;
+  if(document.visibilityState!=='visible'||meridianReorder.dragging()||meridianProfileTable.dragging()||infoPopOpen()||meridianProfileActions.busy())return;
   refresh();
 }
 setInterval(pollRefresh,10000);

@@ -39,6 +39,7 @@ export function storedChatGptSurface(source: ChatGptCredentialSource, reserved: 
     order: () => getSetting("profileOrder"),
     spent: () => undefined,
     freeSeatOrder: () => getChatGptFeatures().freeSeatOrder,
+    renewalHours: (seat) => getChatGptFeatures().seatRenewalHours[seat] ?? null,
   })
 }
 

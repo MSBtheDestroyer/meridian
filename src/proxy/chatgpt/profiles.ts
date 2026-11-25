@@ -25,6 +25,7 @@ import { createHash } from "node:crypto"
 import { describeCodexPlan, normalizeCodexPlanSlug } from "../codex/plan"
 import type { CodexResetCredits, CodexUsageEntry, CodexUsageWindow } from "../codex/types"
 import { codexWindowLabel } from "../codex/windows"
+import type { ChatGptRenewal } from "./credentials"
 import type { ChatGptCredentialMode, ChatGptSeatView, SeatUnavailableReason } from "./source"
 import type { ChatGptRateLimit, ChatGptUsageWindow } from "./windows"
 
@@ -101,6 +102,8 @@ export interface ChatGptProfile extends ChatGptPlanFields {
   signedInAt: number | null
   /** When Meridian renews the seat next because chatgpt.com refused its access token, epoch ms. */
   renewalRetryAt: number | null
+  /** The seat's latest renewals, oldest first; empty for a seat Meridian does not renew. */
+  renewals: readonly ChatGptRenewal[]
 }
 
 /** One window in Claude's `/v1/usage/quota` vocabulary. */
@@ -265,6 +268,7 @@ export function chatGptProfiles(
       accessTokenExpiresAt: seat.expiresAt,
       signedInAt: seat.signedInAt ?? null,
       renewalRetryAt: seat.renewalRetryAt ?? null,
+      renewals: seat.renewals ?? [],
       ...chatGptPlanFields(options.planTypes?.get(seat.id) ?? seat.planType),
     }
   })

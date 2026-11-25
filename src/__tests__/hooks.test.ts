@@ -9,7 +9,6 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   createHookDispatcher,
-  hookProgramName,
   hookTargetLabel,
   parseHookSettings,
   resolveHookTargets,
@@ -30,15 +29,19 @@ function scratch(): { dir: string; done: () => void } {
 }
 
 describe("command hooks", () => {
-  it("hand the event over on stdin, never in argv, and report the first line of output", async () => {
+  it("hand the event over on stdin, never in argv, and keep its output out of the delivery", async () => {
     const { dir, done } = scratch()
     try {
       const out = join(dir, "event.json")
       const args = join(dir, "args.txt")
-      const command = `cat > ${out}; echo "$MERIDIAN_HOOK_EVENT $#" > ${args}; echo "relayed to laptop"; echo second line`
-      const { hooks, logged } = dispatcher([{ kind: "command", value: command, source: "settings" }])
+      const command = `cat > ${out}; echo "$MERIDIAN_HOOK_EVENT $#" > ${args}; echo "relayed to the browser machine"; echo second line`
+      const { hooks, logged } = dispatcher([{ kind: "command", value: command, source: "settings", position: 1 }])
       const [delivery] = await hooks.emit("oauth.callback.listening", { callback: { id: "cb1" } })
-      expect(delivery).toMatchObject({ ok: true, detail: "relayed to laptop", target: "command cat", source: "settings" })
+      // The delivery (what HTTP shows) carries the status only; the first line
+      // the command printed goes to the local log.
+      expect(delivery).toMatchObject({ ok: true, detail: "exit 0", target: "command #1", source: "settings" })
+      expect(JSON.stringify(delivery)).not.toContain("relayed")
+      expect(logged.join("\n")).toContain("(said: relayed to the browser machine)")
       const event = JSON.parse(readFileSync(out, "utf8"))
       expect(event).toMatchObject({ version: 1, event: "oauth.callback.listening", instance: INSTANCE, callback: { id: "cb1" } })
       expect(typeof event.id).toBe("string")
@@ -50,38 +53,35 @@ describe("command hooks", () => {
     }
   })
 
-  it("fail with the exit code and the last thing the command said on stderr", async () => {
-    const { hooks } = dispatcher([{ kind: "command", value: "echo first >&2; echo 'port 1455 in use' >&2; exit 3", source: "env" }])
+  it("fail with the exit code, logging only the last thing the command said on stderr", async () => {
+    const { hooks, logged } = dispatcher([{ kind: "command", value: "echo first >&2; echo 'port 1455 in use' >&2; exit 3", source: "env" }])
     const [delivery] = await hooks.emit("oauth.callback.closed", {})
-    expect(delivery).toMatchObject({ ok: false, detail: "exit 3: port 1455 in use", source: "env" })
+    expect(delivery).toMatchObject({ ok: false, detail: "exit 3", source: "env" })
+    expect(logged.join("\n")).toContain("(said: port 1455 in use)")
   })
 
   it("stop a command that outlives its timeout, together with what it started", async () => {
-    const { dir, done } = scratch()
-    try {
-      const marker = join(dir, "survived")
-      const { hooks } = dispatcher([{ kind: "command", value: `sleep 3 & wait; touch ${marker}`, source: "settings" }], { commandTimeoutMs: 200 })
-      const started = Date.now()
-      const [delivery] = await hooks.emit("hooks.test", {})
-      expect(delivery).toMatchObject({ ok: false, detail: "no answer in 0.2s, stopped" })
-      expect(Date.now() - started).toBeLessThan(2_500)
-      await Bun.sleep(300)
-      expect(await Bun.file(marker).exists()).toBe(false)
-    } finally {
-      done()
-    }
+    // The background sleep inherits the command's stdout, and a delivery ends
+    // only once every holder of it has exited, so answering long before the
+    // sleep would is proof that the whole process group was stopped.
+    const { hooks } = dispatcher([{ kind: "command", value: "sleep 30 & wait", source: "settings" }], { commandTimeoutMs: 200 })
+    const started = Date.now()
+    const [delivery] = await hooks.emit("oauth.callback.closed", {})
+    expect(delivery).toMatchObject({ ok: false, detail: "no answer in 0.2s, stopped" })
+    expect(Date.now() - started).toBeLessThan(10_000)
   })
 
   it("does not count a command that never reads stdin as failed", async () => {
     const { hooks } = dispatcher([{ kind: "command", value: "true", source: "settings" }])
-    const [delivery] = await hooks.emit("hooks.test", { padding: "x".repeat(256 * 1024) })
+    const [delivery] = await hooks.emit("oauth.callback.closed", { padding: "x".repeat(256 * 1024) })
     expect(delivery).toMatchObject({ ok: true, detail: "exit 0" })
   })
 
-  it("strips terminal escapes from what a command prints", async () => {
-    const { hooks } = dispatcher([{ kind: "command", value: "printf '\\033[31mred\\033[0m\\tdone\\n'", source: "settings" }])
-    const [delivery] = await hooks.emit("hooks.test", {})
-    expect(delivery?.detail).toBe("red done")
+  it("strips terminal escapes from what a command prints before logging it", async () => {
+    const { hooks, logged } = dispatcher([{ kind: "command", value: "printf '\\033[31mred\\033[0m\\tdone\\n'", source: "settings" }])
+    const [delivery] = await hooks.emit("oauth.callback.closed", {})
+    expect(delivery?.detail).toBe("exit 0")
+    expect(logged.join("\n")).toContain("(said: red done)")
   })
 })
 
@@ -92,7 +92,8 @@ describe("webhooks", () => {
       fetchImpl: async (url, init) => { calls.push({ url, init }); return new Response("accepted\n", { status: 202 }) },
     })
     const [delivery] = await hooks.emit("oauth.callback.listening", { callback: { id: "cb2" } })
-    expect(delivery).toMatchObject({ ok: true, detail: "accepted", target: "webhook hooks.example" })
+    expect(delivery).toMatchObject({ ok: true, detail: "HTTP 202", target: "webhook hooks.example" })
+    expect(logged.join("\n")).toContain("(said: accepted)")
     expect(calls).toHaveLength(1)
     const headers = new Headers(calls[0]!.init.headers)
     expect(calls[0]!.init.method).toBe("POST")
@@ -118,7 +119,7 @@ describe("webhooks", () => {
       expect(delivery?.ok).toBe(false)
       details.push(delivery!.detail)
     }
-    expect(details).toEqual(["HTTP 500: nope", "HTTP 302 (redirects are not followed)", "unreachable (ConnectionRefused)"])
+    expect(details).toEqual(["HTTP 500", "HTTP 302 (redirects are not followed)", "unreachable (ConnectionRefused)"])
   })
 
   it("give up on a webhook that does not answer in time", async () => {
@@ -134,6 +135,18 @@ describe("webhooks", () => {
 })
 
 describe("dispatch", () => {
+  it("never runs a command for a test event, only for the sign-in callback events", async () => {
+    const delivered: string[] = []
+    const { hooks } = dispatcher([
+      { kind: "command", value: "true", source: "settings", position: 1 },
+      { kind: "command", value: "true", events: ["hooks.test"], source: "settings", position: 2 },
+      { kind: "webhook", value: "https://a.example/", source: "settings" },
+    ], { fetchImpl: async () => { delivered.push("webhook"); return new Response("") } })
+    expect((await hooks.emit("hooks.test", {})).map(d => d.target)).toEqual(["webhook a.example"])
+    expect(delivered).toEqual(["webhook"])
+    expect((await hooks.emit("oauth.callback.listening", {})).map(d => d.target)).toEqual(["command #1", "webhook a.example"])
+  })
+
   it("delivers only the events a target asked for", async () => {
     const seen: string[] = []
     const { hooks } = dispatcher([
@@ -146,14 +159,17 @@ describe("dispatch", () => {
 
   it("answers by the deadline with the unfinished deliveries still running", async () => {
     let release = () => {}
+    let settled = () => {}
+    const finished = new Promise<void>(resolve => { settled = resolve })
     const { hooks } = dispatcher([{ kind: "webhook", value: "https://slow.example/", source: "settings" }], {
       fetchImpl: () => new Promise(resolve => { release = () => resolve(new Response("late")) }),
+      log: line => { if (line.includes(": ok in ")) settled() },
     })
     const early = await hooks.emit("hooks.test", {}, { waitMs: 50 })
     expect(early).toEqual([expect.objectContaining({ ok: null, detail: "running" })])
     release()
-    await Bun.sleep(10)
-    expect(hooks.recent()[0]).toMatchObject({ ok: true, detail: "late" })
+    await finished
+    expect(hooks.recent()[0]).toMatchObject({ ok: true, detail: "HTTP 200" })
   })
 
   it("drops deliveries past the in-flight cap instead of queueing them", async () => {
@@ -183,10 +199,11 @@ describe("dispatch", () => {
 })
 
 describe("configuration", () => {
-  it("names a command by its program, never its arguments or environment", () => {
-    expect(hookProgramName("HOME=/home/x exec /opt/vt/bin/vibeterm-oauth-relay --socket vibeterm")).toBe("vibeterm-oauth-relay")
-    expect(hookProgramName("env -i TOKEN=abc '/usr/local/bin/notify me'")).toBe("notify")
-    expect(hookTargetLabel({ kind: "webhook", value: "https://user:pw@hooks.example:8443/x/TOKEN?k=v" })).toBe("webhook hooks.example:8443")
+  it("names a command by where it is configured, never by any part of its text", () => {
+    const value = 'KEY="a b" exec /opt/relay/bin/oauth-relay --socket relay'
+    expect(hookTargetLabel({ kind: "command", value, source: "settings", position: 2 })).toBe("command #2")
+    expect(hookTargetLabel({ kind: "command", value, source: "env" })).toBe("command MERIDIAN_HOOK_COMMAND")
+    expect(hookTargetLabel({ kind: "webhook", value: "https://user:pw@hooks.example:8443/x/TOKEN?k=v", source: "settings" })).toBe("webhook hooks.example:8443")
   })
 
   it("validates a whole hooks form or rejects it", () => {
@@ -205,7 +222,7 @@ describe("configuration", () => {
     )
     expect(targets).toEqual([
       { kind: "webhook", value: "https://a.example/", events: undefined, source: "settings" },
-      { kind: "command", value: "relay", events: ["oauth.callback.closed"], source: "settings" },
+      { kind: "command", value: "relay", events: ["oauth.callback.closed"], source: "settings", position: 1 },
       { kind: "webhook", value: "https://env.example/", source: "env" },
       { kind: "command", value: "env-relay", source: "env" },
     ])

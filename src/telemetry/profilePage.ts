@@ -9,10 +9,15 @@ import { profileFindJs } from "./profileFind"
 import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrder"
 import { PROVIDERS_NONE_SHOWN_HTML, profileProvidersCss, profileProvidersJs } from "./profileProviders"
 import { LOGIN_STATES_NONE_SHOWN_HTML, profileLoginStatesCss, profileLoginStatesJs } from "./profileLoginStates"
+import { freeResetOutcomeText, freeResetView } from "./freeResets"
 import { isUnusableJs } from "./profileSpent"
 import { WINDOW_LABELS } from "./profileUsage"
 import { domPatchJs } from "./domPatch"
 import { profileCardStatusCss, profileCardStatusJs } from "./profileCardStatus"
+import { ICON_REFRESH_SVG, profileActionsCss, profileActionsJs } from "./profileActions"
+import { profileTableCss, profileTableJs } from "./profileTable"
+import { profileTableFactsJs } from "./profileTableFacts"
+import { profileTableRoutingJs } from "./profileTableRouting"
 
 /**
  * Every text field on this page names a profile, filters the list or takes a
@@ -42,6 +47,10 @@ export const profilePageHtml = `<!DOCTYPE html>
   .subtitle { color: var(--muted); font-size: 14px; margin-bottom: 24px; }
   .section { margin-bottom: 32px; }
   .section-title { font-size: 20px; font-weight: 600; color: var(--text); margin-bottom: 12px; }
+  html:not([data-layout="wide"]) .container:has(#content [data-profile-row]) { max-width: 1440px; }
+  #profiles-table-toolbar { margin-bottom: 12px; }
+  #content:has([data-profile-row]):not(:has([data-profile-row]:not([hidden]))) { display: none; }
+  ${profileTableCss}
 
   .profile-search { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
   .profile-search[hidden] { display: none; }
@@ -87,14 +96,14 @@ export const profilePageHtml = `<!DOCTYPE html>
   html[data-layout="wide"] #content > .profile-card { margin-bottom: 0; }
   html[data-layout="wide"] #content > .provider-group-head { margin-bottom: 0; }
   /* Arriving from a /profiles#<name> link: one short pulse says which card. */
-  .profile-card.anchor-flash { animation: profile-anchor-flash 0.5s ease-out; }
+  .profile-card.anchor-flash, [data-profile-row].anchor-flash > * { animation: profile-anchor-flash 0.5s ease-out; }
   @keyframes profile-anchor-flash {
     0% { box-shadow: 0 0 0 0 rgba(88,166,255,0); background: var(--surface); }
     35% { box-shadow: 0 0 0 4px rgba(88,166,255,0.35); background: rgba(88,166,255,0.12); }
     100% { box-shadow: 0 0 0 0 rgba(88,166,255,0); background: var(--surface); }
   }
   @media (prefers-reduced-motion: reduce) {
-    .profile-card.anchor-flash { animation: none; }
+    .profile-card.anchor-flash, [data-profile-row].anchor-flash > * { animation: none; }
   }
   /* The header row carries the reorder handle, the name, every badge the
      card can earn - active, the type, out of a limit - and the actions. On a
@@ -109,9 +118,20 @@ export const profilePageHtml = `<!DOCTYPE html>
   ${profileProvidersCss}
   ${profileLoginStatesCss}
   ${profileCardStatusCss}
+  ${profileActionsCss}
   .profile-name { font-size: 16px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; color: inherit; text-decoration: none; }
   a.profile-name:hover { color: var(--accent); }
   .profile-card-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  .profile-row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .profile-row-actions .switch-btn { margin-top: 0; }
+  .profile-row-details { white-space: normal; min-width: min(16rem, 70vw); max-width: min(28rem, 70vw); }
+  .profile-row-details > :not(:empty) { margin-top: 8px; }
+  .profile-row-details .login-panel { padding: 10px; }
+  .profile-row-details .login-input { width: 100%; }
+  .profile-row-details .rename-input { width: 100%; }
+  .profile-row-details summary { color: var(--accent); cursor: pointer; }
+  .profile-row-details .reset-outcome { width: 100%; font-size: 11px; }
+  .profile-row-details .reset-outcome.err { color: var(--red); }
   .icon-btn {
     background: var(--bg); color: var(--muted); border: 1px solid var(--border);
     border-radius: 4px; padding: 4px 6px; cursor: pointer; display: inline-flex;
@@ -156,6 +176,20 @@ export const profilePageHtml = `<!DOCTYPE html>
   /* A reserve is a choice, not a failure: the spent note's shape in yellow. */
   .spent-note.reserve-note { background: rgba(210,153,34,0.08); border-color: rgba(210,153,34,0.3); }
   .reserve-note strong { color: var(--yellow); }
+  /* A refusal's note is the out-of badge's tooltip, shown on hover or focus.
+     It hangs from the header row and spans it, so it reads as the note did,
+     over the figures it qualifies. Over them it needs an opaque fill, so the
+     note's red tint is layered on the card's surface. */
+  .profile-card-header { position: relative; }
+  .spent-tip { display: inline-flex; min-width: 0; }
+  .spent-tip .badge-spent { cursor: help; }
+  .spent-tip .badge-spent:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+  .spent-note.spent-pop { position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 20; margin: 0;
+    background: linear-gradient(rgba(248,81,73,0.08), rgba(248,81,73,0.08)), var(--surface);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.35); font-weight: 400;
+    opacity: 0; visibility: hidden; transition: opacity 0.12s; }
+  .spent-pop .spent-why { display: block; }
+  .spent-tip:hover .spent-pop, .spent-tip:focus-within .spent-pop { opacity: 1; visibility: visible; }
   /* minmax(0, 1fr), not 1fr: a bare fr track is at least as wide as its
      longest unbreakable value, so an email address widened the grid past
      the card instead of wrapping. */
@@ -236,6 +270,7 @@ export const profilePageHtml = `<!DOCTYPE html>
     font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px;
   }
   .login-input:focus { outline: none; border-color: var(--accent); }
+  .login-input.renewal-hours { flex: 0 0 auto; width: 90px; }
   .login-msg { margin-top: 10px; font-size: 12px; }
   .login-msg.err { color: var(--red); }
   .login-msg.busy { color: var(--muted); }
@@ -334,6 +369,17 @@ export const profilePageHtml = `<!DOCTYPE html>
   .usage-extra.status-high .usage-pct { color: var(--red); }
   .usage-extra .usage-note { font-size: 10px; color: var(--muted); line-height: 1.4; overflow-wrap: anywhere; min-width: 0; }
   .badge-credits { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  /* Forced past a supervisor's exclusion: an override, so yellow, with its release beside it. */
+  .badge-forced { background: rgba(var(--yellow-rgb),0.15); color: var(--yellow); }
+  .forced-release { font-size: 12px; }
+  .profile-card > .refresh-outcome { font-size: 12px; margin: -4px 0 10px; }
+  /* Banked free resets, one block per kind: green while one can be redeemed, muted otherwise. */
+  .usage-extra.free-resets .usage-pct { color: var(--green); }
+  .usage-extra.free-resets.held .usage-pct { color: var(--muted); }
+  .usage-extra.free-resets .usage-extra-row { align-items: center; }
+  .switch-btn.reset-btn { margin-top: 0; padding: 3px 10px; font-size: 11px; flex: none; }
+  .usage-extra .reset-outcome { margin-top: 4px; }
+  .usage-extra .reset-outcome.err { color: var(--red); }
   .usage-empty {
     font-size: 11px; color: var(--muted); padding: 6px 0; font-style: italic;
   }
@@ -375,6 +421,7 @@ export const profilePageHtml = `<!DOCTYPE html>
       placeholder="Filter by name, email, organization, plan (5x, 20x, max) or former name">
     <span class="profile-search-count" id="profiles-filter-count" aria-live="polite"></span>
   </div>
+  <div id="profiles-table-toolbar"></div>
   <div id="content"><div style="color:var(--muted);padding:40px;text-align:center">Loading\u2026</div></div>
   <div class="empty-state profile-no-match" id="profiles-no-match" hidden>
     No profile matches <strong id="profiles-no-match-query"></strong>.
@@ -516,11 +563,19 @@ function formatExtraUsage(eu) {
 // Shared with / (profileSpent.ts), so both pages flag the same accounts.
 ${isUnusableJs}
 
+// Shared with / (freeResets.ts), so both pages count an account's resets alike.
+var freeResetView = ${freeResetView.toString()};
+var freeResetOutcomeText = ${freeResetOutcomeText.toString()};
+
 ${reorderClientJs}
 ${profileProvidersJs}
 ${profileLoginStatesJs}
 ${domPatchJs}
 ${profileCardStatusJs}
+${profileActionsJs}
+${profileTableJs("profiles")}
+${profileTableFactsJs}
+${profileTableRoutingJs}
 
 var providersPresent = [];
 // Each card's login state by profile id, and how many cards the login-state
@@ -575,6 +630,7 @@ var removeError = null;
 var ICON_PENCIL = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zm1.414 1.06a.25.25 0 00-.354 0L10.811 3.75l1.439 1.44 1.263-1.263a.25.25 0 000-.354l-1.086-1.086zM11.189 6.25L9.75 4.81l-6.286 6.287a.25.25 0 00-.064.108l-.558 1.953 1.953-.558a.249.249 0 00.108-.064l6.286-6.286z"/></svg>';
 var ICON_CHECK = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/></svg>';
 var ICON_X = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M3.72 3.72a.75.75 0 011.06 0L8 6.94l3.22-3.22a.75.75 0 111.06 1.06L9.06 8l3.22 3.22a.75.75 0 11-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 01-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 010-1.06z"/></svg>';
+var ICON_REFRESH = '${ICON_REFRESH_SVG}';
 var ICON_TRASH = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M11 1.75V3h2.25a.75.75 0 010 1.5H2.75a.75.75 0 010-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75zM6.5 1.75V3h3V1.75a.25.25 0 00-.25-.25h-2.5a.25.25 0 00-.25.25z"/><path d="M4.997 6.178a.75.75 0 10-1.494.144L4.462 16.5h7.076l.959-10.178a.75.75 0 00-1.494-.144l-.888 9.322H5.885l-.888-9.322z"/></svg>';
 
 function focusRenameInput() {
@@ -582,8 +638,13 @@ function focusRenameInput() {
   if (el) { el.focus(); el.select(); }
 }
 
-function redraw() {
-  if (lastProfiles) render(lastProfiles, lastQuota);
+function redraw(viewOnly) {
+  if (lastProfiles) render(lastProfiles, lastQuota, viewOnly);
+}
+
+function redrawProfileTable() {
+  meridianPatch.html(document.getElementById('profiles-table-toolbar'), meridianProfileTable.toolbarHtml());
+  redraw(true);
 }
 
 function startRename(id) {
@@ -676,6 +737,7 @@ async function commitRemove(id) {
 // before an answer already drawn is older than the page and is dropped.
 var refreshesIssued = 0;
 var refreshDrawn = 0;
+var lastRouting = null;
 
 async function refresh() {
   if (editingProfile || removingProfile || detailFactFocused()) return;
@@ -700,6 +762,7 @@ async function refresh() {
     refreshDrawn = seq;
     if (quota) lastQuota = quota;
     if (routing) {
+      lastRouting = routing;
       try { meridianReorder.adopt(routing); } catch (_) { /* keep the last good order */ }
     }
     lastProfiles = profiles;
@@ -749,7 +812,7 @@ function commandRow(label, cmd, note, extraHtml) {
 // The rows that say how a profile is signed in again. A Claude profile's is
 // Meridian's own command plus the browser login; a ChatGPT seat's are its
 // owner's, because Meridian only follows that login.
-function renderLoginRows(p) {
+function renderLoginRows(p, tableMode) {
   if (!isChatGptProfile(p)) {
     var browserLogin = '';
     // Only claude-max profiles have an OAuth flow; api and oauth-token profiles
@@ -765,9 +828,12 @@ function renderLoginRows(p) {
         + ' href="' + attr(loginHrefFor(p.id) || '#') + '"'
         + (loginHrefFor(p.id) ? '' : ' aria-disabled="true"')
         + ' target="_blank" rel="noopener noreferrer"'
-        + ' onclick="return onLoginLinkClick(event, &quot;' + esc(p.id) + '&quot;)">Log in from browser</a>';
+        + ' onclick="return onLoginLinkClick(event, ' + attr(JSON.stringify(p.id)) + ')">Log in from browser</a>';
     }
-    return commandRow('Login', 'meridian profile login ' + p.id, '', browserLogin);
+    var command = commandRow('Login', 'meridian profile login ' + p.id, '', tableMode ? '' : browserLogin);
+    return tableMode && browserLogin
+      ? browserLogin + tableDetails('login', p.id, 'Login command', command)
+      : command;
   }
   var owner = p.owner || {};
   if (owner.name === 'meridian') {
@@ -778,13 +844,26 @@ function renderLoginRows(p) {
       + '<button class="login-btn" data-profile="' + attr(p.id) + '" onclick="startChatGptRelogin(this)">Sign in again</button> '
       + '<button class="switch-btn" style="margin-top:0" data-profile="' + attr(p.id) + '" onclick="renewChatGptSeat(this)">Renew now</button>'
       + '<span class="cmd-note">Meridian renews the token by itself before it expires. Sign in again when the seat needs a login.</span>'
-      + '</div>';
+      + '</div>'
+      + renderRenewalRow(p);
   }
   var rows = commandRow('Login', owner.login, '\\u2192 ' + owner.loginMethod + ' \\u2192 ' + (p.label || p.id) + ' \\u2192 Refresh account \\u00b7 at ' + owner.name);
   if (p.tokenState === 'expired') {
     rows += commandRow('Renew', owner.refresh, 'or the ' + owner.refreshTool + ' tool in an opencode session');
   }
   return rows;
+}
+
+// A seat's own renewal interval, in hours; empty means the default.
+function renderRenewalRow(p) {
+  var own = typeof p.renewalHours === 'number';
+  return '<div class="cmd-row"><span class="cmd-label">Renew every:</span> '
+    + '<input class="login-input renewal-hours" type="number" min="6" max="240" step="1" placeholder="default" ' + PROFILE_INPUT_ATTRS
+    + ' data-profile="' + attr(p.id) + '" aria-label="Renewal interval of ' + attr(p.id) + ' in hours" value="' + (own ? attr(p.renewalHours) : '') + '"> hours '
+    + '<button class="switch-btn" style="margin-top:0" data-profile="' + attr(p.id) + '" onclick="saveSeatRenewal(this, false)">Save</button>'
+    + (own ? ' <button class="switch-btn" style="margin-top:0" data-profile="' + attr(p.id) + '" onclick="saveSeatRenewal(this, true)">Use default</button>' : '')
+    + '<span class="cmd-note">How long after its token was issued Meridian renews this seat, 6 to 240 hours. Empty renews on the token\\u2019s 8th day.</span>'
+    + '</div>';
 }
 
 function renderAccessNote(p) {
@@ -975,23 +1054,22 @@ function spentSummary(spent) {
   };
 }
 
-function renderSpentBadge(spent) {
-  var s = spentSummary(spent);
-  if (!s) return '';
-  return '<span class="profile-badge badge-spent" title="' + esc(s.why) + '">out of ' + esc(s.label) + '</span>';
-}
-
-function renderSpentNote(spent, p) {
+// The badge in the header, with the full note as its tooltip: inline in the
+// row, so its parts are spans.
+function renderSpentBadge(spent, p) {
   var s = spentSummary(spent);
   if (!s) return '';
   var refused = refusalSubject(p);
-  return '<div class="spent-note">'
+  var tipId = attr('spent-tip-' + p.id);
+  return '<span class="spent-tip">'
+    + '<span class="profile-badge badge-spent" tabindex="0" aria-describedby="' + tipId + '">out of ' + esc(s.label) + '</span>'
+    + '<span class="spent-note spent-pop" id="' + tipId + '" role="tooltip">'
     + '<strong style="color:var(--red)">\u26a0 ' + refused.vendor + ' is refusing this ' + refused.noun + '</strong> - '
     + 'out of <strong>' + esc(s.label) + '</strong>'
     + (s.reset ? ', expected back ' + esc(s.reset) : '')
     + '. Refused ' + esc(timeAgo(s.at)) + '.'
-    + '<div class="spent-why">' + esc(s.why) + '. The percentages below are the last successful read, not live.</div>'
-    + '</div>';
+    + '<span class="spent-why">' + esc(s.why) + '. The percentages below are the last successful read, not live.</span>'
+    + '</span></span>';
 }
 
 function reservePct(value) { return String(Math.round(value * 10) / 10); }
@@ -1033,12 +1111,13 @@ function renderUsageSection(profileQuota, p) {
   var usageTag = cachedTag(profileQuota.stale ? 'cached' : 'live');
   var chatgpt = isChatGptProfile(p);
   var credits = chatgpt ? codexCreditsView(profileQuota.credits, profileQuota) : null;
+  var resets = chatgpt ? null : freeResetView(profileQuota.bankedResets, Date.now(), profileQuota);
 
   // No figures at all means this profile has never been read successfully —
   // the route serves the last good reading at any age, so an empty windows
   // array is no longer "the stale window lapsed". Saying so keeps it distinct
   // from a profile genuinely sitting at 0%.
-  if (windows.length === 0 && !extra && !credits) {
+  if (windows.length === 0 && !extra && !credits && !resets) {
     if (chatgpt) {
       var gap = chatGptUsageGap(profileQuota.error);
       return gap
@@ -1137,10 +1216,93 @@ function renderUsageSection(profileQuota, p) {
     + renderReserveNote(profileQuota.reserve)
     + (cards ? '<div class="usage-grid">' + cards + '</div>' : '')
     + extraBlock
+    + renderFreeResets(resets, p)
     + '</div>';
 }
 
-function render(data, quotaData) {
+// One block per kind of reset, since each clears something different. A
+// block offers its own redeem only while the view names a grant of that kind,
+// and the click only acts after a confirmation naming the kind and the grant.
+// A redeem's outcome stays in the block of the kind it was for.
+function renderFreeResets(resets, p) {
+  var outcome = resetOutcomes[p.id];
+  if (outcome && Date.now() - outcome.at > 120000) outcome = null;
+  function said(label) {
+    return '<div class="usage-note reset-outcome' + (outcome.ok ? '' : ' err') + '" role="status">' + esc(label + ': ' + outcome.text) + '</div>';
+  }
+  var placed = false;
+  var html = (resets ? resets.groups : []).map(function (g) {
+    var mine = !!outcome && outcome.kind === g.kind;
+    if (mine) placed = true;
+    var button = g.grantId
+      ? '<button type="button" class="switch-btn reset-btn" data-profile="' + attr(p.id) + '" data-name="' + attr(p.label || p.id)
+        + '" data-kind="' + attr(g.kind) + '" data-label="' + attr(g.name) + '" data-kind-name="' + attr(g.shortName)
+        + '" data-grant="' + attr(g.grantId) + '" data-grant-name="' + attr(g.grantName) + '" data-fable-used="' + attr(g.fableUsed)
+        + '" data-clears-five-hour="' + (g.clearsFiveHour ? 'true' : 'false')
+        + '" data-usable="' + g.usable + '" onclick="redeemFreeReset(this)"'
+        + (redeemingReset ? ' disabled' : '') + '>' + esc('Redeem ' + g.shortName) + '</button>'
+      : '';
+    return '<div class="usage-extra free-resets' + (g.muted ? ' held' : '') + '" title="' + attr(g.title) + '">'
+      +   '<div class="usage-extra-row">'
+      +     '<span class="usage-label">' + esc(g.name) + '</span>'
+      +     '<span class="usage-pct">' + esc(g.value) + '</span>'
+      +   '</div>'
+      +   '<div class="usage-extra-row" style="margin-top:4px">'
+      +     '<span class="usage-note">' + esc(g.note) + '</span>' + button
+      +   '</div>'
+      +   (mine ? said(g.name) : '')
+      + '</div>';
+  }).join('');
+  // The redeem spent the last reset of its kind, so its block is gone.
+  if (outcome && !placed) html += '<div class="usage-extra free-resets">' + said(outcome.label) + '</div>';
+  return html;
+}
+
+function renderProfileRename(p) {
+  var input = document.getElementById('rename-input');
+  var draft = input && input.getAttribute('data-profile') === p.id ? input.value : p.id;
+  var profileArg = attr(JSON.stringify(p.id));
+  return "<input class=\\"rename-input\\" id=\\"rename-input\\" type=\\"text\\" value=\\"" + attr(draft) + "\\" " + PROFILE_INPUT_ATTRS
+    + ' data-profile="' + attr(p.id) + '" aria-label="New profile name"'
+    + ' onkeydown="if(event.key===&quot;Enter&quot;){event.preventDefault();commitRename(' + profileArg + ')}'
+    + 'else if(event.key===&quot;Escape&quot;){cancelRename()}">'
+    + '<span class="rename-hint">Enter to save \u00b7 Esc to cancel</span>'
+    + '<span class="profile-card-actions">'
+    + '<button type="button" class="icon-btn" title="Save new name" onclick="commitRename(' + profileArg + ')">' + ICON_CHECK + '</button>'
+    + '<button type="button" class="icon-btn" title="Cancel" onclick="cancelRename()">' + ICON_X + '</button></span>';
+}
+
+function renderProfileEditButtons(p) {
+  var refreshingProfile = meridianProfileActions.refreshing(p.id);
+  var profileArg = attr(JSON.stringify(p.id));
+  return '<button type="button" class="icon-btn profile-refresh' + (refreshingProfile ? ' spinning' : '') + '" title="Refresh this profile: login, usage, models" aria-label="Refresh ' + attr(p.id) + '"'
+    + ' data-profile="' + attr(p.id) + '" onclick="refreshProfile(this.getAttribute(&quot;data-profile&quot;))"' + (refreshingProfile ? ' disabled' : '') + '>' + ICON_REFRESH + '</button>'
+    + '<button type="button" class="icon-btn" title="Rename profile" onclick="startRename(' + profileArg + ')">' + ICON_PENCIL + '</button>'
+    + '<button type="button" class="icon-btn danger" title="' + (isChatGptProfile(p) ? 'Remove seat' : 'Remove profile') + '" onclick="startRemove(' + profileArg + ')">' + ICON_TRASH + '</button>';
+}
+
+function renderProfileConfirmation(p) {
+  var error = editingProfile === p.id && renameError ? '<div class="rename-error">' + esc(renameError) + '</div>' : '';
+  if (removingProfile !== p.id) return error;
+  if (isChatGptProfile(p) && p.removal) {
+    return error + '<div class="remove-confirm"><div class="remove-confirm-text">' + codeSpans(p.removal) + '</div>'
+      + '<div class="remove-confirm-actions"><button class="confirm-btn" onclick="cancelRemove()">Close</button></div></div>';
+  }
+  return error + '<div class="remove-confirm"><div class="remove-confirm-text">Remove <strong>' + esc(p.id) + '</strong>? ' + (isChatGptProfile(p)
+    ? 'Its stored credentials are deleted with it, so putting it back means logging in again.'
+    : 'Credentials Meridian stored for it are deleted with it; a login it shares with another profile or with your own Claude Code stays. Requests that name it with <code>x-meridian-profile</code> are refused afterwards.') + '</div>'
+    + (removeError ? '<div class="rename-error">' + esc(removeError) + '</div>' : '')
+    + '<div class="remove-confirm-actions"><button class="confirm-btn danger" onclick="commitRemove(' + attr(JSON.stringify(p.id)) + ')">Remove</button>'
+    + '<button class="confirm-btn" onclick="cancelRemove()">Cancel</button></div></div>';
+}
+
+function tableDetails(kind, id, label, body) {
+  var detailsId = 'profile-row-' + kind + '-' + id;
+  var previous = document.getElementById(detailsId);
+  return '<details id="' + attr(detailsId) + '"' + (previous && previous.open ? ' open' : '') + '><summary>' + label + '</summary>' + body + '</details>';
+}
+
+function render(data, quotaData, viewOnly) {
   const profiles = meridianReorder.sortProfiles(data.profiles || []);
   const refocusId = meridianReorder.focusAnchor();
   // Build quick lookup: profileId -> per-profile quota entry from
@@ -1183,35 +1345,75 @@ function render(data, quotaData) {
   }
 
   const reorderable = profiles.length > 1 && !meridianReorder.envPinned();
+  const tableMode = meridianProfileTable.isTable();
+  const tableRows = [];
+  const spentById = Array.isArray(data.spent) ? new Map(data.spent.map(mark => [mark.profileId, mark])) : null;
 
   let html = '';
   let anyUpdating = false;
-  if (profiles.length > 1) html += meridianReorder.noteHtml(reorderable, profiles.some(isChatGptProfile), grouped);
+  if (!tableMode && profiles.length > 1) html += meridianReorder.noteHtml(reorderable, profiles.some(isChatGptProfile), grouped);
 
   for (let idx = 0; idx < slots.length; idx++) {
     const slot = slots[idx];
     const p = slot.item;
-    if (grouped && slot.place === 0) html += meridianProviders.headingHtml(slot.group, false);
+    if (!tableMode && grouped && slot.place === 0) html += meridianProviders.headingHtml(slot.group, false);
     // Per profile rather than against data.activeProfile: an instance serving
     // both providers has an active Claude account AND an active ChatGPT seat.
     const isActive = !!p.isActive;
     const needsLogin = isUnusable({ loggedIn: p.loggedIn, error: (quotaById[p.id] || {}).error });
     const update = meridianCardStatus.updateOf(p, lastProfilesRequestedAt);
     if (update && update.state === 'updating') anyUpdating = true;
+    const nameLink = '<a class="profile-name" href="#' + attr(encodeURIComponent(p.id)) + '" title="Link to this profile">' + esc(p.id) + '</a>';
+    const duplicate = meridianCardStatus.duplicateBadgeHtml(p, 'profile-badge');
+    const release = p.forced ? '<button type="button" class="link-btn forced-release" onclick="releaseForcedProfile()">release</button>' : '';
+    const feedback = meridianCardStatus.updateHtml(update) + meridianProfileActions.outcomeHtml(p.id) + renderProfileConfirmation(p);
+    const loginHtml = '<div class="login-slot" id="login-slot-' + attr(p.id) + '"' + (loginPanelOpen(p.id) ? ' data-patch-own' : '') + '></div>';
+    if (tableMode) {
+      const q = quotaById[p.id];
+      const resets = q && !isChatGptProfile(p) ? freeResetView(q.bankedResets, Date.now(), q) : null;
+      const spent = spentSummary(spentById ? spentById.get(p.id) : q && q.spent);
+      const refused = refusalSubject(p);
+      const cells = meridianTableFacts({
+        profile: p, quota: q, name: p.id, provider: slot.provider,
+        login: loginStateById[p.id], active: isActive, forced: p.forced, resetView: resets,
+        spentLabel: spent ? 'Out of ' + spent.label : null,
+        spentDetail: spent ? [refused.vendor + ' is refusing this ' + refused.noun + '.',
+          spent.reset ? 'Expected back ' + spent.reset + '.' : '',
+          'Refused ' + timeAgo(spent.at) + '.', spent.why,
+          'Usage percentages are from the last successful read.'].filter(Boolean).join(' ') : '',
+        routingDetail: meridianTableRouting(p, q || {}, lastRouting)
+      });
+      cells.name = { value: p.id, html: nameLink + duplicate };
+      const credits = isChatGptProfile(p) && q && codexCreditsView(q.credits, q);
+      if (credits) {
+        cells.credits = { value: q.credits?.unlimited ? null : q.credits?.balance ?? null, html: esc(credits.value) + '<span class="profile-table-note">'
+          + esc([credits.note, credits.policy, credits.pace && credits.pace.text].filter(Boolean).join(' · ')) + '</span>' };
+      }
+      if (isChatGptProfile(p) && typeof p.resets?.available === 'number') {
+        cells.chatgptReset = { value: p.resets.available, html: esc(formatResets(p.resets, Date.now())) };
+      }
+      const activate = isActive ? '' : '<button type="button" class="switch-btn switch-to" aria-label="Activate ' + attr(p.id)
+        + '" onclick="switchProfile(' + attr(JSON.stringify(p.id)) + ')">Activate</button>';
+      tableRows.push({
+        id: p.id, anchorId: profileAnchorElementId(p.id), cells: cells,
+        actionsHtml: '<div class="profile-row-actions provider-' + attr(slot.provider) + '">' + activate
+          + release + (editingProfile === p.id ? '' : renderProfileEditButtons(p)) + '</div>',
+        detailHtml: '<div class="profile-row-details">'
+          + (editingProfile === p.id ? '<div class="profile-row-actions">' + renderProfileRename(p) + '</div>' : '')
+          + feedback + loginHtml
+          + tableDetails('account', p.id, 'Account details', '<div class="profile-details">' + factRows(profileFacts(p)) + '</div>'
+            + (p.loggedIn ? '' : renderAccessNote(p)) + renderLoginRows(p, true)
+            + renderUsageSection(q, p)) + '</div>'
+      });
+      continue;
+    }
     html += '<div class="profile-card provider-' + esc(slot.provider) + (isActive ? ' active' : '') + (needsLogin ? ' needs-login' : '') + (update && update.state === 'updating' ? ' updating" aria-busy="true' : '') + '" id="' + esc(profileAnchorElementId(p.id)) + '" data-id="' + esc(p.id) + '" data-index="' + idx + '" data-group="' + esc(slot.provider) + '" data-login-state="' + esc(loginStateById[p.id]) + '">';
     html += '<div class="profile-card-header">';
     if (editingProfile === p.id) {
-      html += "<input class=\\"rename-input\\" id=\\"rename-input\\" type=\\"text\\" value=\\"" + esc(p.id) + "\\" " + PROFILE_INPUT_ATTRS
-        + " onkeydown=\\"if(event.key===&quot;Enter&quot;){event.preventDefault();commitRename(&quot;" + esc(p.id) + "&quot;)}"
-        + "else if(event.key===&quot;Escape&quot;){cancelRename()}\\">";
-      html += "<span class=\\"rename-hint\\">Enter to save \u00b7 Esc to cancel</span>";
-      html += "<span class=\\"profile-card-actions\\">";
-      html += "<button class=\\"icon-btn\\" title=\\"Save new name\\" onclick=\\"commitRename(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_CHECK + "</button>";
-      html += "<button class=\\"icon-btn\\" title=\\"Cancel\\" onclick=\\"cancelRename()\\">" + ICON_X + "</button>";
-      html += "</span>";
+      html += renderProfileRename(p);
     } else {
       if (reorderable && slot.size > 1) html += meridianReorder.handleHtml(p.id, idx, slot.place, slot.size);
-      html += "<a class=\\"profile-name\\" href=\\"#" + esc(encodeURIComponent(p.id)) + "\\" title=\\"Link to this profile\\">" + esc(p.id) + "</a>";
+      html += nameLink;
       if (isActive) html += "<span class=\\"profile-badge badge-active\\">active</span>";
       html += meridianProviders.badgeHtml(slot.provider, "profile-badge");
       // The allowance (20x, 5x) tells accounts apart; the type does not, as
@@ -1224,41 +1426,18 @@ function render(data, quotaData) {
         var access = profileAccessHelp(p);
         html += '<span class="profile-badge badge-needs-login" title="' + esc(access.summary) + '">' + esc(access.pill) + '</span>';
       }
-      html += meridianCardStatus.duplicateBadgeHtml(p, 'profile-badge');
-      html += renderSpentBadge((quotaById[p.id] || {}).spent);
+      html += duplicate;
+      html += renderSpentBadge((quotaById[p.id] || {}).spent, p);
       if ((quotaById[p.id] || {}).servingOnCredits) html += '<span class="profile-badge badge-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
-      html += "<span class=\\"profile-card-actions\\">";
-      html += "<button class=\\"icon-btn\\" title=\\"Rename profile\\" onclick=\\"startRename(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_PENCIL + "</button>";
-      html += "<button class=\\"icon-btn danger\\" title=\\"" + (isChatGptProfile(p) ? "Remove seat" : "Remove profile") + "\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
-      html += "</span>";
+      if (p.forced) {
+        html += '<span class="profile-badge badge-forced" title="You activated this profile although a routing supervisor keeps it out of work. It stays active until '
+          + attr(new Date(p.forced.until).toLocaleString()) + ', or until you release it.">forced \u00b7 until ' + esc(new Date(p.forced.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })) + '</span>';
+        html += release;
+      }
+      html += '<span class="profile-card-actions">' + renderProfileEditButtons(p) + '</span>';
     }
     html += '</div>';
-    html += meridianCardStatus.updateHtml(update);
-    html += renderSpentNote((quotaById[p.id] || {}).spent, p);
-
-    if (editingProfile === p.id && renameError) {
-      html += '<div class="rename-error">' + esc(renameError) + '</div>';
-    }
-
-    if (removingProfile === p.id && isChatGptProfile(p) && p.removal) {
-      // A followed seat's owner, not Meridian, deletes it: the panel says
-      // where, instead of offering a Remove that could only be refused.
-      html += '<div class="remove-confirm">';
-      html += '<div class="remove-confirm-text">' + codeSpans(p.removal || '') + '</div>';
-      html += '<div class="remove-confirm-actions">';
-      html += '<button class="confirm-btn" onclick="cancelRemove()">Close</button>';
-      html += '</div></div>';
-    } else if (removingProfile === p.id) {
-      html += '<div class="remove-confirm">';
-      html += '<div class="remove-confirm-text">Remove <strong>' + esc(p.id) + '</strong>? ' + (isChatGptProfile(p)
-        ? 'Its stored credentials are deleted with it, so putting it back means logging in again.'
-        : 'Credentials Meridian stored for it are deleted with it; a login it shares with another profile or with your own Claude Code stays. Requests that name it with <code>x-meridian-profile</code> are refused afterwards.') + '</div>';
-      if (removeError) html += '<div class="rename-error">' + esc(removeError) + '</div>';
-      html += '<div class="remove-confirm-actions">';
-      html += '<button class="confirm-btn danger" onclick="commitRemove(&quot;'+esc(p.id)+'&quot;)">Remove</button>';
-      html += '<button class="confirm-btn" onclick="cancelRemove()">Cancel</button>';
-      html += '</div></div>';
-    }
+    html += feedback;
 
     html += '<div class="profile-details">' + factRows(profileFacts(p)) + '</div>';
 
@@ -1266,9 +1445,7 @@ function render(data, quotaData) {
 
     html += renderLoginRows(p);
 
-    // An open sign-in panel is the script's, not the render's: the refresh
-    // leaves it, and the code being pasted into it, alone.
-    html += '<div class="login-slot" id="login-slot-' + esc(p.id) + '"' + (loginPanelOpen(p.id) ? ' data-patch-own' : '') + '></div>';
+    html += loginHtml;
 
     html += renderUsageSection(quotaById[p.id], p);
 
@@ -1281,9 +1458,15 @@ function render(data, quotaData) {
     html += '</div>';
   }
 
+  if (tableMode) html = meridianProfileTable.tableHtml(tableRows);
+  const loginPanels = [activeLogin, activeChatGptRelogin].filter(Boolean).map(flow => [flow.profile, loginSlot(flow.profile)]);
   // Patched in place, not replaced: unchanged nodes stay the same nodes, so a
   // find-in-page highlight, a selection, focus and scroll survive a refresh.
   meridianPatch.html(document.getElementById('content'), html);
+  for (const [id, oldSlot] of loginPanels) {
+    const nextSlot = loginSlot(id);
+    if (oldSlot && nextSlot && oldSlot !== nextSlot) nextSlot.replaceWith(oldSlot);
+  }
   meridianReorder.restoreFocus(refocusId);
   if (anyUpdating && !updatePollTimer) {
     updatePollTimer = setTimeout(pollUpdate, 1500);
@@ -1291,13 +1474,10 @@ function render(data, quotaData) {
   // The markup carries placeholder hrefs. Restore them from the cache, then top
   // up anything missing or near expiry in the background.
   applyLoginHrefs();
-  ensureLoginLinks(profiles);
+  if (!viewOnly) ensureLoginLinks(profiles);
   afterRender();
 }
 
-// The search and the #anchor both act on the cards render() just drew, so
-// they run after every render. Both change only visibility and scroll, never
-// the markup, so they cannot wipe a panel or input the poll is protecting.
 function afterRender() {
   applyProfileFilter();
   if (anchorPending && lastProfiles) {
@@ -1333,16 +1513,18 @@ function applyProfileFilter() {
   var profiles = profilesForFind();
   var byId = Object.create(null);
   for (var i = 0; i < profiles.length; i++) byId[profiles[i].id] = profiles[i];
-  var cards = document.querySelectorAll('#content .profile-card[data-id]');
+  var tableMode = meridianProfileTable.isTable();
+  var cards = tableMode ? document.querySelectorAll('#content [data-profile-row]') : document.querySelectorAll('#content .profile-card[data-id]');
   var shown = 0;
   var inView = 0;
   var groupShown = Object.create(null);
   for (var c = 0; c < cards.length; c++) {
-    var group = cards[c].getAttribute('data-group');
-    var cardProfile = byId[cards[c].getAttribute('data-id')];
+    var id = cards[c].getAttribute(tableMode ? 'data-profile-row' : 'data-id');
+    var cardProfile = byId[id];
+    var group = tableMode ? meridianProviders.providerOf(cardProfile) : cards[c].getAttribute('data-group');
     var updating = meridianCardStatus.isUpdating(cardProfile);
     var chipsOn = meridianProviders.visible(group, providersPresent)
-      && (updating || meridianLoginStates.visible(cards[c].getAttribute('data-login-state'), loginTotal));
+      && (updating || meridianLoginStates.visible(tableMode ? loginStateById[id] : cards[c].getAttribute('data-login-state'), loginTotal));
     var match = chipsOn && (profileMatchesQuery(cardProfile, profileQuery) || updating);
     cards[c].hidden = !match;
     if (chipsOn) inView++;
@@ -1405,12 +1587,13 @@ function jumpToProfileAnchor() {
   if (!card) return;
   // Following a link to one profile outranks a filter that hides it, the
   // provider and login-state chips included.
-  var group = card.getAttribute('data-group');
+  var tableId = card.getAttribute('data-profile-row');
+  var group = tableId ? meridianProviders.providerOf(profilesForFind().find(p => p.id === tableId)) : card.getAttribute('data-group');
   if (group && !meridianProviders.visible(group, providersPresent)) {
     meridianProviders.setHidden(group, false);
     applyProfileFilter();
   }
-  var loginState = card.getAttribute('data-login-state');
+  var loginState = tableId ? loginStateById[tableId] : card.getAttribute('data-login-state');
   if (loginState && !meridianLoginStates.visible(loginState, loginTotal)) {
     meridianLoginStates.setHidden(loginState, false);
     applyProfileFilter();
@@ -1471,15 +1654,17 @@ function copyCmd(btn) {
   }, 1500);
 }
 
-async function switchProfile(id) {
-  const res = await fetch('/profiles/active', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ profile: id })
-  });
-  const data = await res.json();
-  if (data.success) refresh();
-  else if (data.error) alert(data.error);
+// A refusal opens the shared dialog saying why and who (profileActions.ts).
+function switchProfile(id) {
+  return meridianProfileActions.activate(id, refresh);
+}
+
+function releaseForcedProfile() {
+  return meridianProfileActions.release(refresh);
+}
+
+function refreshProfile(id) {
+  return meridianProfileActions.refreshProfile(id, function (finished) { return finished ? refresh() : redraw(); });
 }
 
 // --- Browser login ---
@@ -2490,6 +2675,60 @@ async function switchChatGptReloginToRedirect() {
   if (id) startChatGptReloginRedirect(id, '');
 }
 
+// Set while a redeem is in flight, so a poll neither redraws its button
+// enabled nor lets a second click send another one.
+var redeemingReset = null;
+// The last redeem's outcome per profile, drawn in its free-reset block for two
+// minutes so the poll that follows the redeem does not wipe it.
+var resetOutcomes = Object.create(null);
+
+async function redeemFreeReset(button) {
+  if (redeemingReset) return;
+  var id = button.getAttribute('data-profile');
+  var kind = button.getAttribute('data-kind');
+  var noun = button.getAttribute('data-kind-name');
+  var grantId = button.getAttribute('data-grant');
+  var fableUsed = button.getAttribute('data-fable-used');
+  var usable = Number(button.getAttribute('data-usable')) || 0;
+  var after = Math.max(0, usable - 1);
+  // Each kind says only what it does: a Fable reset never promises the week back,
+  // and the 5-hour window is named only when the spent grant's scope lists it.
+  var effect = (kind === 'fable'
+    ? 'Anthropic gives back only this account\\u2019s Fable usage' + (fableUsed ? ' (now ' + fableUsed + ' used)' : '')
+      + ' to its weekly allowance; the rest of the week\\u2019s usage stays as it is.'
+    : 'Anthropic clears this account\\u2019s weekly usage right away.')
+    + (button.getAttribute('data-clears-five-hour') === 'true' ? ' It also clears the 5-hour window.' : '');
+  var go = await meridianDialog.ask({
+    title: 'Redeem a ' + noun + ' on ' + button.getAttribute('data-name') + ' now?',
+    message: 'This spends \\u201c' + (button.getAttribute('data-grant-name') || grantId) + '\\u201d. ' + effect
+      + ' It cannot be undone.',
+    note: after + ' usable ' + noun + (after === 1 ? '' : 's') + ' would be left.',
+    confirmText: 'Redeem ' + noun,
+    danger: true
+  });
+  if (!go) return;
+  redeemingReset = id;
+  button.disabled = true;
+  button.textContent = 'Redeeming\\u2026';
+  var requestId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2);
+  var status = 0, data = null;
+  try {
+    var res = await fetch('/v1/usage/quota/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile: id, grantId: grantId, requestId: requestId })
+    });
+    status = res.status;
+    try { data = await res.json(); } catch (_) { data = null; }
+  } catch (_) {
+    status = 0;
+  }
+  redeemingReset = null;
+  var outcome = freeResetOutcomeText(status, data, labelForWindow);
+  resetOutcomes[id] = { ok: outcome.ok, text: outcome.text, at: Date.now(), kind: kind, label: button.getAttribute('data-label') };
+  await refresh();
+}
+
 async function renewChatGptSeat(button) {
   var id = button.getAttribute('data-profile');
   button.disabled = true;
@@ -2513,7 +2752,40 @@ async function renewChatGptSeat(button) {
   button.textContent = 'Renew now';
 }
 
+// PATCH /settings/api/chatgpt seatRenewalHours: a number of hours, or null
+// for the default. The renewal pass reads it on its next look.
+async function saveSeatRenewal(button, useDefault) {
+  var id = button.getAttribute('data-profile');
+  var input = button.parentNode.querySelector('.renewal-hours');
+  var typed = input ? input.value.trim() : '';
+  var hours = useDefault || typed === '' ? null : Number(typed);
+  var patch = {};
+  patch[id] = hours;
+  button.disabled = true;
+  var res, data;
+  try {
+    res = await fetch('/settings/api/chatgpt', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ seatRenewalHours: patch })
+    });
+    data = await res.json();
+  } catch (err) {
+    data = { error: 'Could not reach Meridian.' };
+  }
+  button.disabled = false;
+  if (!res || !res.ok) {
+    showLoginMessage(id, data.error || 'Not saved.', 'err');
+    return;
+  }
+  if (input && hours === null) input.value = '';
+  showLoginMessage(id, hours === null ? 'Renews on its token\\u2019s 8th day.' : 'Renews ' + hours + ' hours after its token was issued.', '');
+  refresh();
+}
+
 meridianReorder.init({ onSaved: refresh });
+meridianProfileTable.init(document.getElementById('profiles-section'), redrawProfileTable);
+redrawProfileTable();
 refresh();
 if (!restorePendingAdd()) resetAddForm('');
 // A poll re-renders every card, so it must not land while one is being
@@ -2523,8 +2795,8 @@ if (!restorePendingAdd()) resetAddForm('');
 // which is the addId the paste is about to be sent with. A hidden tab skips
 // polls and catches up when it is shown again.
 function pollRefresh() {
-  if (document.visibilityState !== 'visible' || meridianReorder.dragging()
-    || activeLogin || activeAdd || activeChatGptRelogin) return;
+  if (document.visibilityState !== 'visible' || meridianReorder.dragging() || meridianProfileTable.dragging()
+    || activeLogin || activeAdd || activeChatGptRelogin || redeemingReset || meridianProfileActions.busy()) return;
   refresh();
 }
 // The 1.5s poll while a card updates: a hidden tab keeps the timer, not the

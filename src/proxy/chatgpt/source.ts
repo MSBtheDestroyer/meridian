@@ -16,6 +16,7 @@
  * token at all, so a view built from it cannot leak one.
  */
 import type { CodexPoolResult } from "../codex/pool"
+import type { ChatGptRenewal } from "./credentials"
 import type { RefreshOutcome } from "./refresh"
 
 export type ChatGptCredentialMode = "owned" | "follow-external"
@@ -36,6 +37,8 @@ export interface ChatGptSeatView {
   signedInAt?: number | null
   /** owned only: when Meridian renews the seat next because chatgpt.com refused its access token, epoch ms. */
   renewalRetryAt?: number | null
+  /** owned only: the seat's latest renewals, oldest first (credentials.ts `renewals`). No credential fields. */
+  renewals?: readonly ChatGptRenewal[]
   /** The seat the credential owner itself would pick next. */
   active?: boolean
   /** 0-based position in the store; the owner's own account numbers are this plus one. */
@@ -91,6 +94,8 @@ export interface ChatGptCredentialSource {
   isServing(): boolean
   /** The pool as the read-only usage service expects it. */
   usagePool(): CodexPoolResult
+  /** Strict, non-refreshing credential witness for every seat, waiving only plan exhaustion. */
+  refusalPool?(model: string): CodexPoolResult | undefined
   /** What to tell a client when every seat was unavailable for these reasons. */
   describeUnavailable(reasons: ReadonlySet<SeatUnavailableReason>): string
   /** Take whatever authority this mode needs. No-op for follow-external. */
@@ -119,10 +124,15 @@ export interface ChatGptCredentialSource {
    * owned only: chatgpt.com refused the seat's access token in a read or
    * request that started at `observedAt`. Its refresh token may still be good,
    * so the renewal pass renews the seat at once, then backs off while each
-   * renewed token is refused too (owned.ts `ACCESS_REFUSAL_RETRY_MS`).
+   * renewed token is refused too (owned.ts `ACCESS_REFUSAL_RETRY_MS`), and
+   * stops a day after the first refusal (`ACCESS_REFUSAL_GIVE_UP_MS`).
    */
   accessRefused?(seat: string, observedAt: number): void
-  /** owned only: chatgpt.com accepted the seat's access token in a read that started at `observedAt`. */
+  /**
+   * owned only: chatgpt.com accepted the seat's access token in a read that
+   * started at `observedAt`. It cancels a pending renewal but keeps the
+   * backoff until six hours pass without a refusal.
+   */
   accessAccepted?(seat: string, observedAt: number): void
   /**
    * owned only: resolves once every token exchange already dispatched has

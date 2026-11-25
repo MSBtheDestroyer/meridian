@@ -8,17 +8,23 @@
  * are on the machine-read fields: the code, the incident that ties the error
  * to its `pool_exhausted` events, and the per-profile reasons.
  */
-import { describe, it, expect, beforeEach, afterEach } from "bun:test"
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
+import { createOwnedCredentialStore } from "./modelsMock"
 import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
 
 let failingDirs = new Set<string>()
+let sdkCalls = 0
 const SESSION_LIMIT = "Claude Code returned an error result: You've hit your session limit · resets 12:30am (America/Chicago)"
 
 installSdkMock(() => ({
   query: (params: any) => {
+    sdkCalls++
     const dir = params.options?.env?.CLAUDE_CONFIG_DIR ?? "default"
     const sessionId = resolveMockSdkSessionId(params.options, "test-session")
     return (async function* () {
@@ -41,8 +47,10 @@ installMcpToolsMock(() => ({
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { resetActiveProfile } = await import("../proxy/profiles")
-const { __setFetchOAuthUsageOverride } = await import("../proxy/oauthUsage")
+const { __setFetchOAuthUsageOverride, clearOAuthUsageForProfile, fetchOAuthUsage } = await import("../proxy/oauthUsage")
+const { clearAccountModels, fetchAccountModels } = await import("../proxy/accountModels")
 const { rateLimitStore } = await import("../proxy/rateLimitStore")
+const tokens = await import("../proxy/tokenRefresh")
 const { setSetting } = await import("../settings")
 
 const ALL_DIRS = ["nr-work", "nr-personal", "nr-spare"]
@@ -66,6 +74,7 @@ type NoRoutableError = {
   reset_at?: string | null
   incident_id?: string
   request_id?: string
+  route_refusal?: unknown
   profiles?: ProfileEntry[]
 }
 type PoolEvent = {
@@ -84,12 +93,24 @@ function createTestApp(): TestApp {
   return createProxyServer({ port: 0, host: "127.0.0.1", profiles: PROFILES, defaultProfile: "work" }).app
 }
 
-function post(app: TestApp, opts: { stream?: boolean; content?: string } = {}) {
+function setFleetEvidence(app: TestApp, reasons: Record<string, string>, observedAt = Date.now()) {
+  return app.fetch(new Request("http://localhost/settings/api/routing", {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ routingManagedExcludedProfiles: Object.keys(reasons),
+      routingManagedExclusionEvidence: { version: 1, observedAt, reasons } }),
+  }))
+}
+
+function post(app: TestApp, opts: { stream?: boolean; content?: string; requestId?: string; profile?: string; attest?: boolean; model?: string } = {}) {
+  const headers = new Headers({ "Content-Type": "application/json" })
+  if (opts.requestId) headers.set("x-request-id", opts.requestId)
+  if (opts.profile) headers.set("x-meridian-profile", opts.profile)
+  if (opts.attest) headers.set("x-meridian-route-refusal", "1")
   return Promise.resolve(app.fetch(new Request("http://localhost/v1/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({
-      model: "claude-sonnet-4-5",
+      model: opts.model ?? "claude-sonnet-4-5",
       max_tokens: 128,
       stream: opts.stream ?? false,
       messages: [{ role: "user", content: opts.content ?? "hello" }],
@@ -137,6 +158,7 @@ const ENV_KEYS = ["MERIDIAN_ROUTING", "MERIDIAN_PROFILE_ORDER", "MERIDIAN_WEEKLY
 
 beforeEach(async () => {
   failingDirs = new Set()
+  sdkCalls = 0
   await clearSessionCache()
   resetActiveProfile()
   rateLimitStore.clear()
@@ -188,13 +210,19 @@ describe("no_routable_account inside the stream", () => {
     for (const dir of ALL_DIRS) failingDirs.add(dir)
     const app = createTestApp()
 
-    const res = await post(app, { stream: true, content: "streamed unique message" })
+    const res = await post(app, {
+      stream: true,
+      content: "streamed unique message",
+      requestId: "d8f674be-a3b9-4bc9-a13c-57aa3cf2fa6d",
+      attest: true,
+    })
 
     expect(res.status).toBe(200)
     const frames = streamErrors(await res.text())
     expect(frames).toHaveLength(1)
     const error = frames[0]!
     expectContractShape(error)
+    expect(error.route_refusal).toBeUndefined()
     expect(error.profiles!.map(p => p.id).sort()).toEqual(["personal", "spare", "work"])
 
     // Same object shape as the JSON body a non-streaming request gets.
@@ -203,8 +231,163 @@ describe("no_routable_account inside the stream", () => {
   }, 40_000)
 })
 
+describe("early refusal for fresh, spent plan windows", () => {
+  it.each([
+    ["all spent", null, false, 429],
+    ["managed-out account", "managed", false, 429],
+    ["manually excluded account", "manual", false, 200],
+    ["stale observation", null, true, 200],
+    ["paid overflow still allowed", "overflow", false, 200],
+    ["legacy correlated request", "legacy", false, 200],
+  ] as const)("honors routing evidence for %s", async (_name, special, stale, status) => {
+    process.env.MERIDIAN_CLAUDE_EXTRA_USAGE = special === "overflow" ? "immediately" : "never"
+    if (special === "manual") setSetting("routingExcludedProfiles", ["spare"])
+    const now = Date.now()
+    for (const id of special === "managed" || special === "manual" ? ["work", "personal"] : ["work", "personal", "spare"]) {
+      rateLimitStore.record(id, { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt: now + 3_600_000 },
+        stale && id === "spare" ? now - 10 * 60_000 : now)
+    }
+    const app = createTestApp()
+    if (special === "managed") expect((await setFleetEvidence(app, { spare: "loaner-gate" })).status).toBe(200)
+
+    const res = await post(app, { stream: true, requestId: "aba6ca87-82f1-49ed-8905-329ff6b25931", attest: special !== "legacy" })
+
+    expect(res.status).toBe(status)
+    if (status === 429) {
+      const error = await errorOf(res)
+      expect(error.code).toBe("no_routable_account")
+      expect(error.route_refusal).toMatchObject({ sent: false, model: "claude-sonnet-4-5", reason: "quota_exhausted" })
+      expect(sdkCalls).toBe(0)
+    } else {
+      expect(await res.text()).toContain("ok from")
+    }
+  })
+})
+
+it.each([
+  { name: "Opus family", model: "claude-opus-5-5", effort: "high", window: "seven_day_opus", expected: 0.25 },
+  { name: "Sonnet exact model", model: "claude-sonnet-4-6", effort: "medium", scope: "Claude Sonnet 4.6", expected: 0.25 },
+  { name: "Terra reverse target", model: "claude-sonnet-5-5", effort: "high", scope: "Claude Sonnet 5.5", expected: 0.25 },
+  { name: "Fable family", model: "claude-fable-5-2", effort: "xhigh", scope: "Fable", expected: 0.25 },
+  { name: "Astra reverse target", model: "claude-fable-5-2", effort: "high", scope: "Fable", expected: 0.25 },
+  { name: "Mythos governed by Fable", model: "claude-mythos-5-2", effort: "max", window: "seven_day_overage_included", expected: 0.25 },
+  { name: "Mythos governed by versioned Fable scope", model: "claude-mythos-5-2", effort: "max", scope: "Claude Fable 5.2", expected: 0.25 },
+  { name: "Mythos SDK Fable refusal", model: "claude-mythos-5-2", effort: "max", scope: "Fable", sdkBucket: "seven_day_overage_included", expected: 0 },
+  { name: "explicit Haiku", model: "claude-haiku-5-5", effort: "low", expected: 1 - 0.7 },
+  { name: "Haiku catalog omits effort", model: "claude-haiku-5-5", effort: "low", noEffort: true, expected: 0 },
+  { name: "default Haiku", model: "claude-haiku-4-5-20251001", effort: "default", expected: 0 },
+  { name: "unlisted Mythos", model: "claude-mythos-5-2", effort: "high", scope: "Fable", offered: "claude-fable-5-2", expected: 0 },
+  { name: "unsupported explicit effort", model: "claude-opus-5-5", effort: "low", offeredEffort: "high", expected: 0 },
+  { name: "missing Fable quota", model: "claude-fable-5-2", effort: "high", expected: 0 },
+  { name: "spent Sonnet scope", model: "claude-sonnet-4-6", effort: "medium", scope: "Sonnet", used: 100, expected: 0 },
+  { name: "malformed Opus quota", model: "claude-opus-5-5", effort: "high", window: "seven_day_opus", used: -1, expected: 0 },
+  { name: "expired credentials", model: "claude-opus-5-5", effort: "high", expired: true, expected: 0 },
+  { name: "quota from a replaced credential", model: "claude-opus-5-5", effort: "high", replaced: true, expected: 0 },
+  { name: "paid usage", model: "claude-opus-5-5", effort: "high", paid: true, expected: 0 },
+  { name: "unknown paid usage status", model: "claude-opus-5-5", effort: "high", unknownPaid: true, expected: 0 },
+  { name: "immediate paid routing policy", model: "claude-opus-5-5", effort: "high", immediatePaid: true, expected: 0 },
+  { name: "manual exclusion", model: "claude-opus-5-5", effort: "high", excluded: true, expected: 0 },
+  { name: "CVP requirement", model: "claude-opus-5-5", effort: "high", header: ["x-meridian-require", "cvp"], expected: 0 },
+  { name: "manual pin", model: "claude-opus-5-5", effort: "high", header: ["x-meridian-profile", "return-work"], expected: 0 },
+  { name: "cold catalog shared with pinned model list", model: "claude-sonnet-4-6", effort: "medium", cold: true, expected: 1 - 0.7 },
+])("attests only exact available Claude routes over loopback: $name", async ({ model, effort, window, scope, offered, offeredEffort, noEffort, used = 75, expired, replaced, header, sdkBucket, paid, unknownPaid, immediatePaid, excluded, cold, expected }) => {
+  const root = await mkdtemp(join(tmpdir(), "meridian-return-"))
+  const dir = join(root, "work")
+  const profileId = "return-work"
+  const resetsAt = new Date(Date.now() + 60 * 60_000).toISOString()
+  const expiresAt = Date.now() + DAY
+  const credentials = { claudeAiOauth: { accessToken: "fixture", refreshToken: "fixture", expiresAt } }
+  const { app } = createProxyServer({ profiles: [{ id: profileId, claudeConfigDir: dir }, ...PROFILES], defaultProfile: profileId })
+  const listener = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch })
+  tokens.setCredentialStorePlatformForTests("linux")
+  const storeOverride = spyOn(tokens, "createPlatformCredentialStore").mockImplementation(options =>
+    createOwnedCredentialStore(root, options?.claudeConfigDir))
+  const network = globalThis.fetch
+  let catalogReads = 0
+  try {
+    if (immediatePaid) process.env.MERIDIAN_CLAUDE_EXTRA_USAGE = "immediately"
+    await mkdir(dir)
+    await writeFile(join(dir, ".credentials.json"), JSON.stringify({ claudeAiOauth: { ...credentials.claudeAiOauth,
+      accessToken: replaced ? "replacement-fixture" : "fixture", expiresAt: expired ? Date.now() - 1 : expiresAt } }))
+    const sample = await fetchOAuthUsage({ profileId, force: true,
+      store: { read: async () => credentials,
+        write: async () => { throw new Error("availability fixture must not renew credentials") } },
+      fetchImpl: async () => Response.json({ five_hour: { utilization: 30, resets_at: resetsAt },
+        seven_day: { utilization: 70, resets_at: resetsAt },
+        extra_usage: unknownPaid ? {} : { is_enabled: paid === true },
+        ...(window ? { [window]: { utilization: used, resets_at: resetsAt } } : {}),
+        ...(scope ? { limits: [{ kind: "weekly_scoped", scope: { model: { display_name: scope } }, percent: used, resets_at: resetsAt }] } : {}),
+      }),
+    })
+    if (excluded) setSetting("routingExcludedProfiles", [profileId])
+    if (sdkBucket || paid) rateLimitStore.record(profileId, {
+      status: sdkBucket ? "rejected" : "allowed", rateLimitType: sdkBucket ?? "five_hour",
+      utilization: sdkBucket ? 1 : 0.3, resetsAt: Date.parse(resetsAt), isUsingOverage: paid,
+    }, (sample?.fetchedAt ?? Date.now()) + 1)
+    const catalog = () => Response.json({ data: [{ id: offered ?? model,
+      ...(noEffort ? {} : { capabilities: { effort: { supported: true, [offeredEffort ?? effort]: { supported: true } } } }) }] })
+    globalThis.fetch = Object.assign(async (...args: Parameters<typeof fetch>) => {
+      if (String(args[0]).startsWith(listener.url.origin)) return network(...args)
+      if (!cold || !String(args[0]).startsWith("https://api.anthropic.com/v1/models?") ||
+        new Headers(args[1]?.headers).get("authorization") !== "Bearer fixture") {
+        throw new Error("Unexpected non-loopback request in route availability test")
+      }
+      catalogReads++
+      return catalog()
+    }, { preconnect: network.preconnect })
+    if (!cold) await fetchAccountModels({ cacheKey: profileId, auth: async () => ({ Authorization: "Bearer fixture" }), fetchImpl: async () => catalog() })
+
+    const url = new URL("/profiles/route-availability", listener.url)
+    url.search = new URLSearchParams({ provider: "claude", model, variant: effort }).toString()
+    if (cold) {
+      expect(await (await fetch(url)).json()).toMatchObject({ available: false, observed_at: null })
+      const listed = await fetch(new URL("/v1/models", listener.url), { headers: { "x-meridian-profile": profileId } })
+      expect(listed.headers.get("x-meridian-models-source")).toBe("account")
+      expect(await listed.json()).toMatchObject({ data: [{ id: model }] })
+      expect(catalogReads).toBe(1)
+    }
+    const headers = new Headers()
+    if (header) headers.set(header[0], header[1])
+    const res = await fetch(url, { headers })
+
+    expect(res.status).toBe(200)
+    expect(res.headers.get("cache-control")).toBe("no-store")
+    expect(await res.json()).toEqual({ version: 1, provider: "claude", model, variant: effort,
+      available: expected > 0, routable_allotment: expected, observed_at: expected > 0 ? sample?.fetchedAt : null })
+    expect(sdkCalls).toBe(0)
+  } finally {
+    globalThis.fetch = network
+    await listener.stop(true)
+    storeOverride.mockRestore()
+    tokens.setCredentialStorePlatformForTests(null)
+    clearOAuthUsageForProfile(profileId)
+    clearAccountModels(profileId)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+it.each(["gpt-6-sol", "sonnet", "claude-sonnet-test"])("keeps the ordinary quota refusal but does not attest Claude origin for %s", async (model) => {
+  process.env.MERIDIAN_CLAUDE_EXTRA_USAGE = "never"
+  const app = createTestApp()
+  const now = Date.now()
+  for (const { id } of PROFILES) {
+    rateLimitStore.record(id, { status: "allowed", rateLimitType: "seven_day", utilization: 0.97, resetsAt: now + DAY })
+  }
+  const reserve = { seven_day: { floor: 95, ceiling: 95 } }
+  setSetting("usageReserves", { work: reserve, personal: reserve, spare: reserve })
+
+  const res = await post(app, { model, stream: true, attest: true, requestId: "aba6ca87-82f1-49ed-8905-329ff6b25931" })
+
+  expect(res.status).toBe(429)
+  const error = await errorOf(res)
+  expect(error.code).toBe("no_routable_account")
+  expect(error.route_refusal).toBeUndefined()
+  expect(sdkCalls).toBe(0)
+})
+
 describe("no_routable_account when every candidate is held back", () => {
   const FLAT_WEEK_95 = { seven_day: { floor: 95, ceiling: 95 } }
+  const REQUEST_ID = "73f3a376-4d3a-4efa-ae91-d4aff18d898d"
 
   function holdEveryProfile(): void {
     setSetting("usageReserves", { work: FLAT_WEEK_95, personal: FLAT_WEEK_95, spare: FLAT_WEEK_95 })
@@ -226,6 +409,60 @@ describe("no_routable_account when every candidate is held back", () => {
     expect(error.profiles!.map(p => [p.id, p.reason]).sort()).toEqual([["personal", "reserve_held"], ["spare", "reserve_held"], ["work", "reserve_held"]])
     const personal = error.profiles!.find(p => p.id === "personal")!
     expect(error.reset_at).toBe(personal.resets_at)
+    expect(error.route_refusal).toBeUndefined()
+  })
+
+  it("attests an unsent streaming request held by every pool reserve in the HTTP refusal", async () => {
+    holdEveryProfile()
+    const app = createTestApp()
+
+    const res = await post(app, { stream: true, requestId: REQUEST_ID, attest: true })
+
+    expect(res.status).toBe(429)
+    const error = await errorOf(res)
+    expect(error.request_id).toBe(REQUEST_ID)
+    expect(error.route_refusal).toEqual({
+      version: 1,
+      phase: "before_inference",
+      sent: false,
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+      reason: "reserve_held",
+    })
+  })
+
+  it("does not attest a pinned request when the named seat is held", async () => {
+    holdEveryProfile()
+    const app = createTestApp()
+
+    const res = await post(app, { stream: true, requestId: REQUEST_ID, profile: "work", attest: true })
+
+    expect(res.status).toBe(429)
+    expect((await errorOf(res)).route_refusal).toBeUndefined()
+  })
+
+  it("does not attest a mixed reserve and exclusion refusal", async () => {
+    holdEveryProfile()
+    setSetting("routingExcludedProfiles", ["spare"])
+    const app = createTestApp()
+
+    const res = await post(app, { stream: true, requestId: REQUEST_ID, attest: true })
+
+    expect(res.status).toBe(429)
+    const error = await errorOf(res)
+    expect(error.profiles?.map(p => p.reason).sort()).toEqual(["excluded", "reserve_held", "reserve_held"])
+    expect(error.route_refusal).toBeUndefined()
+  })
+
+  it("tries the remaining permitted account instead of attesting pool exhaustion", async () => {
+    holdEveryProfile()
+    setSetting("usageReserves", { work: FLAT_WEEK_95, personal: FLAT_WEEK_95 })
+    const app = createTestApp()
+
+    const res = await post(app, { requestId: REQUEST_ID, attest: true })
+
+    expect(res.status).toBe(200)
+    expect(await res.text()).toContain("ok from /tmp/meridian-nr-spare")
   })
 
   it("does the same for unpinned work in plain active mode", async () => {
@@ -306,6 +543,27 @@ describe("the pool incident on /profiles/events", () => {
 })
 
 describe("no_routable_account when the supervisor's exclusions empty the pool", () => {
+  it.each([
+    ["fresh full fleet evidence", 0, "spent", 200, true],
+    ["stale fleet evidence", 120_001, "spent", 200, false],
+    ["hand hold", 0, "held", 400, false],
+    ["needs login", 0, "logged-out", 400, false],
+  ] as const)("attests only a fresh capacity/protection exclusion set: %s", async (_name, age, reason, status, attests) => {
+    const app = createTestApp()
+    setSetting("routingManagedExcludedProfiles", ["work", "personal", "spare"])
+    const update = await setFleetEvidence(app, { work: reason, personal: "weekly-reserve", spare: "unmeasured-loaner-cap" }, Date.now() - age)
+    expect(update.status).toBe(status)
+
+    const refused = await post(app, { stream: true, attest: true, requestId: "542acae5-5ad5-4a5b-8a40-6b78a9ea3e47" })
+
+    expect(refused.status).toBe(429)
+    const error = await errorOf(refused)
+    expect(error.code).toBe("no_routable_account")
+    if (attests) expect(error.route_refusal).toMatchObject({ sent: false, reason: "quota_exhausted" })
+    else expect(error.route_refusal).toBeUndefined()
+    expect(sdkCalls).toBe(0)
+  })
+
   for (const routing of ["active", "active+priority"]) {
     it(`answers 429 instead of no_eligible_profiles under ${routing}, naming each profile excluded`, async () => {
       process.env.MERIDIAN_ROUTING = routing

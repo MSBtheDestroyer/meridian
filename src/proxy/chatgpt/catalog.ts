@@ -62,6 +62,7 @@ export interface CatalogModel {
   contextWindow: number | null
   /** The plan slugs it is available in; null = the entry does not say, so all. */
   plans: string[] | null
+  efforts?: readonly string[]
 }
 
 /**
@@ -75,7 +76,7 @@ export function parseCodexModelCatalog(body: unknown): CatalogModel[] | null {
   const listed: CatalogModel[] = []
   for (const entry of entries) {
     if (typeof entry !== "object" || entry === null) continue
-    const { slug, visibility, display_name, context_window, available_in_plans } = entry as Record<string, unknown>
+    const { slug, visibility, display_name, context_window, available_in_plans, supported_reasoning_levels } = entry as Record<string, unknown>
     if (typeof slug !== "string" || slug.length === 0 || visibility !== "list") continue
     if (listed.some(model => model.slug === slug)) continue
     listed.push({
@@ -83,6 +84,8 @@ export function parseCodexModelCatalog(body: unknown): CatalogModel[] | null {
       displayName: typeof display_name === "string" && display_name.length > 0 ? display_name : slug,
       contextWindow: typeof context_window === "number" && Number.isFinite(context_window) && context_window > 0 ? context_window : null,
       plans: Array.isArray(available_in_plans) ? available_in_plans.filter((plan): plan is string => typeof plan === "string") : null,
+      ...(Array.isArray(supported_reasoning_levels) ? { efforts: supported_reasoning_levels.flatMap((preset: unknown) =>
+        typeof preset === "object" && preset !== null && "effort" in preset && typeof preset.effort === "string" ? [preset.effort] : []) } : {}),
     })
   }
   return listed
@@ -129,6 +132,7 @@ export interface ChatGptModelCatalog {
   /** The offered models with the catalog's metadata; the static stand-ins carry none. */
   entries(): CatalogModel[]
   view(): ChatGptModelCatalogView
+  routeOffered(model: string, effort: string, plan: string): boolean
   /** Re-read the catalog when due. Concurrent calls share one read; undefined when not due. */
   refresh(): Promise<void> | undefined
 }
@@ -222,6 +226,12 @@ export function createChatGptModelCatalog(options: ChatGptModelCatalogOptions): 
   return {
     entries,
     models: () => entries().map(model => model.slug),
+    routeOffered(model, effort, plan) {
+      const at = now()
+      return !!catalog && at >= catalog.fetchedAt && at - catalog.fetchedAt < CATALOG_TTL_MS &&
+        catalog.clientVersion === clientVersion.current() && retryAt === 0 && catalog.models.some(entry =>
+          entry.slug === model && entry.plans?.includes(plan) && entry.efforts?.includes(effort))
+    },
     view() {
       const plans: Record<string, string[]> = {}
       if (catalog) {

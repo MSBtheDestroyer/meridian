@@ -10,6 +10,12 @@ type ResolveRoutingAccessInput = {
    * account nothing else touches.
    */
   readonly heldProfileIds?: readonly string[]
+  /**
+   * Profiles the supervisor's `routingManagedExcludedProfiles` takes out of
+   * unpinned work. A pin still reaches one and so does a warm: the list is
+   * the supervisor's policy for work nobody assigned, not the user's.
+   */
+  readonly managedExcludedProfileIds?: readonly string[]
   readonly explicitProfileId?: string
 }
 
@@ -54,9 +60,10 @@ export function resolveRoutingAccess(input: ResolveRoutingAccessInput): RoutingA
         return { kind: "explicit_excluded", profileId: input.explicitProfileId }
       }
       const pinnedToHeld = input.explicitProfileId !== undefined && held.includes(input.explicitProfileId)
+      const managed = (input.managedExcludedProfileIds ?? []).filter(profileId => profileId !== input.explicitProfileId)
       const eligibleProfileIds = filterEligibleProfileIds(
         input.availableProfileIds,
-        pinnedToHeld ? input.excludedProfileIds : [...input.excludedProfileIds, ...held],
+        pinnedToHeld ? [...input.excludedProfileIds, ...managed] : [...input.excludedProfileIds, ...held, ...managed],
       )
       return eligibleProfileIds.length > 0
         ? { kind: "allowed", eligibleProfileIds }

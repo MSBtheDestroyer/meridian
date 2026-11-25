@@ -105,7 +105,7 @@ export function createExternalCredentialSource(options: ExternalSourceOptions = 
   const now = options.now ?? Date.now
   let cached: Snapshot | undefined
 
-  const read = (force: boolean): Snapshot => {
+  const read = (force: boolean, strict = false): Snapshot => {
     let key: string
     try {
       const stat = statSync(path)
@@ -127,9 +127,13 @@ export function createExternalCredentialSource(options: ExternalSourceOptions = 
         const at = num(index)
         if (at !== null) byFamily[family] = at
       }
+      const accounts = root.accounts.map((value, index) => parseAccount(value, index)).filter((a): a is ExternalAccount => a !== null)
+      if (strict && accounts.length !== root.accounts.length) {
+        return { key, accounts: [], activeIndex: 0, activeIndexByFamily: {}, error: "invalid_pool" }
+      }
       cached = {
         key,
-        accounts: root.accounts.map((value, index) => parseAccount(value, index)).filter((a): a is ExternalAccount => a !== null),
+        accounts,
         activeIndex: num(root.activeIndex) ?? 0,
         activeIndexByFamily: byFamily,
         error: null,
@@ -137,7 +141,8 @@ export function createExternalCredentialSource(options: ExternalSourceOptions = 
     } catch {
       // Keep serving the last good read through a transient parse failure;
       // with none, report the store unreadable.
-      if (cached && cached.error === null) return cached
+      if (!strict && cached && cached.error === null) return cached
+      if (strict) return { key, accounts: [], activeIndex: 0, activeIndexByFamily: {}, error: "pool_unreadable" }
       cached = { key, accounts: [], activeIndex: 0, activeIndexByFamily: {}, error: "pool_unreadable" }
     }
     return cached
@@ -165,6 +170,15 @@ export function createExternalCredentialSource(options: ExternalSourceOptions = 
     const start = (model !== undefined ? snapshot.activeIndexByFamily[model] : undefined) ?? snapshot.activeIndex
     const offset = start >= 0 && start < accounts.length ? start : 0
     return [...accounts.slice(offset), ...accounts.slice(0, offset)]
+  }
+
+  const usagePool = (snapshot: Snapshot): CodexPoolResult => {
+    if (snapshot.error) return { pool: null, error: snapshot.error }
+    return { error: null, pool: { path, accounts: snapshot.accounts.map((account): CodexPoolAccount => ({
+      accountId: account.accountId, accountUserId: account.accountUserId, organizationId: account.organizationId,
+      email: account.email, accountLabel: null, planType: account.planType, accessToken: account.accessToken,
+      expiresAt: account.expiresAt, enabled: account.enabled,
+    })) } }
   }
 
   return {
@@ -227,26 +241,12 @@ export function createExternalCredentialSource(options: ExternalSourceOptions = 
       return read(false).error === null
     },
 
-    usagePool(): CodexPoolResult {
-      const snapshot = read(false)
-      if (snapshot.error) return { pool: null, error: snapshot.error }
-      return {
-        error: null,
-        pool: {
-          path,
-          accounts: snapshot.accounts.map((account): CodexPoolAccount => ({
-            accountId: account.accountId,
-            accountUserId: account.accountUserId,
-            organizationId: account.organizationId,
-            email: account.email,
-            accountLabel: null,
-            planType: account.planType,
-            accessToken: account.accessToken,
-            expiresAt: account.expiresAt,
-            enabled: account.enabled,
-          })),
-        },
-      }
+    usagePool: () => usagePool(read(false)),
+    refusalPool(model) {
+      const snapshot = read(true, true)
+      const at = now()
+      if (snapshot.accounts.some(account => account.expiresAt === null || unavailable(account, model, at, true) !== null)) return
+      return usagePool(snapshot)
     },
 
     describeUnavailable(reasons) {

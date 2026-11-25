@@ -17,7 +17,7 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_PORT` | `CLAUDE_PROXY_PORT` | `3456` | Port to listen on |
 | `MERIDIAN_HOST` | `CLAUDE_PROXY_HOST` | `127.0.0.1` | Host to bind to |
 | `MERIDIAN_PUBLIC_URL` | `CLAUDE_PROXY_PUBLIC_URL` | unset | The address people reach this instance at, e.g. `https://meridian.example`. Public OAuth callback URLs are built on it. Wins over `publicUrl` saved at `/settings`; with neither, the address a sign-in was started from is used. See [Event hooks](#event-hooks) |
-| `MERIDIAN_HOOK_COMMAND` | `CLAUDE_PROXY_HOOK_COMMAND` | unset | One more [event hook](#event-hooks) command, receiving every event, beside those saved at `/settings` |
+| `MERIDIAN_HOOK_COMMAND` | `CLAUDE_PROXY_HOOK_COMMAND` | unset | One more [event hook](#event-hooks) command, run for the sign-in callback events, beside those in `settings.json` `hooks.commands` |
 | `MERIDIAN_HOOK_URL` | `CLAUDE_PROXY_HOOK_URL` | unset | One more [event hook](#event-hooks) webhook, receiving every event, beside those saved at `/settings` |
 | `MERIDIAN_PASSTHROUGH` | `CLAUDE_PROXY_PASSTHROUGH` | unset | Forward tool calls to client instead of executing |
 | `MERIDIAN_MAX_CONCURRENT` | `CLAUDE_PROXY_MAX_CONCURRENT` | `10` | Maximum SDK queries running concurrently within one Meridian process. The budget is shared by every proxy instance in the process, and is re-read whenever an instance starts — so raising or lowering it takes effect for a later instance without a restart. Embedders that need a distinct budget can pass `maxConcurrent` in `ProxyConfig`, which opts that instance out of the shared pool. |
@@ -47,8 +47,8 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_PASSTHROUGH_MAX_TURNS` | `CLAUDE_PROXY_PASSTHROUGH_MAX_TURNS` | *(unset — capped at 1)* | Pin the passthrough SDK turn budget. An explicit positive value wins over the one-turn cap. With early stop enabled, a budget above one still stops after a batch forwarded to the client (see [digest-turn elimination](#how-tool-calling-works-in-passthrough)), so the pin adds headroom before the tool boundary; structured-output requests retain the normal SDK completion loop. Unset it unless you still need it. |
 | `MERIDIAN_PASSTHROUGH_UNCAPTURED_TOOL_RECOVERY` | — | *(unset — confirmed CLI rejection only)* | In streaming passthrough, complete tool calls can be returned as `tool_use` when every call has a CLI dispatch rejection matching its ID and tool name: `No such tool available`, or `InputValidationError: … could not be parsed as JSON`. Input must still form a complete JSON object after the supported control-character/invalid-escape repair; schema validation failures do not count. Explicit rejection can also qualify an undeclared tool name for the client's own invalid-tool response. The rejected SDK session is evicted so the next client result replays against a fresh one. Set to `1` to **also** allow experimental uncaptured abort-window recovery without explicit rejection (no live positive gate yet); every call must then name a declared tool. Set to `0` to disable both recoveries. Non-streaming responses are unaffected. Confirmed-rejection recovery applies at any turn budget, including deferred tools; abort-window recovery requires `maxTurns=1`. Both require a complete open envelope and no cancellation. When neither applies, the `sdk_termination` error log names the blocking condition as `uncaptured_veto=…`. |
 | `MERIDIAN_SESSION_GC_LOCK_WAIT_MS` | `CLAUDE_PROXY_SESSION_GC_LOCK_WAIT_MS` | `2000` | External lifecycle-lock acquisition budget, starting only at the head of the local FIFO; minimum 100 ms. Local queue waiting does not consume this budget and is not bounded by two seconds. Each lock allows 256 waiting callers; a holder stalled for 60 seconds rejects queued/new callers without unlocking its transaction, unless the deadline itself ran late because the event loop was blocked. An answered turn whose terminal publication meets any of these errors is still delivered; its next turn replays history. Request cancellation removes queued work or cancels acquisition, never an executing durable transaction; cleanup remains uncanceled. External timeout, queue capacity and stalled-holder failures answer **503 `overloaded_error`** with distinct reasons. |
-| `MERIDIAN_SESSION_GC_MAX_PENDING` | `CLAUDE_PROXY_SESSION_GC_MAX_PENDING` | `2048` | Transcripts that may wait for deletion at once (prepared, retired or being deleted). A superseded transcript waits its grace period in this budget, so it caps deletion throughput at this many per grace period; superseded transcripts beyond it stay live. When it is full and superseded transcripts are waiting, the log says `session GC backlog saturated` (at most every 10 minutes) and healthy `/health` reports `sessionGc.saturated: true`. |
-| `MERIDIAN_SESSION_GC_MAX_DELETES` | `CLAUDE_PROXY_SESSION_GC_MAX_DELETES` | `64` | Deletions one GC run claims, in batches of 8 that run side by side. While transcripts are still due for deletion and runs make progress, the next run follows at once, for up to 5 minutes per sweep. |
+| `MERIDIAN_SESSION_GC_MAX_DELETES` | `CLAUDE_PROXY_SESSION_GC_MAX_DELETES` | `64` | Deletions one GC run claims, in batches of 8 that run side by side. While transcripts are still due for deletion and runs make progress, the next run follows at once, for up to 5 minutes per sweep. Runs also follow every managed fork publication or abandonment, so under load `MERIDIAN_SESSION_GC_MAX_PENDING` bounds the cleanup rate instead. Once the proxy is draining, no run claims a new deletion; the next process deletes what is left. |
+| `MERIDIAN_SESSION_GC_GRACE_MS` | `CLAUDE_PROXY_SESSION_GC_GRACE_MS` | session turn hold + `60000` | How long a transcript no longer pinned by a mapping waits, retired, before it may be deleted, so a request still holding it ends first. |
 | `MERIDIAN_SESSION_PROFILE_COPY_PRUNE` | `CLAUDE_PROXY_SESSION_PROFILE_COPY_PRUNE` | `0` | Opt in to removing stale cross-profile session mappings during GC. Off preserves native resume history. Returning to a pruned profile uses flattened, context-trimmed replay, which cannot restore SDK thinking. |
 | `MERIDIAN_SESSION_PROFILE_COPY_GRACE_MS` | `CLAUDE_PROXY_SESSION_PROFILE_COPY_GRACE_MS` | `86400000` (24 hours) | With several profiles, the same conversation gets its own stored session under each profile it has run on. When profile-copy pruning is enabled, on every session GC sweep a copy is removed once a newer copy of that conversation exists under another profile and the older copy has not been used for this many milliseconds. The newest copy, copies of a conversation with a request in flight, and mappings a priority route depends on are always kept. A conversation that returns to a profile while its copy exists resumes that profile's own session, unless another profile's copy holds more of the history the client sends (the conversation took turns there since), in which case it is replayed as below; after removal it is replayed into a fresh session on that account, as flattened history trimmed to the model's context window. The default covers an account's 5-hour usage window resetting and a day of switching back and forth. `0` keeps only the newest copy. Removal is paced to leave at least half of `MERIDIAN_SESSION_GC_MAX_PENDING` free for new requests, so a large store is trimmed over several sweeps. |
 | `MERIDIAN_SILENT_TURN_RECOVERY` | `CLAUDE_PROXY_SILENT_TURN_RECOVERY` | `1` | Set to `0` to stop spending a recovery turn on a [silent turn](#silent-turns). Detection and telemetry stay on either way |
@@ -60,7 +60,8 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_SUPPRESS_SCRATCHPAD` | — | `1` | Set to `0` to disable prompt-level scratchpad suppression in passthrough mode (#627, #1049) |
 | `MERIDIAN_SUPPRESS_SCRATCHPAD_ENV` | — | `0` | Set to `1` to also pass `CLAUDE_CODE_SESSION_KIND=bg` to the SDK subprocess. Disabled by default to prevent CLI 2.1.274+ from registering persistent phantom background jobs under `~/.claude/jobs/` (#1049) |
 | `MERIDIAN_SUPPRESS_IMPLICIT_ATTACHMENTS` | — | `1` | Set to `0` to stop defaulting `CLAUDE_CODE_DISABLE_ATTACHMENTS=1` in passthrough mode. Does not clear an explicitly inherited CLI setting. See [known limitations](#known-limitations). |
-| `MERIDIAN_CACHE_KEEPALIVE` | — | unset (off) | Set to `1` to keep idle one-hour-cache sessions warm with a few small cache-read requests; `0` forces it off. Wins over `cacheKeepalive` in `settings.json`. See [Prompt-cache keepalive](#prompt-cache-keepalive). |
+| `MERIDIAN_CACHE_KEEPALIVE` | — | unset (off) | Set to `1` to keep idle one-hour-cache sessions warm with a few small cache-read requests; `client` to beat only when a client asks; `0` forces it off. Wins over `cacheKeepalive` in `settings.json`. See [Prompt-cache keepalive](#prompt-cache-keepalive). |
+| `MERIDIAN_CACHE_KEEPALIVE_MAX_BEATS` | — | `3` | Keepalive requests per idle session before its cache is allowed to expire, in automatic and client mode. At least `1`. |
 | `MERIDIAN_CACHE_KEEPALIVE_MAX_IN_FLIGHT` | — | `1` | Keepalive requests allowed to run at once across all sessions, clamped to `1`–`2`. |
 | `MERIDIAN_COMPACTION_SURVIVAL` | — | `0` | Set to `1` to resume the old SDK session after a client shortens its history head into a summary. By default Meridian replays the supplied summary in a fresh SDK session so the removed context is released. Equal-length pruning still resumes. |
 | `MERIDIAN_CONFIG_DIR` | — | `~/.config/meridian` | Meridian's own config directory. Moving it moves everything inside it — see [below](#relocating-the-config-directory). |
@@ -397,7 +398,7 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `GET /settings` | Routing, SDK feature toggles, model pricing, telemetry storage, update-check, site-header and page layout UI |
 | `GET/PUT /settings/api/updates` | Read or set `checkForUpdates` (JSON `{"checkForUpdates": true}`); takes effect on the running proxy. Also reports each loaded plugin's installed and latest version in `plugins`; turning it on also sends loaded plugins' npm package names to the registry |
 | `GET/PUT /settings/api/header` | Read or set `showHostname` (JSON `{"showHostname": true}`): name the machine beside the header's status; takes effect on the running proxy |
-| `GET/PUT /settings/api/hooks`, `POST /settings/api/hooks/test` | [Event hooks](#event-hooks) and the public URL (JSON); `test` sends a `hooks.test` event |
+| `GET/PUT /settings/api/hooks`, `POST /settings/api/hooks/test` | [Event hooks](#event-hooks) webhooks and the public URL (JSON); `test` sends a `hooks.test` event to webhooks. Management clients only: `MERIDIAN_API_KEY`, or without one this machine at its loopback address |
 | `GET /callback/<id>/<path>` | A loopback OAuth redirect, relayed from another machine (see [Event hooks](#event-hooks)). No API key; unknown ids are 404 |
 | `GET/PUT /settings/api/layout` | Read or set the web pages' `layout`: `contained` (default, a centered column) or `wide` (spans the window, more cards per row). JSON `{"layout": "wide"}`, `null` to unset; applies on the next page load |
 | `GET /plugins` | Plugin management page (`/plugins/list`, `POST /plugins/reload` for JSON/actions) |
@@ -1001,7 +1002,9 @@ interactive Claude Code.
   held until the process has exited. It skips a directory whose login is due
   for renewal within 30 minutes, starts nothing under
   `MERIDIAN_CREDENTIALS_READONLY`, and stops until restart, with a log line, if a
-  stored login changes during a run in a way no renewal explains.
+  stored login changes during a run in a way no renewal explains. An instance
+  under `MERIDIAN_FOLLOW_ACTIVE` runs no idle sweep; the followed instance does. If a transcript Meridian still needs cannot be refreshed, it runs no
+  cleanup in that directory and logs why.
 - **The first cleanup can wait a day.** Claude Code stamps `.last-cleanup`
   even when retention is off and it skips the deletion, so after you turn
   retention on, a config directory that served a request in the previous
@@ -1241,6 +1244,7 @@ line reads `session=new`. One value applies, in this order:
 |---|---|
 | `transformed-history` | A plugin rewrote the history this turn runs. This does not depend on the lookup, so it appears on any line, `lineage=new` (with its `diverged=`) included |
 | `changed-or-unproved-primary-agent` | The lookup found a session (`lineage=continuation`, `compaction` or `undo`), but OpenCode's primary agent is not the one that session was published with, or that session recorded none |
+| `system-prompt-reset` | The lookup found a session, and the request carried `x-meridian-system-prompt-reset: 1` or its key was armed with `POST /v1/sessions/:key/system-prompt-reset`: the history replays so the fresh session renders the client's current system prompt |
 | `unproved-sdk-prefix` | The lookup found a session (`lineage=continuation`, `compaction` or `undo`) that holds no proof its SDK transcript matches this history: it was published from a plugin-rewritten history, or it is a stopped turn's kept session read without that turn's record (after a restart, or on another process sharing the store; see [Stopping a turn](#stopping-a-turn)) |
 
 `headerless-tool-result` also prints a one-time warning at the first
@@ -1301,8 +1305,9 @@ When it is on:
 - About 55 minutes after the latest real turn, and 55 minutes after each
   keepalive, Meridian resumes the session's stored transcript exactly as the
   next turn would, adds a short prompt, and stops as soon as the response
-  starts. At most three keepalives per idle period (about three hours); after
-  that the cache is allowed to expire.
+  starts. At most three keepalives per idle period (about three hours;
+  `MERIDIAN_CACHE_KEEPALIVE_MAX_BEATS` changes the number); after that the
+  cache is allowed to expire.
 - The next real turn on the session ends the idle period and starts a new one.
   Side calls that share the session key (Claude Code's classifier and title
   requests) do not.
@@ -1320,6 +1325,40 @@ When it is on:
   rate.
 - Shutdown and drain stop new keepalives, abort a running one and wait for its
   Claude Code process to exit, like any other request.
+
+#### Client-requested beats
+
+With `MERIDIAN_CACHE_KEEPALIVE=client` (or `"cacheKeepalive": "client"`),
+Meridian tracks the same sessions but never beats on its own. A client that
+knows whether its user is coming back asks for each beat instead. Only the
+operator can choose this mode; in any other mode the endpoint sends nothing
+and answers `disabled`.
+
+```
+POST /v1/sessions/<session key>/cache-beat
+```
+
+`<session key>` is the exact key the client sends with its turns
+(`x-session-affinity`, `x-opencode-session`, ...). The request answers once
+the beat has finished, as `{ "session": "...", "outcome": "..." }`:
+
+| Outcome | Meaning |
+|---|---|
+| `reached` | Upstream read the cached prefix; the cache lives another hour. |
+| `retry` | The beat could not run now (no free SDK slot, account blocked, transient error). |
+| `busy` | A real turn or another beat is running for the session. |
+| `stop` | The session cannot be kept warm (cache gone, five-minute tier, mapping moved), or it has used its keepalives for this idle period. |
+| `early` | The cache was read less than 20 minutes ago, or a failed beat is still backing off; nothing was sent. |
+| `expired` | The cache had already expired; nothing was sent. |
+| `untracked` | No eligible session under that key. |
+| `disabled` | The operator has not chosen client mode. |
+
+The client chooses when to beat, but not how often: the same per-period cap
+applies (`MERIDIAN_CACHE_KEEPALIVE_MAX_BEATS`, three by default, reset by the
+next real turn), and a beat is refused within 20 minutes of the latest turn or
+beat. Every other rule above (subscription accounts only, never the last SDK
+slot, never an expired cache, never beside a real turn) still applies. A
+tracked session whose cache expires is forgotten as before.
 
 Keepalives appear in `/telemetry` with `requestSource: "cache-keepalive"`.
 They are left out of the request, error, cache-hit and cost figures and shown
@@ -1416,14 +1455,19 @@ ANTHROPIC_API_KEY=your-secret-key ANTHROPIC_BASE_URL=http://meridian-host:3456 o
 
 ## Event hooks
 
-Meridian can tell other programs when something happens. Configure targets on `/settings` -> **Event Hooks** (saved as `hooks` in `settings.json`), or add one of each kind with `MERIDIAN_HOOK_URL` and `MERIDIAN_HOOK_COMMAND`. Targets are re-read for every event; no restart is needed.
+Meridian can tell other programs when something happens. Targets are re-read for every event; no restart is needed. With no target configured, nothing is sent and nothing runs.
+
+- **Webhooks** are edited on `/settings` -> **Event Hooks** (saved as `hooks.webhooks` in `settings.json`), or one more is given with `MERIDIAN_HOOK_URL`.
+- **Commands** are local operator configuration only: `hooks.commands` in `settings.json`, edited on the machine, or `MERIDIAN_HOOK_COMMAND`. No HTTP request can create, edit, enable or remove one (a request naming `commands` is refused with 403; one that omits them keeps them), and `/settings` lists them read-only as `command #<n>` (their position in `hooks.commands`) or `command MERIDIAN_HOOK_COMMAND`.
+- A command runs only for the events Meridian raises itself as a ChatGPT browser sign-in opens and closes its redirect listener (`oauth.callback.listening`, `oauth.callback.closed`). It never runs for `hooks.test`, so **Send test event** reaches webhooks only.
+- The hook settings routes answer only a management client: one of Meridian's own pages (or a client without an `Origin`), and either `MERIDIAN_API_KEY` when one is configured or, without a key, a request from Meridian's own machine to its loopback address (`http://127.0.0.1:<port>`, not through a reverse proxy: a request carrying `Forwarded`, `X-Forwarded-For` or `X-Real-IP`, or a `Host` other than exactly `localhost`, `127.x.y.z` or `[::1]` with an optional port, is refused). A reverse proxy on the same machine that strips its forwarding headers and rewrites `Host` to a loopback address cannot be told apart from a local client, so do not configure one that way in front of an instance without `MERIDIAN_API_KEY`. Elsewhere `/settings` shows why the card is unavailable.
 
 | Target | Delivery |
 | --- | --- |
 | Webhook | `POST <url>`, `Content-Type: application/json`, headers `X-Meridian-Event` and `X-Meridian-Delivery`. Any 2xx is success. Redirects are not followed. 5s limit |
 | Command | Run through the system shell with the event as JSON on **stdin**, never in argv; `MERIDIAN_HOOK_EVENT` and `MERIDIAN_HOOK_DELIVERY` are set. Exit 0 is success. 10s limit, then its process group is stopped |
 
-Each delivery is tried once. At most 16 run at once; past that an event is dropped for that target. The last 25 deliveries, with the command's first line of output (or the webhook's status), are shown on `/settings` and in `[hooks]` log lines, so a command must not print secrets. Logs name a webhook by host and a command by program name only.
+Each delivery is tried once. At most 16 run at once; past that an event is dropped for that target. `/settings` shows the last 25 deliveries by status only (`exit 0`, `HTTP 502`, `no answer in 10s, stopped`): what a command prints or a webhook answers is never returned over HTTP. Its first line goes to the `[hooks]` log line on this machine, so a command must still not print secrets. A webhook is named by host and a command by its position or `MERIDIAN_HOOK_COMMAND`, never by any part of its command line.
 
 Every event is one JSON object:
 

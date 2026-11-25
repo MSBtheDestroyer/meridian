@@ -110,6 +110,21 @@ describe("chatGptModelList", () => {
 })
 
 describe("createChatGptModelCatalog", () => {
+  it("requires a catalog-backed exact effort and an explicitly named eligible plan for route evidence", async () => {
+    const { source } = fakeSource([seat(0)])
+    const { fetchImpl } = catalogFetch(() => json({ models: [{
+      slug: "gpt-6.2-sol", visibility: "list", available_in_plans: ["pro"],
+      supported_reasoning_levels: [{ effort: "xhigh", description: "Extra high" }],
+    }] }))
+    const catalog = createChatGptModelCatalog({ source, fetchImpl, now: () => NOW })
+
+    await catalog.refresh()
+
+    expect(catalog.routeOffered("gpt-6.2-sol", "xhigh", "pro")).toBe(true)
+    expect(catalog.routeOffered("gpt-6.2-sol", "high", "pro")).toBe(false)
+    expect(catalog.routeOffered("gpt-6.2-sol", "xhigh", "team")).toBe(false)
+  })
+
   it("offers the static list until the catalog has been read", () => {
     const { source } = fakeSource([seat(0)])
     const catalog = createChatGptModelCatalog({ source, fetchImpl: catalogFetch(() => json(CATALOG)).fetchImpl, now: () => NOW })

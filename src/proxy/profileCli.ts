@@ -325,13 +325,6 @@ export function buildLoginCredentials(
   }
 }
 
-/** A `claude auth login` that just succeeded wrote the credential itself, so it is read back. */
-async function recordCliLogin(configDir: string | undefined): Promise<void> {
-  const store = createPlatformCredentialStore(configDir ? { claudeConfigDir: configDir } : undefined)
-  const credentials = await store.read().catch(() => null)
-  noteAuthLogin(store.refreshKey, { refreshTokenExpiresAt: credentials?.claudeAiOauth?.refreshTokenExpiresAt })
-}
-
 export type OAuthExchangeFailureReason =
   | "state_mismatch"
   | "request_failed"
@@ -440,9 +433,19 @@ export async function exchangeAuthorizationCodeForCredentials(params: OAuthExcha
   })
   const written = await store.write(credentials)
   if (written) {
-    noteAuthLogin(store.refreshKey, { refreshTokenExpiresAt: credentials.claudeAiOauth.refreshTokenExpiresAt })
+    await noteAuthLogin(store.refreshKey, {
+      refreshTokenExpiresAt: credentials.claudeAiOauth.refreshTokenExpiresAt,
+      refreshToken: credentials.claudeAiOauth.refreshToken,
+    })
   }
   return written ? { ok: true } : { ok: false, reason: "write_failed" }
+}
+
+/** `claude auth login` wrote the credential itself, so the login is read back from it. */
+async function recordCliLogin(configDir: string | undefined): Promise<void> {
+  const store = createPlatformCredentialStore(configDir ? { claudeConfigDir: configDir } : undefined)
+  const oauth = (await store.read().catch(() => null))?.claudeAiOauth
+  await noteAuthLogin(store.refreshKey, { refreshTokenExpiresAt: oauth?.refreshTokenExpiresAt, refreshToken: oauth?.refreshToken })
 }
 
 async function completeManualOAuthLogin(configDir: string): Promise<boolean> {

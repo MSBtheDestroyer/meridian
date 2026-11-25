@@ -190,8 +190,45 @@ API-key and supplied setup-token profiles report null timestamps/day count and
 false without consulting the host's stored login. Failed credential reads also
 return unavailable expiry facts and preserve the existing authentication
 provenance. A changed or missing current deadline replaces the displayed value.
-The login history fields come from `auth-lifecycle.json` in the config
-directory, which records each account's logins, refreshes and logouts.
+
+### Login history
+
+Claude Code wipes `.credentials.json` once a refresh is refused, and with it
+everything about the login. Meridian keeps its own record of each stored
+credential in `auth-lifecycle.json` beside `settings.json`: when the login
+happened, when Meridian last renewed it, and when the account was first found
+logged out and why. It never holds a token. Every transition is logged
+(`[PROXY] Profile "work" logged out: ...`, naming the deadline and how long
+the login lasted) and kept in the diagnostics log under `auth`.
+
+`GET /profiles/list` adds five fields to every profile, `null` when nothing is
+on record or the profile has no stored login:
+
+| Field | Meaning |
+| --- | --- |
+| `authObtainedAt` | When the current login happened (epoch ms); `null` when a replaced credential cannot be dated |
+| `authObtainedVia` | `login` when Meridian performed it, `observed` when a new login was found on disk (then `authObtainedAt` is when Meridian noticed it) |
+| `lastRefreshAt` | Meridian's last renewal of this login; a renewal by a Claude Code process is not seen |
+| `firstUnauthedAt` | When authentication was first found failing; cleared by a new login or a renewal that works |
+| `unauthedReason` | `refresh_rejected` (Anthropic answered `invalid_grant` for the stored refresh token) or `credentials_cleared` (the stored credential has no access token) |
+
+A refused renewal is not yet a logout: the account keeps serving until its
+access token expires, so `loggedIn` stays as `claude auth status` reports it
+and the card shows **Renewal refused, stops in …**. After that expiry, or once
+the credential is cleared, `loggedIn` is `false` and the card shows
+**Logged out … ago** with the reason on hover. Cards also show **Logged in …
+ago**, saying on hover whether Meridian performed the login or found it.
+
+Other OAuth errors, outages and stores that cannot be read record nothing. A
+different refresh token with a different deadline is a new login; one that
+cannot be told apart from a rotation of the old login is recorded without a
+login time instead of a wrong one.
+
+The history is best-effort. Renewals and `/profiles/list` write it in the
+background and never wait for it, so a problem with `auth-lifecycle.json`
+(such as a lock file left by a crashed process) only drops history entries; it
+never slows a request. Removing a profile deletes the history of the
+credentials it removes, and renaming one carries the history to the new name.
 
 ### Duplicate profiles
 
@@ -220,7 +257,9 @@ An instance serving [ChatGPT subscriptions](configuration.md#chatgpt-subscriptio
 
 A ChatGPT seat reports the same fields. OpenAI states no login deadline, so `refreshTokenExpiresAt` and `daysUntilRenewal` are null and `renewalRequiredSoon` is false. Where Meridian recorded no login for a seat, `authObtainedAt` is the OpenAI sign-in its access token states (`authObtainedVia: "token"`). Refreshing keeps that time, and it can predate the seat's own authorization when that reused a browser that was already signed in.
 
-Meridian renews each seat in its own store on the eighth day of its ten-day access token, whether or not work is sent to it, one seat per minute at most (`[chatgpt] renewing account … ahead of expiry`). A request renews only the seat it is routed to, so without this a seat no work goes to runs out and cannot serve though nothing refused it. A failed exchange leaves its seat needing a sign-in, so after OpenAI fails one, renewing ahead of expiry pauses for six hours. While a renewal is out, the seat is listed as it was before it: it reads as needing a sign-in only once the exchange fails, or when a stamp is left by one that never finished. An instance with `MERIDIAN_CREDENTIALS_READONLY=1` cannot see another instance's exchanges, so it can take up to about 20 seconds to show a failed renewal.
+Meridian renews each seat in its own store on the eighth day of its ten-day access token, whether or not work is sent to it, one seat per minute at most (`[chatgpt] renewing account … ahead of expiry`). A request renews only the seat it is routed to, so without this a seat no work goes to runs out and cannot serve though nothing refused it. A failed exchange leaves its seat needing a sign-in, so after OpenAI fails one, renewing ahead of expiry pauses for six hours. While a renewal is out, the seat is listed as it was before it: it reads as needing a sign-in only once the exchange fails, or when a stamp is left by one that never finished.
+
+chatgpt.com sometimes refuses a seat's access token while its refresh token is still good. Meridian then renews the seat on its own within a minute (`[chatgpt] renewing account …: chatgpt.com refused its access token`), and the card shows "Next renewal" instead of asking for a sign-in. When the renewed token is refused too, it renews again 5 minutes later, then 30 minutes, 2 hours, and every 6 hours after that. A read that chatgpt.com accepts in between does not restart that schedule; only six hours without a refusal does. A day after the first refusal Meridian stops renewing (`[chatgpt] chatgpt.com kept refusing account …`) and the seat needs a sign-in, since a refusal a fresh token does not fix, such as a deactivated workspace, needs attention. The seat also needs a sign-in once OpenAI refuses the refresh itself, or a renewal's result cannot be established; a refresh token that may already have been spent is never sent again. `GET /profiles/list` reports the next attempt as `renewalRetryAt`. An instance with `MERIDIAN_CREDENTIALS_READONLY=1` cannot see another instance's exchanges, so it can take up to about 20 seconds to show a failed renewal.
 
 chatgpt.com sometimes refuses a seat's access token while its refresh token is still good. Meridian then renews the seat on its own within a minute (`[chatgpt] renewing account …: chatgpt.com refused its access token`), and the card shows "Next renewal" instead of asking for a sign-in. When the renewed token is refused too, it renews again 5 minutes later, then 30 minutes, 2 hours, and every 6 hours after that, for as long as OpenAI accepts the refresh token. The seat needs a sign-in only once OpenAI refuses the refresh itself, or a renewal's result cannot be established; a refresh token that may already have been spent is never sent again. `GET /profiles/list` reports the next attempt as `renewalRetryAt`.
 
@@ -229,6 +268,10 @@ When OpenAI refuses a renewal, the log line, the logged-out event and the `cause
 A seat can be given its own renewal interval in hours, from 1 to 240, with `PATCH /settings/api/chatgpt` and `{"seatRenewalHours": {"<profile>": 24}}`; `null` removes it. That seat is then renewed that long after its access token was issued, and never later than a request would renew it. `GET /settings/api/chatgpt` lists each seat's `renewalHours`, and the log line names the interval. It exists to measure whether renewing more often changes how long a sign-in lasts; every other seat keeps the default.
 
 Each seat's record in `auth-lifecycle.json` keeps its latest 64 renewals under `renewals`, apart from its login events: when, the outcome (`rotated`, `kept`, `refused` or `unverified`), the cause of a refusal, and the new access token's issue and expiry times.
+
+A seat in Meridian's own store can be given its own renewal interval in hours, from 6 to 240: **Renew every** on its card, or `PATCH /settings/api/chatgpt` with `{"seatRenewalHours": {"<profile>": 24}}`, where `null` removes it. That seat is then renewed that long after its access token was issued, never later than a request would renew it; a token that does not say when it was issued is still left to the request path. The renewal pass reads the intervals every minute, so a change applies without a restart, and removing the seat drops its interval. Every other seat keeps the eighth day. `GET /settings/api/chatgpt` lists each seat's `renewalHours`, and the renewal log line names the interval. It exists to measure whether renewing more often changes how long a sign-in lasts. The six-hour minimum is there because each renewal spends the seat's refresh token, and a renewal that auth.openai.com throttles or fails logs the seat out; a saved interval below it is ignored. An instance with `MERIDIAN_CREDENTIALS_READONLY=1` never renews, interval or not.
+
+Each such seat keeps its latest 64 renewals with its record in the store, and `/profiles/list` lists them under `renewals`, oldest first, beside `renewalHours` (`null` for the default): when, the `outcome` (`rotated` or `kept`, whether OpenAI issued a new refresh token; `refused`; or `unverified`, a failure on OpenAI's side), the `cause` of a refusal or failure, and the new access token's `issuedAt` and `expiresAt`. An attempt that never reached OpenAI, such as one after an interrupted exchange, records nothing. The card shows the interval under **Renewal** and the latest entry under **Last renewal**, with the ones before it in its tooltip. A seat whose login another tool owns has `renewalHours: null` and `renewals: []`.
 
 ### Switching profiles
 
@@ -286,15 +329,16 @@ MERIDIAN_ROUTING=priority MERIDIAN_PROFILE_ORDER=work,personal meridian
 # failback behavior. MERIDIAN_PRIORITY_FAILBACK overrides the settings value.
 ```
 
-- **Conversations keep their account** while it's healthy — a session never flips accounts just because the pool preference changed (protects per-account prompt caches). A session on an exhausted account fails over and then stays on its new account. A conversation is identified by its session header when the client sends one, and otherwise by a fingerprint of its opening message and project directory — so keyless clients get the same affinity.
+- **Conversations keep their account** while it's healthy — a session never flips accounts just because the pool preference changed (protects per-account prompt caches). A session on an exhausted account fails over and then stays on its new account. A conversation is identified by its session header when the client sends one, and otherwise by a fingerprint of its opening message and project directory — so keyless clients get the same affinity. A conversation with a session header also keeps its account across a Meridian restart: Meridian resumes it on the account that served it last.
 - **Failback policy**: `new-conversation` is the default and current behavior. When the preferred account recovers, new conversations use it while existing conversations stay on their fallback. With `next-user-turn`, Meridian switches an existing OpenCode or Pi conversation only on a fresh HMAC-attested, visible primary human turn, using a full-history fresh backing session on the preferred account. Hidden/title/summary/compaction, fork, subagent, keyless, malformed, replayed, and explicitly pinned requests cannot promote. Tool-loop continuations retain and atomically refresh the current route. If the preferred account refuses before content, the fallback session is retained. After assistant content, structured output, or a tool side effect, Meridian never replays the turn on another account. Pi needs the extension from `meridian setup --client pi`; other adapters retain `new-conversation` behavior.
 - **One-time setup for `next-user-turn`**: rerun `meridian setup` after upgrading. Setup creates `~/.config/meridian/opencode-turn.key` as a 32-byte key with mode `0600` and configures the matching V1 or V2 plugin; `meridian setup --client pi` uses the same key for the Pi extension. Missing or invalid keys fail closed: requests still work, but they cannot promote. If OpenCode or Pi and Meridian run in separate hosts or config homes, set the same 32-byte base64url `MERIDIAN_OPENCODE_ATTESTATION_KEY` in both environments instead of relying on the shared file. Attestations bind the immutable creation time of the client's user message and are accepted only for the short freshness window; an old A-B-A replay keeps A's old time even after a restart and cannot cross B's durable high-water mark.
 - **Exposed turns are replay-fenced durably.** Meridian records an exact attempt claim before SDK work starts and clears it only with terminal route/session finalization or a proven pre-exposure account failure. A crash, cancellation, assistant output, structured output, or tool execution leaves the claim fail-closed. Retrying the same, older, missing, or invalid attestation then returns `503` before any SDK call; only a strictly newer trusted human turn can supersede the uncertain attempt.
 - **Exhaustion is tracked in-memory.** A quota refusal uses that account's own reported reset time (conservative 10-minute default when unknown), refined shortly after by an authoritative check against the usage API that can extend — never shorten — the cooldown once that account's five-hour window is confirmed exhausted. A billing refusal has no reset to wait for, so it takes the conservative default unrefined — the account is simply re-probed later, since only a human can fix a subscription. The home page shows `#n in pool` and `exhausted · resets in …` badges per account.
 - **A quota refusal speaks for the whole account.** Profiles signed in to one Claude account share its quota, so a quota refusal on one also cools down every other profile signed in to that account at that moment, and the request moves on to a different account without trying them. Only the account and organization UUIDs read for the token each profile stores now count: a profile re-logged into another account is not affected, and the email and organization name that can raise a duplicate badge never steer routing. A billing refusal still benches only its own profile. A token renewal makes a profile's account record stale until the next read, and records are re-read when a Meridian page polls the profile list. With no page open, a twin whose token renewed is still tried once.
 - **A per-model weekly limit benches only that model.** When Anthropic says an account's weekly allowance for one model ran out (for example `seven_day_fable`), the pool skips that account only for requests of that model until that allowance resets; other models keep using it. Other profiles signed in to that account skip it for that model too. The account's `spent` entry on `/v1/usage/quota/all` then carries `modelFamily` (`"fable"` here); it is `null` whenever the refusal benched the whole account or nothing.
-- When **no** account can take a request, because every candidate refused or every one is held back by a reserve or by Extra Usage `never`, Meridian answers `429` with `Retry-After` (or, once a stream has started, one SSE error frame) of type `rate_limit_error` and `code: "no_routable_account"`. Its message reads `No routable Claude account: <why> (incident <id>)`, and it lists each account with its reason (`spent`, `model_benched`, `reserve_held`, `weekly_held`, `extra_usage_off`, `excluded`, `held`) and when it reopens (`resets_at`), plus the pool's soonest opening (`reset_at`). `GET /profiles/events` reports the same incident as `pool_exhausted` events and, once any account serves again, one `pool_recovered`. A pool that ran out only on billing refusals keeps the last-tried account's error and its own status, because waiting will not fix a subscription.
+- When **no** account can take a request, because every candidate refused or every one is held back by a reserve or by Extra Usage `never`, Meridian answers `429` with `Retry-After` (or, once a stream has started, one SSE error frame) of type `rate_limit_error` and `code: "no_routable_account"`. Its message reads `No routable Claude account: <why> (incident <id>)`, and it lists each account with its reason (`spent`, `model_benched`, `reserve_held`, `weekly_held`, `extra_usage_off`, `excluded`, `held`, `no_cvp`) and when it reopens (`resets_at`), plus the pool's soonest opening (`reset_at`). `GET /profiles/events` reports the same incident as `pool_exhausted` events and, once any account serves again, one `pool_recovered`. A pool that ran out only on billing refusals keeps the last-tried account's error and its own status, because waiting will not fix a subscription.
 - An explicit `x-meridian-profile` header always bypasses the pool (per-session pinning keeps working).
+- A request with `x-meridian-require: cvp` goes only to an account that holds Cyber Verification Program access on the requested model. It has its own order and active pointer, `cvpProfileOrder` (empty: the pool order) and `cvpActiveProfile`, and its own managed exclusions `cvpManagedExcludedProfiles` in place of `routingManagedExcludedProfiles`, all set through `PUT /settings/api/routing`; ordinary work never reads them. Meridian learns that access from refusals that report it and from claude.ai readings posted to `POST /profiles/<id>/cvp-access`; `/profiles/list` shows it per account as `cvpAccess`, and `GET /v1/models` with the same header lists only the models some reachable account holds it on. With no such account the answer is `no_routable_account` with reason `no_cvp`. A request that also pins `x-meridian-profile` goes to that account, and is refused unsent with `403` `profile_no_cvp` when the account's map shows the model without access; an account with no reading for the model is tried.
 - **Weekly reserve (opt-in).** Hold back part of an account's weekly allowance, for example for someone who uses that account directly outside Meridian. Once its weekly usage reaches 100% minus the reserve, the pool skips it until the weekly window resets:
 
   ```bash
@@ -316,6 +360,25 @@ A profile can be held out of rotation, for example to measure what one job spend
 - still serve every request pinned to them with `x-meridian-profile`.
 
 Unlike `routingExcludedProfiles`, which refuses pinned work and still allows warms, a hold refuses warms and still allows pinned work.
+
+`routingManagedExcludedProfiles` (a supervisor's list, written through the same endpoint) keeps a profile out of unpinned work and off the active pointer, but a request pinned to it with `x-meridian-profile` is served there. Only the user's own `routingExcludedProfiles` refuses a pin (`409` with `profile_excluded`). A supervisor may say why in `routingManagedReasons` (`{"loaner-bob": "loaner outside its harvest window"}`); Home and Profiles show that text when someone tries to activate the profile.
+
+### Forcing a forbidden profile
+
+Settings, Routing, **Allow forcing a forbidden profile** (off by default) lets you activate a Claude profile that a supervisor keeps out of work, through its managed exclusions, its held list or a usage reserve. The refusal dialog then offers **Activate anyway**. The profile stays active for up to five hours; meanwhile the supervisor's lists still name it but do not move work or the pointer off it. You can release it using the link on its card or the Release button beside the setting. Your own exclusion list and a missing login are never forced past. Turning the setting off ends a force in effect.
+
+A switch away from a forced profile is refused with `profile_forced`. The dialog offers **Release and switch** when it asks you only to release the current profile. If it also asks you to force the target profile, one button, **Release &lt;profile&gt; and activate anyway**, confirms both actions. If the blockers appear in separate dialogs, the page remembers what you already approved for that switch. Meridian releases only the forced profile shown in the dialog, and only if the switch succeeds.
+
+### Refreshing a profile
+
+The refresh icon on each card re-reads what Meridian knows about that profile right away, for example after a reset or a re-login made outside Meridian, and shows one line per part:
+
+- **Login:** asks Claude Code again whether the profile is signed in and which account it holds. If it now holds another account, what Meridian knew about the previous one is dropped first.
+- **Usage:** re-reads usage from Anthropic (or ChatGPT). Routing and reserves see the new figures at once, and refusals the new reading shows are over are cleared.
+- **Models:** re-lists the models the account may use.
+- **CVP:** Meridian cannot read Cyber Verification Program access itself; the line says how old the last claude.ai reading is.
+
+Each part is re-read at most once per profile per 30 seconds. `POST /profiles/<id>/refresh` does the same from a script; `POST /profiles/<id>/usage/refresh` re-reads usage alone.
 
 ### Profile commands
 

@@ -32,6 +32,7 @@ Code: `src/proxy/chatgpt/` (incl. `migrate/`), `src/proxy/codex/`,
   request. Bodies are adapted only where the Codex backend requires it; the
   response streams back byte for byte. A GPT model is never answered by Claude
   (`/v1/messages` returns 404 when ChatGPT is configured).
+- **Client attribution stays local.** Turn events retain the optional client and purpose for request telemetry, including retries and Images requests. Codex request headers are assembled separately and never contain a Meridian header.
 - **Exactly one program refreshes a seat.** ChatGPT refresh tokens are
   single-use: exchanging one invalidates every other copy and breaks the account
   (`refresh_token_reused`). Hence:
@@ -49,10 +50,19 @@ Code: `src/proxy/chatgpt/` (incl. `migrate/`), `src/proxy/codex/`,
     (`MERIDIAN_CREDENTIALS_READONLY`) treat a stamp younger than the exchange
     timeout plus 5 s as in flight, so they may lag a lost sign-in by up to
     about 20 s, and a stamp dated in the future is not trusted (#1463).
+  - the renewal pass falls due 80% into a token's life, or at the seat's own
+    `seatRenewalHours` interval (6-240 hours) after the token's `iat`, never later than a
+    request would renew it; a token without `iat` is left to the request path.
+    Each exchange the provider saw is recorded on the seat's own store record
+    (`renewals`, newest 64), in the commit of its tokens or beside the stamp a
+    failure leaves; an attempt that never reached the provider records
+    nothing. The history is never a credential, so a malformed entry is
+    dropped on read rather than failing the store. Owner approval pending.
 - Seats are profiles with `type: "chatgpt"` and their own active pointer; they
   never live in Claude's profile config. All additions are absent unless
   ChatGPT is enabled, and existing fields keep their meaning
   ([`api-contract`](../../../.agents/references/api-contract.md)).
+- Direct Responses requests can opt in to [pre-dispatch route refusal evidence](../profiles-routing.spec.md#cross-provider-evidence). The ChatGPT backend waits until ordinary seat policy has yielded no dispatch; the provider-specific HTTP proof excludes proxy fallback and billing policies, sits outside streaming, and never authenticates an upstream error body as Meridian-local evidence.
 - `chatgpt/migrate/` and `instanceImport/` are CLI-only — **the server never
   imports them**.
 - Reuses only `session` durability primitives (durable file writes, process

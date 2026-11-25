@@ -60,6 +60,16 @@ Code: `src/proxy/session/`, plus `sessionStore.ts`, `sessionLifecycle.ts` and
   child is joined; collectors in other processes ignore that private pin, but
   the published mapping retains the source, and if another process retires it
   anyway the beat only fails and is retried or stopped.
+- An auxiliary fork (an adapter's `forksAuxiliaryRequests` side call that
+  `auxiliaryLineage` accepts: user text after a completed turn) also only
+  **reads** the mapping. It resumes the mapping's current transcript into a
+  managed fork target, holds no turn lease, takes the writer lease on its
+  target alone (the conversation's own turn may hold the source's), neither
+  attaches nor re-registers the source, writes no mapping, and abandons the
+  target when it ends. Like a beat, its source is pinned only against this
+  process's GC; a source retired meanwhile is refused by the SDK and the side
+  call replays fresh without evicting anything. A legacy mapping without a
+  transcript locator, or any other shape, is answered from a fresh replay.
 - Transcript GC here is the only Meridian-owned transcript deletion. Opt-in
   transcript retention (`proxy/transcriptRetention.ts`, off by default) hands
   Claude Code's own cleanup a period; that cleanup is outside this module's
@@ -310,9 +320,12 @@ next request replays, as main's fresh replay of that turn would have.
 - **Mixed proxy versions replay.** v1 lineage digests cannot prove a v2 prefix,
   so alternating old and new proxies repeats a full-history replay until every
   participating proxy is upgraded.
-- **Editing a primary agent's instructions without switching agents** stays
-  subject to the native resume limitation (the SDK restores its original system
-  prompt).
+- **Edited instructions reach a resumed conversation as a reminder, not as a
+  new system prompt.** The SDK restores the system prompt it recorded; Meridian
+  delivers changed OpenCode instruction files in the next turn's input
+  (`instructionSections`, see `ARCHITECTURE.md`). Other clients' prompt edits,
+  and prompt text outside instruction files, still need a reset
+  (`x-meridian-system-prompt-reset`) to take effect.
 - **A conversation returning to a pruned profile copy replays** instead of
   resuming (only with `MERIDIAN_SESSION_PROFILE_COPY_PRUNE=1`).
 - **Windows writer-lease recovery** for a crashed proxy waits for a host reboot,

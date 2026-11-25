@@ -24,11 +24,16 @@
  * The stamp is cleared only by the commit that records a result, or when the
  * provider states it declined to process the grant at all. That asymmetry is
  * deliberate: a 429 must not brand an account, and an unexplained silence must.
+ *
+ * Every exchange the provider saw also goes into the seat's renewal history
+ * (`ChatGptAccount.renewals`): a renewal in the same commit as its tokens, a
+ * refusal or an unverifiable result beside the stamp it leaves. An attempt
+ * that never reached the provider - an interrupted one, one without write
+ * authority - is not a renewal and records nothing.
  */
 
-import { noteRefreshRejected, noteRefreshSucceeded } from "../authLifecycle"
 import { decodeCodexToken } from "../codex/token"
-import { WriterLeaseRequiredError, type ChatGptCredentialStore } from "./credentials"
+import { WriterLeaseRequiredError, type ChatGptAccount, type ChatGptCredentialStore, type ChatGptRenewal } from "./credentials"
 import { WriterLeaseLostError } from "./lease"
 
 /** A seat's record in authLifecycle.ts, kept apart from Claude's, which are keyed by credential path. */
@@ -41,6 +46,14 @@ export const CHATGPT_TOKEN_URL = "https://auth.openai.com/oauth/token"
 export const CHATGPT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 /** An exchange that has not answered by now is abandoned, so a stamp older than this belongs to no exchange still out. */
 export const EXCHANGE_TIMEOUT_MS = 15_000
+
+/** Renewals kept per seat: two months of renewing daily. */
+export const MAX_SEAT_RENEWALS = 64
+
+/** The seat's history with one more renewal, trimmed to the newest `MAX_SEAT_RENEWALS`. */
+function withRenewal(account: ChatGptAccount, renewal: ChatGptRenewal): ChatGptAccount {
+  return { ...account, renewals: [...(account.renewals ?? []), renewal].slice(-MAX_SEAT_RENEWALS) }
+}
 
 export type RequiresReauthReason =
   /** The provider processed the grant and refused it. */
@@ -166,11 +179,24 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
     // reason is this module's own vocabulary, never the provider's wording.
     const detail = cause ? `${reason}: ${cause}` : reason
     console.error(`[chatgpt] account ${accountUserId} needs an interactive login (${detail})`)
-    // An interrupted exchange is one this attempt never sent, so it is no
-    // renewal: the history holds only what the provider saw.
-    const renewal = reason === "interrupted" ? undefined : { outcome: reason === "rejected" ? "refused" as const : "unverified" as const, detail }
-    noteRefreshRejected(chatGptAuthLifecycleKey(accountUserId), { at: now(), detail, ...(renewal ? { renewal } : {}) })
+    if (reason !== "interrupted") {
+      recordRenewal(accountUserId, { at: now(), outcome: reason === "rejected" ? "refused" : "unverified", ...(cause ? { cause } : {}) })
+    }
     return { status: "requires-reauth", accountUserId, reason, ...(cause ? { cause } : {}) }
+  }
+
+  // Kept beside the stamp the failed exchange leaves, which this commit
+  // carries over unchanged. The history is a record, not a credential, so
+  // failing to write it costs the entry and nothing else.
+  const recordRenewal = (accountUserId: string, renewal: ChatGptRenewal): void => {
+    try {
+      store.commitAccount(accountUserId, current => {
+        if (!current) throw new Error(`[chatgpt] account ${accountUserId} disappeared mid-exchange`)
+        return withRenewal(current, renewal)
+      })
+    } catch (error) {
+      console.error(`[chatgpt] recording account ${accountUserId}'s renewal failed: ${(error as Error).message}`)
+    }
   }
 
   const stampExchange = (accountUserId: string, startedAt: number | null): boolean => {
@@ -242,8 +268,14 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
         superseded = true
         return current
       }
+      const issuedAt = decodeCodexToken(accessToken)?.issuedAt ?? null
       return {
-        ...current,
+        ...withRenewal(current, {
+          at: now(),
+          outcome: parsed.refreshToken ? "rotated" : "kept",
+          ...(issuedAt !== null ? { issuedAt } : {}),
+          expiresAt,
+        }),
         refreshToken: parsed.refreshToken ?? current.refreshToken,
         accessToken,
         expiresAt,
@@ -260,11 +292,6 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
     // One line per renewal, so the operator can see a refresh happen. The
     // seat id is an identity, not a credential.
     console.log(`[chatgpt] account ${accountUserId} refreshed${parsed.refreshToken ? " (refresh token rotated)" : ""}; access token valid until ${new Date(expiresAt).toISOString()}`)
-    const issuedAt = decodeCodexToken(accessToken)?.issuedAt ?? null
-    noteRefreshSucceeded(chatGptAuthLifecycleKey(accountUserId), {
-      at: now(),
-      renewal: { outcome: parsed.refreshToken ? "rotated" : "kept", expiresAt, ...(issuedAt !== null ? { issuedAt } : {}) },
-    })
     return { status: "refreshed", accountUserId, accessToken, expiresAt }
   }
 

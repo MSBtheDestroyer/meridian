@@ -1,18 +1,18 @@
 #!/usr/bin/env node
 // Deterministic official-CLI protocol fixture. Never contacts a model service.
 const { spawnSync } = require('node:child_process')
-const { readFileSync } = require('node:fs')
+const { appendFileSync, readFileSync } = require('node:fs')
 const args = process.argv.slice(2)
 const emit = value => process.stdout.write(JSON.stringify(value) + '\n')
 const nativePrompts = []
 async function main(inputPrompt) {
-  if (args[0] === '--version') return console.log(process.env.AGY_FIXTURE_VERSION || '1.2.7')
+  if (args[0] === '--version') return console.log(process.env.AGY_FIXTURE_VERSION || '1.5.13')
   if (args[0] === 'models') return console.log('fixture-model\tFixture Model\nfixture-model-high\tFixture High\ngemini-fixture-low\tGemini Low\ngemini-fixture-medium\tGemini Medium\ngemini-fixture-high\tGemini High')
   let prompt = args[args.indexOf('-p') + 1]
   if (inputPrompt !== undefined) prompt = inputPrompt
   nativePrompts.push(prompt)
   if (prompt === '/config' && process.env.AGY_FIXTURE_CONFIG_EXIT) return process.exit(2)
-  if (prompt === '/config') return emit({ command: { data: { config: { customModelsConfig: process.env.AGY_FIXTURE_CUSTOM ? { fixture: {} } : {}, modelProvider: process.env.AGY_FIXTURE_API ? 'gemini' : '', useG1Credits: false } } } })
+  if (prompt === '/config') return emit({ conversation_id: '', status: 'SUCCESS', duration_seconds: 0, num_turns: 0, response: 'customModelsConfig\t' + (process.env.AGY_FIXTURE_CUSTOM ? '{"fixture":{}}' : '') + '\nmodelProvider\t' + (process.env.AGY_FIXTURE_API ? 'gemini' : '') + '\nuseG1Credits\tfalse' })
   if (prompt === '/usage') return emit({command:{data:{groups:[{name:'Gemini Models',buckets:[{id:'gemini-5h',window:'5h',remaining_fraction:0.75,reset_time:'2099-01-01T00:00:00Z'}]}]}}})
   if (prompt.includes('POLICY_PROBE')) {
     const check = (input, decision) => {
@@ -50,6 +50,52 @@ async function main(inputPrompt) {
     return value.result
   }
   const { tools } = await rpc('tools/list')
+  if (prompt.includes('CLIENT_LEDGER_BOUNDARY')) {
+    for (let at = 0; at < 2; at++) {
+      try {
+        await rpc('tools/call', { name: tools[0].name, arguments: { key: at } })
+        throw new Error('Invalid tool unexpectedly succeeded')
+      } catch (error) {
+        if (!String(error.message).includes('Invalid arguments for lookup')) throw error
+      }
+    }
+    const batch = tools.find(tool => tool.name === 'meridian_parallel')
+    try {
+      await rpc('tools/call', { name: batch.name, arguments: { calls: [{ name: 'lookup', arguments: { key: 'a' } }, { name: 'lookup', arguments: { key: 'b' } }] } })
+      throw new Error('Full replay ledger admitted another batch')
+    } catch (error) {
+      if (!String(error.message).includes('exceeded 2 tool calls')) throw error
+    }
+    emit({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: 'LEDGER_BOUNDARY_PRESERVED' } })
+    return emit({ event: 'result', result: { status: 'SUCCESS' } })
+  }
+  const longLoop = prompt.match(/CLIENT_TOOL_LOOP_(\d+)/)
+  if (longLoop) {
+    try {
+      for (let at = 0; at < Number(longLoop[1]); at++) {
+        const params = { name: tools[0].name, arguments: { key: String(at) } }
+        const first = await rpc('tools/call', params)
+        const repeated = await rpc('tools/call', params, nextId)
+        if (JSON.stringify(first) !== JSON.stringify(repeated)) throw new Error('Duplicate MCP result changed')
+      }
+    } catch (error) { console.error(error.message); return process.exit(1) }
+    emit({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: 'LONG_LOOP_COMPLETE' } })
+    return emit({ event: 'result', result: { status: 'SUCCESS' } })
+  }
+  const longBatchLoop = prompt.match(/CLIENT_BATCH_LOOP_(\d+)/)
+  if (longBatchLoop) {
+    const batch = tools.find(tool => tool.name === 'meridian_parallel')
+    try {
+      for (let at = 0; at < Number(longBatchLoop[1]); at += 16) {
+        const params = { name: batch.name, arguments: { calls: Array.from({ length: Math.min(16, Number(longBatchLoop[1]) - at) }, (_, index) => ({ name: 'lookup', arguments: { key: String(at + index) } })) } }
+        const first = await rpc('tools/call', params)
+        const repeated = await rpc('tools/call', params, nextId)
+        if (JSON.stringify(first) !== JSON.stringify(repeated)) throw new Error('Duplicate batch result changed')
+      }
+    } catch (error) { console.error(error.message); return process.exit(1) }
+    emit({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: 'LONG_LOOP_COMPLETE' } })
+    return emit({ event: 'result', result: { status: 'SUCCESS' } })
+  }
   if (prompt.includes('UNICODE_CHUNKS')) {
     const { request } = require('node:http')
     const input = { key: 'café/你好/🧪.txt' }
@@ -126,8 +172,20 @@ async function main(inputPrompt) {
   if (prompt.includes('LINGER')) setInterval(() => {}, 1000)
 }
 async function run() {
-  if (!args.includes('--input-format')) return main()
+  const egress = JSON.parse(process.env.AGY_FIXTURE_EGRESS_CAPTURE || 'null')
+  const capture = stdin => {
+    if (!egress) return
+    const envKeys = Object.entries(process.env).filter(([key, value]) => key !== 'AGY_FIXTURE_EGRESS_CAPTURE' && (
+      /^x[-_]meridian[-_]/i.test(key) || egress.markers.some(marker => value.includes(marker))
+    )).map(([key]) => key)
+    const mcp = stdin === undefined ? undefined : readFileSync('.agents/mcp_config.json', 'utf8')
+    appendFileSync(egress.path, JSON.stringify({ args, stdin, envKeys, mcp }) + '\n')
+  }
+  if (!args.includes('--input-format')) { capture(); return main() }
   const lines = require('node:readline').createInterface({ input: process.stdin })
-  for await (const line of lines) await main(JSON.parse(line).message.content)
+  for await (const line of lines) {
+    capture(line)
+    await main(JSON.parse(line).message.content)
+  }
 }
 run().catch(error => { console.error(error); process.exitCode = 1 })

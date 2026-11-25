@@ -160,6 +160,39 @@ describe("a seat's own renewal interval", () => {
     expect(await source.renewDue!()).toEqual(nothing)
     expect(onDisk("control")).toMatchObject({ refreshToken: "refresh-control" })
   })
+
+  it("is never renewed by a read-only instance, however long past it is", async () => {
+    await seed([account("daily", NOW - 3 * DAY)])
+    let asked = 0
+    const source = createOwnedCredentialSource({
+      storePath, now: () => clock, readOnly: true,
+      renewalIntervals: () => ({ daily: HOUR }),
+      fetchImpl: async () => { asked++; return renewed("refresh-daily") },
+    })!
+    held.push(source)
+    await source.acquire()
+    expect(await source.renewDue!()).toEqual(nothing)
+    expect(asked).toBe(0)
+    expect(onDisk("daily")).toMatchObject({ refreshToken: "refresh-daily" })
+  })
+})
+
+describe("a seat's renewal history", () => {
+  it("is listed with the seat, kept when the seat signs in again, and read by a read-only instance", async () => {
+    await seed([account("daily", NOW - 25 * HOUR)])
+    const { source } = owned(renewed, () => ({ daily: DAY }))
+    await source.acquire()
+    await source.renewDue!()
+    const renewal = { at: NOW, outcome: "rotated" as const, issuedAt: NOW, expiresAt: NOW + 10 * DAY }
+    expect(source.seats().find(seat => seat.id === "daily")?.renewals).toEqual([renewal])
+
+    source.connectAccount!({ accountUserId: "daily", accountId: "workspace-daily", email: null, refreshToken: "signed-in", accessToken: token(NOW, NOW + 10 * DAY), expiresAt: NOW + 10 * DAY })
+    expect(onDisk("daily")).toMatchObject({ refreshToken: "signed-in", renewals: [renewal] })
+
+    const reader = createOwnedCredentialSource({ storePath, now: () => clock, readOnly: true })!
+    held.push(reader)
+    expect(reader.seats()[0]?.renewals).toEqual([renewal])
+  })
 })
 
 describe("renewing owned seats ahead of expiry", () => {
@@ -381,6 +414,66 @@ describe("a seat whose access token chatgpt.com refused", () => {
     expect(retryAt(source, "refused")).toBeUndefined()
     expect(await source.renewDue!()).toEqual(nothing)
     expect(sent).toHaveLength(1)
+  })
+
+  // A usage read can accept the token that requests are refused with. Each
+  // accepted read reset the backoff, so the next refused request renewed the
+  // seat again: 60 exchanges an hour instead of 3.
+  it("keeps backing off while requests keep refusing renewed tokens and usage reads accept them", async () => {
+    await seed([account("refused", NOW - DAY)])
+    const { source, sent } = owned()
+    await source.acquire()
+    for (let minute = 0; minute < 60; minute++) {
+      clock = NOW + minute * MINUTE
+      source.accessRefused!("refused", clock)
+      source.accessAccepted!("refused", clock + 30_000)
+      source.accessRefused!("refused", clock + 45_000)
+      clock += 50_000
+      await source.renewDue!()
+    }
+    // At once, +5 minutes, +30 minutes after that.
+    expect(sent).toHaveLength(3)
+  })
+
+  it("stops renewing a day after the first refusal and leaves the seat needing a sign-in", async () => {
+    await seed([account("refused", NOW - DAY)])
+    const { source, sent } = owned()
+    await source.acquire()
+    source.accessRefused!("refused", NOW)
+    await source.renewDue!()
+    for (let minute = 1; minute <= 30 * 60; minute++) {
+      clock = NOW + minute * MINUTE
+      source.accessRefused!("refused", clock)
+      await source.renewDue!()
+    }
+    // At once, then +5m, +30m, +2h, +6h, +6h, +6h: the next would fall past 24 hours.
+    expect(sent).toHaveLength(7)
+    expect(retryAt(source, "refused")).toBeUndefined()
+
+    // A sign-in brings a new token, and a refusal of it is renewed again.
+    clock += MINUTE
+    const signedIn = account("refused", clock)
+    source.connectAccount!({ ...signedIn, accessToken: signedIn.accessToken! })
+    clock += MINUTE
+    source.accessRefused!("refused", clock)
+    expect(retryAt(source, "refused")).toBe(clock)
+  })
+
+  it("starts over once a seat has gone six hours without a refusal", async () => {
+    await seed([account("refused", NOW - DAY)])
+    const { source, sent } = owned()
+    await source.acquire()
+    source.accessRefused!("refused", NOW)
+    await source.renewDue!()
+    clock = NOW + MINUTE
+    source.accessRefused!("refused", clock)
+    source.accessAccepted!("refused", clock + MINUTE)
+
+    clock = NOW + 6 * HOUR + MINUTE
+    source.accessRefused!("refused", clock)
+    expect(retryAt(source, "refused")).toBe(clock)
+    expect((await source.renewDue!()).outcome).toMatchObject({ status: "refreshed" })
+    expect(sent).toHaveLength(2)
   })
 
   const endings: Array<[string, (status: number) => Response]> = [

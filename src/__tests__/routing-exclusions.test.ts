@@ -64,6 +64,41 @@ describe("routing exclusions", () => {
     expect(access).toEqual({ kind: "no_eligible_profiles" })
   })
 
+  it("serves work pinned to a profile only the managed list excludes", () => {
+    const access = resolveRoutingAccess({
+      purpose: "work",
+      availableProfileIds: ["work", "personal"],
+      excludedProfileIds: [],
+      managedExcludedProfileIds: ["work", "personal"],
+      explicitProfileId: "work",
+    })
+
+    expect(access).toEqual({ kind: "allowed", eligibleProfileIds: ["work"] })
+  })
+
+  it("keeps managed exclusions out of unpinned work", () => {
+    const access = resolveRoutingAccess({
+      purpose: "work",
+      availableProfileIds: ["work", "personal"],
+      excludedProfileIds: [],
+      managedExcludedProfileIds: ["work"],
+    })
+
+    expect(access).toEqual({ kind: "allowed", eligibleProfileIds: ["personal"] })
+  })
+
+  it("refuses a pin the user's own list excludes even when the managed list names it too", () => {
+    const access = resolveRoutingAccess({
+      purpose: "work",
+      availableProfileIds: ["work", "personal"],
+      excludedProfileIds: ["work"],
+      managedExcludedProfileIds: ["work"],
+      explicitProfileId: "work",
+    })
+
+    expect(access).toEqual({ kind: "explicit_excluded", profileId: "work" })
+  })
+
   it("allows the fixed warm purpose to target an excluded profile", () => {
     // Given / When
     const access = resolveRoutingAccess({

@@ -237,8 +237,11 @@ function applyProfileRenameLocked(from: string, to: string, options: ApplyProfil
   // matches ids exactly, drops what it cannot match, then appends the
   // unmatched profiles at the END. A renamed profile that was first silently
   // becomes last - a demotion nobody asked for and nothing reports.
-  const order = getSetting("profileOrder")
-  if (order?.includes(from)) setSetting("profileOrder", order.map(id => (id === from ? to : id)))
+  for (const key of ["profileOrder", "cvpProfileOrder"] as const) {
+    const order = getSetting(key)
+    if (order?.includes(from)) setSetting(key, order.map(id => (id === from ? to : id)))
+  }
+  if (getSetting("cvpActiveProfile") === from) setSetting("cvpActiveProfile", to)
 
   return { ok: true, from, to, aliases: plan.aliases, profiles: plan.profiles }
 }

@@ -44,6 +44,8 @@ The server and the default Claude request path:
   `buildInfo`, `retryAfter`, `toolInputJson` are additionally pure.
 - `query.ts` builds SDK options **through the adapter interface**, never from
   tool constants directly.
+- Meridian attribution headers stay local, including on translated and tool-passthrough requests. Before SDK dispatch, `claudeEgress.ts` removes case-insensitive `x-meridian-*` entries from the effective subprocess `ANTHROPIC_CUSTOM_HEADERS` (one `name: value` per line), preserving unrelated configured headers and profile env.
+- Claude Design builds outbound MCP requests from an explicit protocol and upstream-auth header allowlist; it never forwards client-supplied `x-meridian-*` headers.
 - No `as any`, `@ts-ignore`, `@ts-expect-error` or empty catch blocks.
 
 The full file-level rules, throttling and cancellation contracts are in
@@ -164,8 +166,10 @@ Contract*, *Cancellation Contract*; public routes and headers are in
     session store maps or a request has pinned in that root, and that the
     cleanup could reach, gets a current mtime, its sidecar directory included
     (`transcriptSweep.ts` → `protectPinnedTranscripts`). Files are found by
-    session id under `projects/`. If that fails the request child runs
-    without a period, so the cleanup never runs unprotected. Cost: one walk of
+    session id under `projects/`; roots are compared after resolving
+    symlinks. If any pinned file cannot be read or touched (other than being
+    gone), the request child runs without a period and the idle sweep skips
+    the root, so the cleanup never runs unprotected. Cost: one walk of
     `projects/` per root per day, at most once an hour.
   - *Idle sweep* (`transcriptSweep.ts`, only where retention is on). The
     cleanup runs only inside a CLI process, so a root that serves no requests,
@@ -187,6 +191,8 @@ Contract*, *Cancellation Contract*; public routes and headers are in
     - every outbound connection goes to a loopback proxy that refuses it, a
       login due for refresh within 30 minutes is skipped, and
       `MERIDIAN_CREDENTIALS_READONLY` starts nothing;
+    - an instance under `MERIDIAN_FOLLOW_ACTIVE` sweeps nothing: it shares
+      the followed instance's directories, whose pins live in that store;
     - the stored login is compared before and after; a login that is usable
       and expires no earlier afterwards was renewed elsewhere (the child has
       no network) and is logged, any other change stops the sweep until
@@ -221,8 +227,8 @@ Contract*, *Cancellation Contract*; public routes and headers are in
   - *55 minutes, 3 beats.* One beat 55 minutes after the latest real turn
     started, and 55 minutes after each reached beat: five minutes of margin
     under the hour for tick jitter (10 s), the 15 s settle after a new
-    mapping, a retry, and SDK start-up. At most three per idle period (≈3 h)
-    bounds the cost of a session that never comes back. A real turn ends the
+    mapping, a retry, and SDK start-up. At most three per idle period (≈3 h;
+    `MERIDIAN_CACHE_KEEPALIVE_MAX_BEATS` changes it) bounds the cost of a session that never comes back. A real turn ends the
     period (and no beat runs while one is running); auxiliary/independent
     requests never touch the schedule.
   - *Main conversations only.* Subagent and one-shot requests (OpenCode's
@@ -236,6 +242,15 @@ Contract*, *Cancellation Contract*; public routes and headers are in
     rewrote 86,385 tokens; with it, one beat at 55.3 min read 90,018 and the
     next turn read 90,018 and wrote 340, about 89% cheaper in input-token
     equivalents net of the beat.
+  - *Client mode* (deploy-only). `MERIDIAN_CACHE_KEEPALIVE=client` tracks the
+    same sessions but starts no beat on its own; `POST
+    /v1/sessions/:key/cache-beat` runs one now and answers with its outcome.
+    Only the operator chooses this mode; otherwise the endpoint answers
+    `disabled`. A client that knows whether its user is coming back picks the
+    time, within the same per-period cap (`MERIDIAN_CACHE_KEEPALIVE_MAX_BEATS`,
+    default 3) and no sooner than 20 minutes after the latest turn or beat;
+    eligibility, the account rules, the in-flight cap and "never refresh an
+    expired prefix" still apply. The key must match the session key exactly.
   - *Never on someone's money or an exhausted window.* No beat on API-key or
     token profiles, while any live window reports `isUsingOverage`, a
     rejected or fully used window, priority cooldown, a spent refusal, or a
@@ -301,6 +316,11 @@ response response.created → response.in_progress → output_item.added →
 - **Implicit SDK attachments** in passthrough are suppressed by default
   (`CLAUDE_CODE_DISABLE_ATTACHMENTS=1`), which also bypasses the CLI's
   kept-deferred-tools optimization.
+- **No proxy-side compaction in passthrough:** the CLI's auto-compaction is
+  off (`DISABLE_AUTO_COMPACT=1`) because the client owns the history. A turn
+  over the context window fails with the canonical prompt-too-long error
+  (400 `invalid_request_error`), which the client answers by compacting.
+  Inherited env or profile `envOverrides` may set another value.
 - **Passthrough turns default to `maxTurns=1`** to stop at the tool boundary;
   the client must send another request after executing tools.
 

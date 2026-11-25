@@ -7,6 +7,7 @@
 
 import { createHash } from "crypto"
 import { HASH_IGNORED_BLOCK_TYPES, normalizeContent } from "../messages"
+import type { InstructionSectionState } from "./instructionSections"
 
 // --- Types ---
 
@@ -49,6 +50,8 @@ export interface SessionState {
   clientLineageHash?: string
   /** Adapter-owned proof of the stable context used to create this SDK session. */
   resumeContextHash?: string
+  /** Digests of the client instruction sections the SDK transcript's model has seen. */
+  instructionSections?: InstructionSectionState
   /** Per-message content hashes from the last stored request.
    *  Used for precise diff-based mutation classification when the aggregate
    *  lineageHash mismatches. */
@@ -525,6 +528,54 @@ export function independentRequestCause(input: {
   if (input.clientDrivenLoop) return "headerless-tool-result"
   if (!input.hasDurableKey) return "no-cache-identity"
   return undefined
+}
+
+/** Why an auxiliary request was answered from a fresh replay instead of a fork. */
+export type AuxiliaryForkRefusal =
+  /** The conversation's lineage for the body was not a plain continuation:
+   *  `lineage-<type>`, or `lineage-diverged:<reason>`. */
+  | `lineage-${string}`
+  | "regrouped"
+  | "partial-message"
+  /** The stored session waits for tool results. */
+  | "pending-tool"
+  /** After the session's last reply the request carries more than user text
+   *  and system notes: a reply snapshot, a tool call or a tool result. */
+  | "not-side-prompt"
+
+/**
+ * The lineage an auxiliary request is served from, given the conversation's
+ * own lineage for its body.
+ *
+ * A side call that only adds user text after a completed turn of the
+ * conversation is resumed as an unpublished fork of the conversation's SDK
+ * session: it reads the conversation's prompt cache and writes only its own
+ * prompt. After the stored prefix the client's copy of the session's last
+ * reply comes first, as on every continuation; it must not call a tool. The
+ * side prompt may carry mid-conversation `system` notes, as the conversation's
+ * own turns do. Any other shape is answered from a fresh replay, as every
+ * auxiliary request was before, and `refusal` says why. Either way the request
+ * never publishes, so the conversation's mapping is untouched.
+ */
+export function auxiliaryLineage(
+  result: LineageResult,
+  messages: ReadonlyArray<{ role: string; content: unknown }>,
+): { lineage: LineageResult; refusal?: AuxiliaryForkRefusal } {
+  const independent: LineageResult = { type: "diverged", reason: "independent-request" }
+  const replay = (refusal: AuxiliaryForkRefusal) => ({ lineage: independent, refusal })
+  if (result.type === "diverged") return replay(`lineage-diverged:${result.reason}`)
+  if (result.type !== "continuation") return replay(`lineage-${result.type}`)
+  if (result.regrouped) return replay("regrouped")
+  if (result.resumeContentFrom !== undefined) return replay("partial-message")
+  if (result.session.passthroughToolCallIds?.length) return replay("pending-tool")
+  const blocks = (content: unknown): Array<{ type?: unknown } | null> => Array.isArray(content) ? content : []
+  const textOnly = (content: unknown): boolean => typeof content === "string" || blocks(content).every(block => block?.type === "text")
+  let next = result.resumeFrom
+  while (messages[next]?.role === "assistant" && !blocks(messages[next]!.content).some(block => block?.type === "tool_use")) next++
+  const added = messages.slice(next)
+  const sidePrompt = added.some(message => message.role === "user")
+    && added.every(message => (message.role === "user" || message.role === "system") && textOnly(message.content))
+  return sidePrompt ? { lineage: result } : replay("not-side-prompt")
 }
 
 /**

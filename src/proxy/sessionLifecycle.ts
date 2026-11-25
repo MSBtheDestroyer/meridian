@@ -168,6 +168,10 @@ export interface SessionLifecycleOptions {
   maxOwned?: number
   maxTombstones?: number
   maxDeletesPerRun?: number
+  /** Lower the remaining attempt allowance cooperatively, never replenish it.
+   * Checked before claims and after settlement; an active deletion completes
+   * and counts toward a lowered allowance before another claim can start. */
+  maxRemainingDeletes?: () => number
   lockWaitMs?: number
   lockRetryMs?: number
   lockStaleMs?: number
@@ -866,24 +870,41 @@ export async function runGc(
   await retryDeferredLeaseReleases(options)
   await reconcile(pins, options)
   let currentPins = indexPins(pins)
-  const limit = option(options.maxDeletesPerRun, DEFAULT_MAX_DELETES, "maxDeletesPerRun")
+  let limit = option(options.maxDeletesPerRun, DEFAULT_MAX_DELETES, "maxDeletesPerRun")
   const deletionTimeout = option(options.deletionTimeoutMs, DEFAULT_DELETE_TIMEOUT_MS, "deletionTimeoutMs")
+  // Lower the attempt allowance cooperatively, never replenish it: deletions
+  // already counted stay counted, and `maxRemainingDeletes` caps what may be
+  // claimed from `counted` on (see SessionLifecycleOptions).
+  const lowerLimit = (counted: number): void => {
+    limit = Math.min(limit, counted + nonNegativeOption(
+      options.maxRemainingDeletes?.(), limit - counted, "maxRemainingDeletes",
+    ))
+  }
   const result: GcResult = { deleted: 0, notFound: 0, failed: 0, deferred: 0 }
   const runTimeoutMs = option(options.runTimeoutMs, DEFAULT_DELETE_TIMEOUT_MS, "runTimeoutMs")
   const deadline = Date.now() + runTimeoutMs
   let claimed = 0
   let deletionStillRunning = false
 
-  while (claimed < limit && !deletionStillRunning && Date.now() < deadline && !options.shouldStop?.()) {
+  while (!deletionStillRunning && !options.shouldStop?.()) {
+    lowerLimit(claimed)
+    if (claimed >= limit || Date.now() >= deadline) break
     const refreshedPins = options.pinProvider?.()
     if (refreshedPins) {
       currentPins = indexPins(refreshedPins)
     }
     const batch = await claimDeletions(currentPins, Math.min(DELETION_BATCH_SIZE, limit - claimed), options)
     if (batch.length === 0) break
+    const countedBefore = claimed
     claimed += batch.length
 
-    const outcomes = await Promise.all(batch.map((candidate) => deleteClaimed(candidate, deletionTimeout, options)))
+    // Shutdown may begin while the batch runs: each settled deletion re-reads
+    // the allowance, and the whole batch counts toward the lowered one.
+    const outcomes = await Promise.all(batch.map(async (candidate) => {
+      const outcome = await deleteClaimed(candidate, deletionTimeout, options)
+      lowerLimit(countedBefore)
+      return outcome
+    }))
     const verdicts: DeletionVerdict[] = []
     for (const [index, outcome] of outcomes.entries()) {
       if (outcome === "still-running") {
@@ -902,6 +923,8 @@ export async function runGc(
       else if (outcome === "not-found") result.notFound++
       else result.failed++
     }
+    // Shutdown may also begin during the batch's settlement.
+    lowerLimit(countedBefore)
   }
 
   const backlog = await readBacklog(currentPins, options)

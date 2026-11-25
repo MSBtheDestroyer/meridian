@@ -1,20 +1,25 @@
-import { noteApiRejected, noteCredentialObserved } from "./authLifecycle"
-import { isExpiredTokenError } from "./errors"
+import { authLifecycleLoggedOut, observeCredentialInBackground } from "./authLifecycle"
 import type { ClaudeAuthStatus } from "./models"
 import type { ResolvedProfile } from "./profiles"
 import { createPlatformCredentialStore, readStoredCredentialSnapshot, type CredentialStore, type StoredCredentialPresence } from "./tokenRefresh"
 
 export type ProfileLoginState = "authenticated" | "needs_login" | "unverified"
 
+/**
+ * One login state for every surface that reports it. `loggedOut` is the
+ * login history's verdict (authLifecycle.ts `authLifecycleLoggedOut`): a
+ * refused renewal counts only once the access token it left has run out.
+ */
 export function profileLoginState(input: {
   readonly loggedIn?: boolean
   readonly presence?: StoredCredentialPresence
-  readonly firstUnauthedAt?: number | null
+  readonly loggedOut?: boolean
 }): ProfileLoginState {
-  if (input.firstUnauthedAt || input.presence === "absent" || input.loggedIn === false) return "needs_login"
+  if (input.loggedOut || input.presence === "absent" || input.loggedIn === false) return "needs_login"
   return input.loggedIn === true ? "authenticated" : "unverified"
 }
 
+/** `claude auth status` corrected by what the stored credential and its login history say. */
 export async function reconcileClaudeProfileAuth(
   auth: ClaudeAuthStatus | null,
   profile: ResolvedProfile,
@@ -23,14 +28,8 @@ export async function reconcileClaudeProfileAuth(
   if (profile.type !== "claude-max") return auth
   const profileStore = store ?? createPlatformCredentialStore({ claudeConfigDir: profile.env.CLAUDE_CONFIG_DIR })
   const stored = await readStoredCredentialSnapshot(profileStore)
-  const lifecycle = noteCredentialObserved(profileStore.refreshKey, stored)
-  const state = profileLoginState({ loggedIn: auth?.loggedIn, presence: stored.presence, firstUnauthedAt: lifecycle?.firstUnauthedAt })
+  const lifecycle = observeCredentialInBackground(profileStore.refreshKey, stored)
+  const loggedOut = authLifecycleLoggedOut(lifecycle, stored.accessTokenExpiresAt, Date.now())
+  const state = profileLoginState({ loggedIn: auth?.loggedIn, presence: stored.presence, loggedOut })
   return state === "needs_login" ? { ...auth, loggedIn: false } : auth
-}
-
-export async function noteClaudeAuthenticationFailure(profile: ResolvedProfile, input: { message: string; startedAt: number }): Promise<void> {
-  if (profile.type !== "claude-max" || !(isExpiredTokenError(input.message) || input.message.toLowerCase().includes("failed to authenticate: oauth session"))) return
-  const store = createPlatformCredentialStore({ claudeConfigDir: profile.env.CLAUDE_CONFIG_DIR })
-  noteCredentialObserved(store.refreshKey, await readStoredCredentialSnapshot(store))
-  noteApiRejected(store.refreshKey, { startedAt: input.startedAt })
 }

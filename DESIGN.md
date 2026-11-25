@@ -150,6 +150,46 @@ at its provider, so card CSS never names one.
 - **Spent or failing:** shown by dimming and the existing badges. The active
   border is never recoloured or faded, and the active card's Active strip and
   name row, with its spent badge, never dim. Only its figures do.
+- **Refused:** an "out of <window>" badge in the name row. Its explanation
+  (who is refusing, the reset, when it was refused, why, and that the figures
+  are the last good read) is the badge's tooltip on hover or keyboard focus,
+  hung across the card over the figures; the card does not carry it
+  permanently.
+- **Free resets:** a Claude account with banked resets shows one line per
+  kind, because each clears something different: "Full reset" (the whole
+  week), "Fable reset" (only Fable usage) and "Unrecognised reset" (the
+  provider's own label, quoted, as a readout only). Each shows its count in
+  green while one of that kind can be redeemed and in `--muted` otherwise,
+  beside the reason or how many are usable, and that kind's soonest expiry. A
+  Fable reset with no Fable usage to give back stays visible, muted, and says
+  so. On `/` each kind is a "resets" row under the usage figures, labelled
+  "full reset", "Fable reset" or "other reset", and never redeems. On
+  `/profiles` each kind is a block below them; a kind that can be redeemed
+  carries its own small blue "Redeem full reset" / "Redeem Fable reset"
+  button. The confirmation names the kind, the grant and only that kind's
+  effect, adding "It also clears the 5-hour window." only when that grant's
+  provider scope lists it, and the outcome is shown in that kind's block.
+  - Brief (`/profiles` blocks): primary action is the redeem button of a kind
+    that can be redeemed; priorities are the kind's name, its count, then
+    why it is or is not offered. Left out on purpose: a combined total, a
+    redeem for unrecognised or muted kinds, and any fallback to another kind.
+  - Expected rendering for a whole-week grant and three Fable launch grants
+    with 0% Fable used: "Full reset 1 · all usable now · expires in 24d
+    [Redeem full reset]", then a muted "Fable reset 3 · no Fable usage to
+    give back right now · next expires in 12d" with no button.
+- **Refresh:** a small icon button with circular arrows, on every profile
+  card. On `/profiles` it is the first of the card's action icons, before
+  Rename and Remove; on `/` it sits at the end of the name row, after the
+  cost, and clicking it never switches the account. While the reads run it
+  spins (still under reduced motion) and is disabled. The outcome stays on the
+  card for a minute as a short muted list, one line per part (Login, Usage,
+  Models, CVP): the part, its state as a word (green "refreshed", yellow "rate
+  limited", red "failed", muted "skipped" / "not readable here"), then the
+  note. Below 520px the note wraps under the part and state. A spent card's
+  fade on `/` never reaches the outcome: its states are told apart by colour.
+- **Forced:** a profile activated past a supervisor's exclusion carries a
+  yellow "forced" badge naming when the force ends, and on `/profiles` a blue
+  "release" link beside it. Yellow because it is an override, not a fault.
 - **Needs a login:** a red border, the same for every provider, and a
   needs-login badge. An active card keeps its brand ring outside the red.
 - **Controls stay blue:** buttons, links, focus rings, drag handles and drop
@@ -219,6 +259,8 @@ account card on the home page (or the Profiles page). The header chip only
 *shows* the active profile. After any state mutation, call
 `window.meridianHeaderRefresh()` so the chip updates immediately.
 
+**Layout: profile table.** The Tiles / Table control and column settings stay in the page flow. The table's own labeled region scrolls horizontally when columns do not fit; the page scrolls vertically as before. The home preset is for comparing active accounts and usage; Profiles starts with more account facts and management controls.
+
 ## 5. Typography & numbers
 
 - **UI stack:** `-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif`
@@ -251,9 +293,21 @@ account card on the home page (or the Profiles page). The header chip only
 - **Tabs:** muted text, active = accent text + 2px accent underline.
 - **Tables:** inside a `--surface` card; uppercase micro-label headers on
   `--bg`; row hover = faint blue tint.
+- **Profile table:** Tiles stays the default. Table shows one row per account, prioritizing identity, activation and login, then quota and reset times. Sort by a column header or set the precedence and direction of multiple columns under Columns. Drag columns or use their move buttons, hide or show fields, and reset to the page preset. Each page remembers its view, visible columns, column order and sort separately in the browser. Sorting never changes routing order. Missing readings do not look like zero and sort last. Full and Fable resets have separate columns. An always-visible Actions column reuses the tile actions and confirmations.
 - **Inline code chip:** mono, `--surface`/`--bg` fill, 1px border, radius
   4–5px, **violet text** (`--accent2`).
 - **Empty states:** calm centered `--muted` text in a card — never red.
+- **Dialogs and toasts:** never the browser's `alert`, `confirm` or
+  `prompt`. The shared header provides `meridianDialog` (`dialog.ts`): a
+  `--surface` card, radius 12px, on a dimmed backdrop, title 16px/600, body
+  13px, optional label/value facts and a muted note, buttons right-aligned in
+  the Buttons style (blue for the expected action, red only for one that
+  cannot be undone or overrides a safeguard). The border turns yellow for a
+  warning and red for an error. Escape, a click outside and Close all cancel;
+  focus stays inside while it is open and returns afterwards. Errors show the
+  server's message and code, never `[object Object]`. A toast is a short
+  `--surface2` note in the bottom-right corner with a blue, green or red left
+  edge, gone after four seconds.
 - **Header build badge:** a current npm install shows nothing; an
   outdated one shows the blue update chip linking to releases. A local or
   dev build shows one violet metadata pill (release · build number or

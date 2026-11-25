@@ -25,20 +25,21 @@
  * `hooks` option; see ChatGptHooks.
  */
 import { randomUUID } from "node:crypto"
+import { meridianWarmAttribution, readClientAttribution } from "../clientIdentity"
 import { AssignmentStore, type ProfileExhaustion } from "../routing"
 import { isImageEndpoint, type UpstreamBackend, type UpstreamRequest } from "../upstream/backend"
 import { adaptResponsesBody, type BodyAdaptation, type ReasoningSummaryLevel } from "../chatgpt/body"
 import { buildCodexImagesRequest, buildCodexRequest } from "../chatgpt/request"
 import { isModelRefusal, sniffChatGptFailure, type ChatGptFailureKind } from "../chatgpt/stream"
 import { aggregateResponsesStream, tapResponsesStream, type ChatGptUsage, type TapSummary } from "../chatgpt/tap"
-import { noteApiRejected, noteProviderAccepted } from "../authLifecycle"
-import { chatGptAuthLifecycleKey } from "../chatgpt/refresh"
 import { chatGptCooldownUntil, chatGptCreditsFromHeaders, chatGptRateLimitFromHeaders, creditsCanServe, type ChatGptRateLimit } from "../chatgpt/windows"
 import type { CodexCredits, CodexUsageWindow } from "../codex/types"
 import type { ChatGptCreditsPolicy, ChatGptFreeSeatOrder } from "../chatgpt/features"
 import { seatWindows } from "../chatgpt/profiles"
 import type { ChatGptCredentialSource, SeatUnavailableReason } from "../chatgpt/source"
+import type { RequestAttribution } from "../../telemetry/types"
 import { retryAfterHeaders, retryAfterSeconds } from "../retryAfter"
+import { chatGptRefusalBinding, chatGptRefusalPoolKey, chatGptRouteRefusalResponse, type ChatGptRefusalInput, type ChatGptRouteRefusalReason } from "../chatgpt/routeRefusal"
 import {
   describeUsageReserveHold,
   soonestOpening,
@@ -66,7 +67,7 @@ export interface ChatGptAttempt {
 }
 
 /** One per client turn, success or failure. Carries no credential. */
-export interface ChatGptTurnEvent {
+export interface ChatGptTurnEvent extends RequestAttribution {
   requestId: string
   startedAt: number
   requestModel: string | null
@@ -83,6 +84,7 @@ export interface ChatGptTurnEvent {
   error: string | null
   reasoningSummaryEvents: number
   requestSource?: string
+  readonly clientSessionId?: string
   /** Set when the seat served with its plan quota spent, paying with Codex credits. */
   servedOnCredits?: boolean
 }
@@ -177,6 +179,7 @@ export interface ChatGptBackendOptions<Ctx> {
    * a backend nobody configured does not spend money.
    */
   creditsPolicy?: (seat: string) => ChatGptCreditsPolicy
+  routeRefusalProof?: (input: ChatGptRefusalInput, context: Ctx) => { readonly reason: ChatGptRouteRefusalReason; readonly resetAt: number | null } | undefined
   /** A seat's plan windows from the last usage read, with when it was taken; null when never read. */
   planWindows?: (seat: string) => { windows: readonly CodexUsageWindow[]; at: number } | null
   /**
@@ -207,6 +210,7 @@ export interface ChatGptSeatCreditState {
 }
 
 export interface ChatGptBackend<Ctx> extends UpstreamBackend<Ctx> {
+  planSeatAvailable(seat: string, model: string): boolean
   /** Latest `x-codex-*` window headers per seat, from real responses. */
   observedLimits(): ReadonlyMap<string, ObservedSeatLimits>
   seatCreditState(seat: string): ChatGptSeatCreditState
@@ -295,6 +299,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
   const reserveRefusedUntil = new Map<string, number>()
   const modelRefusedUntil = new Map<string, number>()
   const reserveKey = (seat: string, model: string | undefined) => `${seat}\u0000${model ?? ""}`
+  const refusesModel = (seat: string, model: string | undefined) => (modelRefusedUntil.get(reserveKey(seat, model)) ?? 0) > now()
 
   /** The newer of what a response stated and what the usage read found. */
   const creditsOf = (seat: string): CodexCredits | null => {
@@ -350,6 +355,10 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
     provider: "chatgpt",
     observedLimits: () => observed,
     reserveHold,
+    planSeatAvailable(seat, model) {
+      return source.candidateSeats(model).includes(seat) && !(source.reserveSeats?.(model) ?? []).includes(seat) &&
+        !exhaustion.isExhausted(seat) && !refusesModel(seat, model) && !readingSpent(seat) && reserveHold(seat) === null
+    },
 
     forgetSeat(seat) {
       observed.delete(seat)
@@ -389,6 +398,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
 
       const model = typeof parsed.model === "string" ? parsed.model : undefined
       const requestSource = inbound.headers.get("x-meridian-source")?.slice(0, 64) || undefined
+      const attribution = request.meridianWarm ? meridianWarmAttribution : readClientAttribution(inbound.headers)
       const turn: ChatGptTurnInfo = { requestId, model, body: parsed, headers: inbound.headers }
       // An image request goes as the client wrote it: the Responses
       // adaptations (forced stream, store=false) mean nothing to that endpoint.
@@ -400,9 +410,10 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       const report = (fields: Partial<ChatGptTurnEvent> & { status: number }) => {
         hooks?.onTurn?.({
           requestId, startedAt, requestModel: model ?? null, model: model ?? null, seat: null,
+          clientSessionId: request.clientSessionId,
           stream: adapted.clientWantsStream, adaptations: adapted.applied, attempts,
           usage: null, ttfbMs: null, durationMs: now() - startedAt, error: null,
-          reasoningSummaryEvents: 0, ...(requestSource ? { requestSource } : {}), ...fields,
+          reasoningSummaryEvents: 0, ...(requestSource ? { requestSource } : {}), ...attribution, ...fields,
         })
       }
       const fail = (response: Response, error: string) => {
@@ -415,6 +426,10 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
 
       const refused = await hooks?.admit?.(turn)
       if (refused) return fail(refused, "refused_by_admission")
+
+      const refusalBinding = request.route === "/v1/responses" && route.kind === "pool" && !route.warm && options.routeRefusalProof
+        ? chatGptRefusalBinding(inbound.headers, parsed) : undefined
+      const refusalPoolKey = refusalBinding && chatGptRefusalPoolKey(source.refusalPool?.(refusalBinding.model))
 
       // Serialized once: every seat is offered exactly the same bytes.
       const outbound = JSON.stringify(adapted.body)
@@ -455,9 +470,10 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       const immediate: string[] = []
       const reserve: string[] = []
       const reserveHeld = new Map<string, UsageReserveState>()
+      const uncertainty = new Set<string>()
       for (const seat of routable) {
         const reason = benched.get(seat)
-        if (reason !== undefined && reason !== "quota_spent") { reasons.add("quota_exhausted"); continue }
+        if (reason !== undefined && reason !== "quota_spent") { uncertainty.add(seat); reasons.add("quota_exhausted"); continue }
         const planLeft = !stampedSpent.includes(seat) && reason === undefined && !readingSpent(seat)
         const hold = planLeft && route.warm !== true ? reserveHold(seat) : null
         if (hold) { reasons.add("reserved"); reserveHeld.set(seat, hold); continue }
@@ -529,10 +545,9 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       // A seat that refused this model sits it out (MODEL_REFUSAL_MS). It is
       // asked again only when no other seat was, so a model that every seat
       // refuses still gets the backend's own answer, not "unavailable".
-      const refusesModel = (seat: string) => (modelRefusedUntil.get(reserveKey(seat, model)) ?? 0) > now()
       const queue: Array<{ seat: string; onCredits: boolean }> = []
       const sittingOut: Array<{ seat: string; onCredits: boolean }> = []
-      const enqueue = (seat: string, onCredits: boolean) => (refusesModel(seat) ? sittingOut : queue).push({ seat, onCredits })
+      const enqueue = (seat: string, onCredits: boolean) => (refusesModel(seat, model) ? sittingOut : queue).push({ seat, onCredits })
       for (const seat of seats) enqueue(seat, onCreditsNow.has(seat))
       const dispatched = new Set<string>()
       let reserveQueued = false
@@ -595,7 +610,6 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
           }
 
           if (!sniffed.failure) {
-            noteProviderAccepted(chatGptAuthLifecycleKey(seat), { startedAt: authAttemptStartedAt })
             const until = chatGptCooldownUntil(rateLimit, now())
             if (until !== null) exhaustion.mark(seat, until, "quota_spent")
             if (cacheKey) affinity.set(cacheKey, { profileId: seat, requestId: undefined })
@@ -649,7 +663,6 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
             requestId, seat, kind: failureKind, status: upstream.status,
             until: bench(seat, failureKind, rateLimit), rateLimit, startedAt: authAttemptStartedAt,
           }
-          if (failureKind === "requires_reauth") noteApiRejected(chatGptAuthLifecycleKey(seat), { startedAt: authAttemptStartedAt })
           refusals.push(refusal)
           if (onCredits) reserveRefusedUntil.set(reserveKey(seat, model), refusal.until)
           hooks?.onSeatRefused?.(refusal)
@@ -680,6 +693,15 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       if (fallback) return fallback
 
       const message = source.describeUnavailable(reasons)
+      if (refusalBinding && refusalPoolKey && route.kind === "pool" &&
+          dispatched.size === 0 && queue.length === 0 && sittingOut.length === 0 && !inbound.signal.aborted) {
+        const proof = options.routeRefusalProof?.({
+          binding: refusalBinding, poolKey: refusalPoolKey, excluded: route.excluded, listed: new Set(listed), reserveHeld, uncertainty,
+          newerSeatEvidence: (seat, at) => (observed.get(seat)?.at ?? 0) > at || (observedCredits.get(seat)?.at ?? 0) > at ||
+            refusesModel(seat, model) || (reserveRefusedUntil.get(reserveKey(seat, model)) ?? 0) > now(),
+        }, request.context)
+        if (proof) return fail(chatGptRouteRefusalResponse(refusalBinding, proof, now()), "chatgpt_no_routable_account")
+      }
       // No seat at all is a sign-in to do, not an outage to wait out.
       const auth = reasons.has("expired") || reasons.has("requires_reauth") || source.seats().length === 0
       const quota = !auth && reasons.size > 0

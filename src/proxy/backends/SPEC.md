@@ -46,6 +46,7 @@ belong to [`chatgpt-backend`](../chatgpt/SPEC.md).)
   expansion), the same as `meridian setup --client pi`.
 - Persistence (`statePath`) is opt-in and bounded; Antigravity plugins
   (`antigravityPlugins.ts`) are separate from Claude user plugins.
+- [Client attribution](../../../docs/client-attribution.md) stays in Antigravity's existing per-request telemetry, including optional exchange persistence and telemetry observers. No `x-meridian-*` request header reaches the CLI; attribution does not affect routing, conversation reuse or replay.
 
 The full runtime, replay, recovery and persistence contract is in
 [`architecture`](../../../ARCHITECTURE.md) → *Antigravity runtime and combined
@@ -53,10 +54,30 @@ provider service*; public routes and headers are in
 [`api-contract`](../../../.agents/references/api-contract.md); feature status in
 `docs/antigravity-support.md`.
 
+## Client-tool allowance
+
+The live conversation's cumulative client-tool count and MCP request replay
+ledger are bounded by `MERIDIAN_AGY_MAX_TOOL_CALLS` (default 256, integer
+1–65536, captured at runtime construction). Invalid explicit values fail
+construction. Sequential and parallel calls share this allowance; an excessive
+batch fails before any call is dispatched, and duplicate MCP request IDs replay
+their original result without spending another call. The independent limits of
+32 outstanding client calls and 16 calls per parallel batch remain unchanged.
+This is Meridian's bridge allowance; native CLI/provider limits are unchanged;
+raising it retains more conversation/replay data until that run is retired.
+The existing completed-conversation reuse cutoff (128 client calls) is unchanged.
+A restored live process starts a fresh counter; this is not a persistent native
+conversation lifetime ledger. Model/turn and pending-tool deadlines remain
+independent of the allowance.
+
 ## Known limitations
 
-- **Platform verification.** Authenticated acceptance exists only on macOS
-  arm64 (agy 1.2.7, Pi 0.72.1, OpenCode V1 1.18.31); Linux and Windows remain
+- **Platform verification.** Authenticated acceptance exists on macOS arm64
+  (agy 1.2.7, Pi 0.72.1, OpenCode V1 1.18.31) and, for the core, Pi-client and
+  account-settings gates, on Linux x64 (agy 1.5.5, Pi 1.5.2, 2026-11-12; agy
+  1.5.13, Pi 1.3.0, 2026-11-22); the compatibility gate now pins agy 1.5.13, so
+  the frozen macOS gates pinning the 1.2.7 binary hash await a 1.5.13 re-run on
+  that platform. Windows remains
   unverified.
 - **Active-task reattachment** after a restart and **automatic reconciliation of
   uncertain tool outcomes** are unfinished; an unclean restart returns 409 with

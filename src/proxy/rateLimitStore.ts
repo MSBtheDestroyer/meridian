@@ -71,13 +71,17 @@ export function toEpochMs(value: number | undefined): number | undefined {
   return value < MIN_EPOCH_MS ? Math.round(value * 1000) : value
 }
 
-export interface RateLimitEntry extends SDKRateLimitInfo {
+interface ProviderRateLimitInfo extends Omit<SDKRateLimitInfo, "rateLimitType"> {
+  rateLimitType?: SDKRateLimitInfo["rateLimitType"] | "seven_day_fable" | "seven_day_overage_included"
+}
+
+export interface RateLimitEntry extends ProviderRateLimitInfo {
   /** When this entry was captured (epoch ms). */
   observedAt: number
 }
 
 /** Type discriminator for the entry's bucket key. */
-export type RateLimitBucketKey = NonNullable<SDKRateLimitInfo["rateLimitType"]> | "default"
+export type RateLimitBucketKey = NonNullable<ProviderRateLimitInfo["rateLimitType"]> | "default"
 
 class RateLimitStore {
   /** profileId -> (bucket key -> entry). One inner map per configured profile. */
@@ -92,7 +96,7 @@ class RateLimitStore {
    * explicitly so callers (and tests) can control the capture timestamp used
    * for newest-first ordering in {@link getAll}.
    */
-  record(profileId: string, info: SDKRateLimitInfo | undefined | null, observedAt: number = Date.now()): void {
+  record(profileId: string, info: ProviderRateLimitInfo | undefined | null, observedAt: number = Date.now()): void {
     if (!info || typeof info !== "object") return
     const key: RateLimitBucketKey = info.rateLimitType ?? "default"
     let buckets = this.byProfile.get(profileId)

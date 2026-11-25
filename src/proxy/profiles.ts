@@ -18,9 +18,11 @@
 import { existsSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { configPath, defaultConfigDir } from "../configDir"
-import { setSetting, getSetting } from "../settings"
+import { setSetting, getSetting, loadSettings } from "../settings"
 import { pickStickyProfile, type RoutingMode } from "./routing"
-import { adoptedProfiles, followedActiveProfile } from "./followActive"
+import { adoptedProfiles, followedActiveProfile, isFollowEnabled } from "./followActive"
+import { liveForcedProfile } from "./forcedProfile"
+import { parseRoutingExcludedProfiles } from "./routingExclusions"
 
 /** Disk profile cache with short TTL so new profiles are picked up quickly */
 const DISK_CACHE_TTL_MS = 5_000
@@ -227,6 +229,20 @@ export function restoreActiveProfile(configProfiles?: ProfileConfig[]): void {
   } else {
     console.warn(`[meridian] Saved active profile "${saved}" not found. Using default.`)
   }
+}
+
+export function initializeConfiguredForcedActiveProfile(profiles: readonly ProfileConfig[]): void {
+  const settings = loadSettings()
+  const forced = liveForcedProfile(settings.forcedActiveProfile, Date.now())
+  if (!forced) return
+  if (settings.allowForcingForbiddenProfile !== true || settings.activeProfile !== forced.profile) {
+    setSetting("forcedActiveProfile", undefined)
+    return
+  }
+  if (activeProfileId !== undefined || isFollowEnabled() || !profiles.some(p => p.id === forced.profile)) return
+  const excluded = parseRoutingExcludedProfiles(settings.routingExcludedProfiles)
+  if (excluded.some(id => findProfileByIdOrAlias(profiles, id)?.id === forced.profile)) return
+  activeProfileId = forced.profile
 }
 
 /**

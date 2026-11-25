@@ -46,6 +46,10 @@ Record what Meridian did and show it to the operator:
 
 ## Decisions
 
+- **Client conversation identity is not SDK session identity.** `/telemetry/requests` may include `clientSessionId`, the conversation key resolved from the client's adapter or the unscoped thread ID in Responses metadata, falling back to a valid `x-meridian-session` header. The fallback never enters session resume, lineage, leases, or route selection. It is retained across requests and profile attempts even when the provider creates a new SDK session or the request uses a side-flow routing key. `sdkSessionId` still identifies the SDK transcript. Warm requests, keepalive beats, requests without a client ID, and legacy rows omit `clientSessionId`; a prompt fingerprint or cache key alone is not a conversation identifier.
+
+- **Client attribution is self-reported telemetry.** `/telemetry/requests` and ChatGPT turn events carry optional `client: {name, version?, installation?, device?}` and `purpose`; SQLite stores these in nullable `client_name`, `client_version`, `client_installation`, `client_device`, and `purpose` columns. Old rows omit the new fields. See the [client contract](../../docs/client-attribution.md) for validation and internal attribution; it does not change `requestSource` or any routing decision.
+
 - **`/` and `/profiles` update in place.** Their polls patch `#content` from
   the fresh markup (`domPatch.ts`) instead of replacing it: nodes are matched
   by `data-key`/`id` (cards by profile id) or by position among unkeyed
@@ -53,6 +57,7 @@ Record what Meridian did and show it to the operator:
   removed nodes are touched, so find-in-page, a selection, focus and scroll
   survive a refresh. A node marked `data-patch-own` (an open sign-in panel)
   keeps its script-owned children.
+- **Profile table preferences are presentation-only.** `profileTable.ts` owns the shared table, column definitions and browser-local presets. Both pages project the same profile and quota responses they already read into keyed rows and reuse their existing action paths. The table receives the current filters; changing its columns or sort does not change the profile pool or trigger a provider read.
 - **Card status is shared between both pages** (`profileCardStatus.ts`): the
   informational duplicate badge and the post-sign-in *updating* / *failed*
   line. The page remembers a sign-in it finished, so an answer requested
@@ -81,6 +86,75 @@ Record what Meridian did and show it to the operator:
   answering 429 for the CLIs and widgets that share it. A hidden tab skips its
   timed polls, and `visibilitychange` refreshes the page as soon as it is
   shown again.
+
+- **Free resets are counted from Meridian's own reading** (`freeResets.ts`).
+  Each Claude entry of `/v1/usage/quota/all` carries the provider's
+  `bankedResets`, which Meridian reads per profile with that profile's
+  credentials; neither page asks anyone else. One view feeds both pages, and
+  it counts resets **per kind**, because each kind clears something different:
+  *Full reset* (`kind: "full"`, the whole week), *Fable reset*
+  (`kind: "fable"`, only Fable usage back to the weekly allowance, never the
+  week) and *Unrecognised reset* (anything else). Either known kind may also
+  clear the 5-hour window: Meridian says so only when the grant's own `clears`
+  lists `five_hour` (observed on Team grants, not on personal ones), never by
+  guessing from the plan.
+  The grant's `kind` decides, never the provider's raw `type` (the observed
+  Fable launch grant has `type: "full"`). A reading without `kind` (one taken
+  before Meridian read grant scope) labels only the known ids:
+  `full-reset-2611` is full, `launch-2610-fable` and its `-6mo`/`-12mo`
+  grants are Fable; every other grant is unrecognised. Unrecognised grants
+  are grouped by the provider's `description` and `providerType`, or by raw
+  grant id when the provider gives neither; that name is shown escaped and
+  the grants are never offered for redeeming. A grant id listed twice
+  counts once; the six- and twelve-month Fable grants are distinct grants.
+  Within a kind, resets on unexpired grants are *available*, and those on
+  grants the provider marks `usableNow`, unpaused and already started are
+  *usable*; each kind shows its own soonest expiry.
+- **A kind offers a grant only when redeeming it would do something.** The
+  grant is the provider's `nextGrantId` when that grant is usable and of the
+  same kind, else the usable grant of that kind expiring soonest. A full
+  reset needs nothing more. A Fable reset also needs a current reading of
+  Fable usage above zero: the grant's `percentUsed.seven_day_overage_included`
+  (0-100), else the profile's `seven_day_fable` window (0-1). A stale reading
+  confirms nothing. At zero, unknown or stale usage the Fable count stays
+  visible but muted, with the reason ("no Fable usage to give back right
+  now", "Fable usage unknown", "Fable usage not confirmed: the last reading is
+  stale") and no redeem button. A known zero is shown even while Anthropic
+  holds every Fable grant back. Muted also means none of that kind is usable.
+- **Only `/profiles` redeems.** A card on `/` shows one "resets" row per kind
+  (its name, count, and the reason or usable count with its soonest expiry)
+  and never redeems. `/profiles` shows one block per kind, each with its own
+  "Redeem full reset" / "Redeem Fable reset" button while that kind offers a
+  grant. The button acts only after a confirmation that names the kind, the
+  grant (provider label and id) and only that kind's effect (a Fable reset
+  gives back Fable usage and leaves the week as it is), plus the 5-hour window
+  when that grant's scope lists it, and posts that grant
+  to `POST /v1/usage/quota/reset` with a fresh `requestId`; nothing redeems
+  on its own, and a refusal never falls back to another kind or grant. The
+  poll is held while a redeem is in flight, and the outcome stays in the
+  block of the kind it was for (or in a block of its own once that kind is
+  used up) for two minutes, so the poll that follows does not wipe it. The
+  route clears the profile's cached usage after a reset, so the next read of
+  `/v1/usage/quota/all` (the page's refresh, or Vibeterm's re-check) shows
+  the new state.
+
+- **Refresh is one click per card.** Every profile card and ChatGPT seat on
+  `/` and `/profiles` carries a refresh icon that posts
+  `POST /profiles/:id/refresh` (`profileActions.ts`): login, usage, model
+  list, and where CVP access comes from. The icon spins and is disabled while
+  the reads run, the poll is held meanwhile, and the outcome stays on the card
+  for a minute as one inline line per part (`outcomeHtml`): the part, its
+  state in words and colour, and the route's note. Never a dialog.
+
+- **No native dialogs.** No page calls `alert`, `confirm` or `prompt`. The
+  shared header carries `window.meridianDialog` (`dialog.ts`): a queued,
+  focus-trapped modal and a corner toast, text set with `textContent`. Error
+  replies are read with `dialogErrorText`, which takes both envelopes
+  (`{error: "...", code}` and `{error: {type, message}}`), so an object is
+  never shown as `[object Object]`. `no-native-dialogs.test.ts` fails on a
+  native dialog call in any served page.
+
+- **A refused switch says why and who.** Activation on `/` and `/profiles` goes through `meridianProfileActions.activate`: a refusal opens a dialog with the route's reason, who keeps the profile out, and what forcing would take. It offers "Activate anyway" when only forcing is needed and allowed, "Release and switch" when the refusal only asks for a release, or one `Release <profile> and activate anyway` button when both are needed and forcing is allowed. When forcing is possible but disabled, the dialog links to the setting. Retries carry consent across separate dialogs for the same switch. Release consent applies only to the force shown in the dialog, and a failed switch does not release it. A forced card shows a yellow "forced" badge with its expiry and, on `/profiles`, a release link.
 
 - **Keepalive beats are not requests.** Rows with
   `requestSource: "cache-keepalive"` answered no client, so `computeSummary`

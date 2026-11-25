@@ -63,6 +63,7 @@ Environment variables:
   MERIDIAN_AGY_TURN_TIMEOUT_MS      Active CLI turn deadline (default: 300000)
   MERIDIAN_AGY_TOOL_TIMEOUT_MS      Idle client-tool wait (default: 60000)
   MERIDIAN_AGY_MAX_CONCURRENT       Maximum CLI processes (default: 4)
+  MERIDIAN_AGY_MAX_TOOL_CALLS       Client calls per live process (default: 256; range: 1–65536)
   MERIDIAN_AGY_PLUGIN_PATHS         JSON array of Antigravity plugin modules
   MERIDIAN_AGY_GRAMMAR_PYTHON       Local Python with Lark for custom grammars
   MERIDIAN_AGY_PATH                 Official agy executable (default: agy)
@@ -420,16 +421,13 @@ export async function runCli(
       }
     } catch { /* non-fatal */ }
 
+    const { enableDiskProfileDiscovery, initializeConfiguredForcedActiveProfile, usesDefaultAuthContext } = await import("../src/proxy/profiles")
     // Enable disk auto-discovery when no MERIDIAN_PROFILES env var is set.
     // This lets `meridian profile add` work without restarting the server.
-    if (!profiles) {
-      const { enableDiskProfileDiscovery } = await import("../src/proxy/profiles")
-      enableDiskProfileDiscovery()
-    }
+    if (!profiles) enableDiskProfileDiscovery()
 
     // Pre-flight auth check — runs the resolved Claude binary's auth-status
     // subcommand. Independent of whether `claude` is on PATH (#478).
-    const { usesDefaultAuthContext } = await import("../src/proxy/profiles")
     if (usesDefaultAuthContext(profiles, defaultProfile)) {
       try {
         const { stdout } = await runAuthCheck()
@@ -445,6 +443,7 @@ export async function runCli(
         console.error("\x1b[33m⚠ Could not verify Claude auth status. If requests fail, run: claude login\x1b[0m")
       }
     }
+    if (profiles) initializeConfiguredForcedActiveProfile(profiles)
   }
 
   const { enableOrganizationLookup } = await import("../src/proxy/organizationName")

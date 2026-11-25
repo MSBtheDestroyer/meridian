@@ -11,7 +11,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { setSessionStoreDir } from "../proxy/sessionStore"
-import { InflightRegistry, isLoopbackPeer, onResponseDone } from "../proxy/inflight"
+import { InflightRegistry, isLoopbackHost, isLoopbackPeer, onResponseDone } from "../proxy/inflight"
 import {
   assistantMessage,
   blockStop,
@@ -139,6 +139,24 @@ describe("isLoopbackPeer", () => {
     }
     for (const header of ["forwarded", "x-forwarded-for", "x-real-ip"]) {
       expect(isLoopbackPeer("127.0.0.1", new Headers({ [header]: "203.0.113.9" }))).toBe(false)
+    }
+  })
+})
+
+describe("isLoopbackHost", () => {
+  it("accepts a loopback authority, with or without a port", () => {
+    for (const host of ["127.0.0.1", "127.0.0.1:3456", "127.12.0.9:1", "localhost", "LOCALHOST:65535", "[::1]", "[::1]:3456"]) {
+      expect(isLoopbackHost(host)).toBe(true)
+    }
+  })
+  it("refuses any other name, and any authority with URL components or an invalid port", () => {
+    for (const host of [
+      undefined, "", "meridian.example", "meridian.example:3456", "app.localhost", "localhost.", "::1", "[::2]", "128.0.0.1",
+      "127.0.0.256", "127.0.0.01", "127.1", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:03456", "127.0.0.1:",
+      "127.0.0.1:x", "127.0.0.1/x", "127.0.0.1:3456/x", "127.0.0.1?x", "127.0.0.1#x", "u@127.0.0.1", "u:p@localhost",
+      " 127.0.0.1", "127.0.0.1 ", "127.0.0.1,meridian.example",
+    ]) {
+      expect(isLoopbackHost(host)).toBe(false)
     }
   })
 })

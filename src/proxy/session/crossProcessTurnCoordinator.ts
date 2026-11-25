@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
-import { hostname } from "node:os"
+import { hostname, uptime } from "node:os"
 import { basename, dirname, join } from "node:path"
 import {
   chmod,
@@ -29,9 +29,7 @@ import {
 } from "./recoveryClaim"
 import {
   captureProcessIncarnation,
-  currentBootTimeMs,
   parseProcessIncarnation,
-  predatesBoot,
   processIncarnationIsDead,
   type ProcessIncarnation,
 } from "./processIncarnation"
@@ -53,6 +51,10 @@ const DEFAULT_RELEASE_RETRY_DELAYS_MS: readonly number[] = [1_000, 5_000, 30_000
 const LIVE_LEASE_TOKENS: unique symbol = Symbol.for("meridian.crossProcessTurn.liveLeaseTokens")
 const leaseTokenRegistry = globalThis as typeof globalThis & { [LIVE_LEASE_TOKENS]?: Set<string> }
 const liveLeaseTokens = leaseTokenRegistry[LIVE_LEASE_TOKENS] ??= new Set<string>()
+// os.uptime() is whole seconds on some platforms, so the boot instant derived
+// from it can land up to a second late. Only activity clearly before it counts
+// as belonging to an earlier boot.
+const BOOT_CLOCK_TOLERANCE_MS = 5_000
 
 export interface CrossProcessTurnCoordinatorOptions {
   /** Maximum time an acquire may wait. Acquires always have a finite bound. */
@@ -235,6 +237,10 @@ async function newestOwnerlessActivity(lockPath: string): Promise<number | undef
   return newest
 }
 
+function currentBootTimeMs(): number {
+  return Date.now() - uptime() * 1000
+}
+
 function sameIdentity(left: LockSnapshot, right: LockSnapshot): boolean {
   return left.dev === right.dev && left.ino === right.ino
 }
@@ -276,7 +282,7 @@ interface RecoveryPolicy {
  */
 function ownerlessFromEarlierBoot(snapshot: LockSnapshot, policy: RecoveryPolicy): boolean {
   const lastActivity = Math.max(snapshot.mtimeMs, snapshot.heartbeatMtimeMs ?? 0)
-  return predatesBoot(lastActivity, policy.bootTimeMs())
+  return lastActivity < policy.bootTimeMs() - BOOT_CLOCK_TOLERANCE_MS
 }
 
 function canRecover(snapshot: LockSnapshot, policy: RecoveryPolicy, now = Date.now()): boolean {

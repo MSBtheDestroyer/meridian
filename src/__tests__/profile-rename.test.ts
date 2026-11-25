@@ -381,6 +381,17 @@ describe("applyProfileRename", () => {
     expect(getSetting("profileOrder")).toEqual(["spare"])
   })
 
+  test("the cvp order and cvp pointer follow the rename", () => {
+    seed([{ id: "work" }, { id: "spare" }])
+    setSetting("cvpProfileOrder", ["spare", "work"])
+    setSetting("cvpActiveProfile", "work")
+
+    applyProfileRename("work", "employer", { profilesDir, configFile })
+
+    expect(getSetting("cvpProfileOrder")).toEqual(["spare", "employer"])
+    expect(getSetting("cvpActiveProfile")).toBe("employer")
+  })
+
   test("a renamed profile still resolves under its old name", () => {
     seed([{ id: "work", claudeConfigDir: join(profilesDir, "work") }])
 

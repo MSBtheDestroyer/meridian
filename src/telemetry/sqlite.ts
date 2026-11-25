@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS metrics (
   session_discovered_count INTEGER,
   message_count        INTEGER,
   sdk_session_id       TEXT,
+  client_session_id    TEXT,
   status               INTEGER NOT NULL,
   queue_wait_ms        REAL    NOT NULL,
   session_queue_wait_ms REAL   NOT NULL DEFAULT 0,
@@ -48,7 +49,13 @@ CREATE TABLE IF NOT EXISTS metrics (
   route_refused_bucket TEXT,
   reasoning_output_tokens INTEGER,
   fallback_from_model  TEXT,
-  resolved_model       TEXT
+  resolved_model       TEXT,
+  routing_require      TEXT,
+  client_name          TEXT,
+  client_version       TEXT,
+  client_installation  TEXT,
+  client_device        TEXT,
+  purpose              TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_ts    ON metrics(timestamp);
 CREATE INDEX IF NOT EXISTS idx_metrics_model ON metrics(model);
@@ -74,6 +81,13 @@ const METRICS_MIGRATIONS = [
   "ALTER TABLE metrics ADD COLUMN reasoning_output_tokens INTEGER",
   "ALTER TABLE metrics ADD COLUMN fallback_from_model TEXT",
   "ALTER TABLE metrics ADD COLUMN resolved_model TEXT",
+  "ALTER TABLE metrics ADD COLUMN routing_require TEXT",
+  "ALTER TABLE metrics ADD COLUMN client_session_id TEXT",
+  "ALTER TABLE metrics ADD COLUMN client_name TEXT",
+  "ALTER TABLE metrics ADD COLUMN client_version TEXT",
+  "ALTER TABLE metrics ADD COLUMN client_installation TEXT",
+  "ALTER TABLE metrics ADD COLUMN client_device TEXT",
+  "ALTER TABLE metrics ADD COLUMN purpose TEXT",
 ]
 
 const LOGS_SCHEMA = `
@@ -137,24 +151,26 @@ class SqliteTelemetryStore implements ITelemetryStore {
         request_id, timestamp, adapter, request_source, model, request_model, resolved_model, mode,
         is_resume, is_passthrough, lineage_type,
         has_deferred_tools, deferred_tool_count, tool_count, discovered_tools, session_discovered_count,
-        message_count, sdk_session_id,
+        message_count, sdk_session_id, client_session_id,
         status, queue_wait_ms, session_queue_wait_ms, sdk_queue_wait_ms, proxy_overhead_ms, ttfb_ms,
         upstream_duration_ms, total_duration_ms, content_blocks, text_events, error,
         input_tokens, output_tokens, cache_read_input_tokens,
         cache_creation_input_tokens, cache_hit_rate, profile_id, envelope_violations,
         route_kind, route_group_id, route_attempt, route_refused_bucket,
-        reasoning_output_tokens, fallback_from_model
+        reasoning_output_tokens, fallback_from_model, routing_require,
+        client_name, client_version, client_installation, client_device, purpose
       ) VALUES (
         @requestId, @timestamp, @adapter, @requestSource, @model, @requestModel, @resolvedModel, @mode,
         @isResume, @isPassthrough, @lineageType,
         @hasDeferredTools, @deferredToolCount, @toolCount, @discoveredTools, @sessionDiscoveredCount,
-        @messageCount, @sdkSessionId,
+        @messageCount, @sdkSessionId, @clientSessionId,
         @status, @queueWaitMs, @sessionQueueWaitMs, @sdkQueueWaitMs, @proxyOverheadMs, @ttfbMs,
         @upstreamDurationMs, @totalDurationMs, @contentBlocks, @textEvents, @error,
         @inputTokens, @outputTokens, @cacheReadInputTokens,
         @cacheCreationInputTokens, @cacheHitRate, @profileId, @envelopeViolations,
         @routeKind, @routeGroupId, @routeAttempt, @routeRefusedBucket,
-        @reasoningOutputTokens, @fallbackFromModel
+        @reasoningOutputTokens, @fallbackFromModel, @routingRequire,
+        @clientName, @clientVersion, @clientInstallation, @clientDevice, @purpose
       )
     `)
 
@@ -185,6 +201,7 @@ class SqliteTelemetryStore implements ITelemetryStore {
         sessionDiscoveredCount: metric.sessionDiscoveredCount ?? null,
         messageCount: metric.messageCount ?? null,
         sdkSessionId: metric.sdkSessionId ?? null,
+        clientSessionId: metric.clientSessionId ?? null,
         status: metric.status,
         queueWaitMs: metric.queueWaitMs,
         sessionQueueWaitMs: metric.sessionQueueWaitMs ?? 0,
@@ -212,6 +229,12 @@ class SqliteTelemetryStore implements ITelemetryStore {
         routeRefusedBucket: metric.routeRefusedBucket ?? null,
         reasoningOutputTokens: metric.reasoningOutputTokens ?? null,
         fallbackFromModel: metric.fallbackFromModel ?? null,
+        routingRequire: metric.routingRequire && metric.routingRequire.length > 0 ? JSON.stringify(metric.routingRequire) : null,
+        clientName: metric.client?.name ?? null,
+        clientVersion: metric.client?.version ?? null,
+        clientInstallation: metric.client?.installation ?? null,
+        clientDevice: metric.client?.device ?? null,
+        purpose: metric.purpose ?? null,
       })
     } catch (err) {
       console.error("[telemetry] SQLite write failed, skipping:", err)
@@ -399,7 +422,7 @@ class SqliteDiagnosticLogStore implements IDiagnosticLogStore {
   }
 }
 
-function parseEnvelopeViolations(raw: unknown): string[] | undefined {
+function parseStringList(raw: unknown): string[] | undefined {
   if (typeof raw !== "string" || raw.length === 0) return undefined
   try {
     const parsed = JSON.parse(raw)
@@ -410,6 +433,7 @@ function parseEnvelopeViolations(raw: unknown): string[] | undefined {
 }
 
 function rowToMetric(r: Record<string, unknown>): RequestMetric {
+  const { client_name: name, client_version: version, client_installation: installation, client_device: device, purpose } = r
   return {
     requestId: r.request_id as string,
     timestamp: r.timestamp as number,
@@ -429,6 +453,7 @@ function rowToMetric(r: Record<string, unknown>): RequestMetric {
     sessionDiscoveredCount: (r.session_discovered_count as number) ?? undefined,
     messageCount: (r.message_count as number) ?? undefined,
     sdkSessionId: (r.sdk_session_id as string) ?? undefined,
+    clientSessionId: typeof r.client_session_id === "string" ? r.client_session_id : undefined,
     status: r.status as number,
     queueWaitMs: r.queue_wait_ms as number,
     sessionQueueWaitMs: (r.session_queue_wait_ms as number) ?? 0,
@@ -446,13 +471,23 @@ function rowToMetric(r: Record<string, unknown>): RequestMetric {
     cacheCreationInputTokens: (r.cache_creation_input_tokens as number) ?? undefined,
     cacheHitRate: (r.cache_hit_rate as number) ?? undefined,
     profileId: (r.profile_id as string) ?? undefined,
-    envelopeViolations: parseEnvelopeViolations(r.envelope_violations),
+    envelopeViolations: parseStringList(r.envelope_violations),
     routeKind: (r.route_kind as RequestMetric["routeKind"]) ?? undefined,
     routeGroupId: (r.route_group_id as string) ?? undefined,
     routeAttempt: (r.route_attempt as number) ?? undefined,
     routeRefusedBucket: (r.route_refused_bucket as string) ?? undefined,
     reasoningOutputTokens: (r.reasoning_output_tokens as number) ?? undefined,
     fallbackFromModel: (r.fallback_from_model as string) ?? undefined,
+    routingRequire: parseStringList(r.routing_require),
+    ...(typeof name === "string" ? {
+      client: {
+        name,
+        ...(typeof version === "string" ? { version } : {}),
+        ...(typeof installation === "string" ? { installation } : {}),
+        ...(typeof device === "string" ? { device } : {}),
+      },
+    } : {}),
+    ...(typeof purpose === "string" ? { purpose } : {}),
   }
 }
 

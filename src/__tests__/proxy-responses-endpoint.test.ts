@@ -85,11 +85,11 @@ function createTestApp() {
   return app
 }
 
-function postResponses(app: any, body: any) {
+function postResponses(app: any, body: any, headers: Record<string, string> = {}) {
   return app.fetch(
     new Request("http://localhost/v1/responses", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...headers },
       body: JSON.stringify(body),
     })
   )
@@ -340,4 +340,15 @@ describe("/v1/responses cost estimate for GPT model ids", () => {
     expect(estimate.byModel["gpt-5.5"]!.estimatedUsd).toBeNull()
     expect(estimate.unpricedRequestCount).toBe(1)
   })
+})
+
+it("reports the OpenCode conversation through the Claude Responses translation", async () => {
+  const app = createTestApp()
+  const response = await postResponses(app, {
+    model: "claude-sonnet-5", input: "Continue", stream: false, prompt_cache_key: "different-routing-key",
+  }, { "x-opencode-session": "oc-on-responses" })
+  expect(response.status).toBe(200)
+
+  const history = await app.fetch(new Request("http://localhost/telemetry/requests?limit=1"))
+  expect(await history.json()).toMatchObject([{ adapter: "codex", clientSessionId: "oc-on-responses" }])
 })

@@ -45,11 +45,17 @@ const { authLifecycleFor, noteRefreshRejected } = await import("../proxy/authLif
 const { chatGptAuthLifecycleKey } = await import("../proxy/chatgpt/refresh")
 
 const NOW = Date.now()
-const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
-const IMAGES_PREFIX = "https://chatgpt.com/backend-api/codex/images/"
+const CODEX_PREFIX = "https://chatgpt.com/backend-api/codex/"
+const IMAGES_PREFIX = `${CODEX_PREFIX}images/`
 const TOKEN_URL = "https://auth.openai.com/oauth/token"
 
-interface UpstreamCall { url: string; authorization: string | null; accountId: string | null; body: Record<string, unknown> }
+interface UpstreamCall {
+  url: string
+  authorization: string | null
+  accountId: string | null
+  body: Record<string, unknown>
+  meridianHeaders: string[]
+}
 let upstreamCalls: UpstreamCall[] = []
 let tokenCalls = 0
 let respond: (call: UpstreamCall, index: number) => Response | Promise<Response> = () => completed()
@@ -94,9 +100,13 @@ function mockFetch(input: string | URL | Request, init?: RequestInit): Promise<R
     tokenCalls++
     return Promise.resolve(new Response(JSON.stringify({ access_token: "at-refreshed", refresh_token: "rt-rotated", expires_in: 3600 }), { status: 200, headers: { "content-type": "application/json" } }))
   }
-  if (url === CODEX_URL || url.startsWith(IMAGES_PREFIX)) {
-    const headers = new Headers(init?.headers)
-    const call = { url, authorization: headers.get("authorization"), accountId: headers.get("chatgpt-account-id"), body: JSON.parse(String(init?.body)) as Record<string, unknown> }
+  if (url.startsWith(CODEX_PREFIX) && init?.method === "POST") {
+    const headers = new Headers(init.headers)
+    const call = {
+      url, authorization: headers.get("authorization"), accountId: headers.get("chatgpt-account-id"),
+      body: JSON.parse(String(init.body)) as Record<string, unknown>,
+      meridianHeaders: [...headers.keys()].filter(name => name.startsWith("x-meridian-")),
+    }
     upstreamCalls.push(call)
     return Promise.resolve(respond(call, upstreamCalls.length - 1))
   }
@@ -132,6 +142,17 @@ function snapshotPoolDir() {
   return { bytes: readFileSync(poolPath), entries: readdirSync(poolDir).sort() }
 }
 
+// The hook settings routes answer only a management client; with no API key
+// that is a request on this machine to its loopback address.
+const LOOPBACK_PEER = { incoming: { socket: { remoteAddress: "127.0.0.1" } } }
+function hookRoute(app: { fetch: (request: Request, env?: unknown) => Response | Promise<Response> }, method: string, path: string, body?: unknown) {
+  return app.fetch(new Request(`http://127.0.0.1${path}`, {
+    method,
+    headers: { host: "127.0.0.1:3456", ...(body === undefined ? {} : { "content-type": "application/json" }) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  }), LOOPBACK_PEER)
+}
+
 async function server(mode: string | undefined, plugin?: string) {
   if (mode === undefined) delete process.env.MERIDIAN_CHATGPT_CREDENTIALS
   else process.env.MERIDIAN_CHATGPT_CREDENTIALS = mode
@@ -157,6 +178,22 @@ const LUNA = {
   input: [{ role: "developer", content: "You are opencode." }, { role: "user", content: "hi" }],
   prompt_cache_key: "conversation-1", // gitleaks:allow - a conversation id, not a credential
 }
+
+const ATTRIBUTION_HEADERS = {
+  "x-meridian-client": "voice-ai/0.9.3",
+  "x-meridian-installation": "verify-client-id",
+  "x-meridian-device": "m4max",
+  "x-meridian-purpose": "test",
+  "x-meridian-session": "verify-1",
+  "x-meridian-source": "gateway-test",
+  "x-meridian-future-metadata": "local-only",
+} as const
+
+const ATTRIBUTION = {
+  client: { name: "voice-ai", version: "0.9.3", installation: "verify-client-id", device: "m4max" },
+  purpose: "test",
+  requestSource: "gateway-test",
+} as const
 
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "chatgpt-gateway-"))
@@ -186,7 +223,7 @@ afterEach(() => {
   __setFetchOAuthUsageOverride(null)
   saveSettings({
     chatGptActiveSeat: undefined, chatGptProfileNames: undefined, chatGptProfileAliases: undefined, profileOrder: undefined,
-    routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined, routingHeldProfiles: undefined, usageReserves: undefined, chatgpt: undefined,
+    routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined, routingHeldProfiles: undefined, usageReserves: undefined, chatgpt: undefined, hooks: undefined, publicUrl: undefined,
   })
   globalThis.fetch = realFetch
   delete process.env.MERIDIAN_CHATGPT_CREDENTIALS
@@ -203,10 +240,10 @@ afterAll(() => {
 })
 
 describe("ChatGPT gateway routing", () => {
-  it("serves a GPT model from the seat's token, adapting only what the backend requires", async () => {
+  it("serves a GPT model from the seat's token and keeps client attribution local", async () => {
     writePool([account(0), account(1)])
     const { app } = await server("follow-external")
-    const res = await app.fetch(responses(LUNA))
+    const res = await app.fetch(responses(LUNA, ATTRIBUTION_HEADERS))
     expect(res.status).toBe(200)
     expect(res.headers.get("set-cookie")).toBeNull()
     expect(await res.text()).toContain('"delta":"pong"')
@@ -215,11 +252,16 @@ describe("ChatGPT gateway routing", () => {
     const [call] = upstreamCalls
     expect(call!.authorization).toBe("Bearer at-0")
     expect(call!.accountId).toBe("workspace-0")
+    expect(call!.meridianHeaders).toEqual([])
     const { max_output_tokens: _dropped, ...client } = LUNA
     expect(call!.body).toEqual({ ...client, store: false, include: ["reasoning.encrypted_content"] })
 
-    const [metric] = telemetryStore.getRecent({ limit: 1 })
-    expect(metric).toMatchObject({ adapter: "chatgpt", requestModel: "gpt-6-luna", status: 200, isPassthrough: true, inputTokens: 40, cacheReadInputTokens: 10, outputTokens: 5 })
+    const recent = await app.fetch(new Request("http://localhost/telemetry/requests?limit=1"))
+    expect(recent.status).toBe(200)
+    expect(await recent.json()).toMatchObject([{
+      adapter: "chatgpt", requestModel: "gpt-6-luna", status: 200, isPassthrough: true,
+      inputTokens: 40, cacheReadInputTokens: 10, outputTokens: 5, ...ATTRIBUTION,
+    }])
   })
 
   it("aggregates the stream for a client that did not ask to stream", async () => {
@@ -246,6 +288,20 @@ describe("ChatGPT gateway routing", () => {
     }))
     expect(gptOnMessages.status).toBe(404)
     expect(upstreamCalls).toHaveLength(0)
+  })
+
+  it("rejects GPT on Chat Completions without sending client attribution upstream", async () => {
+    writePool([account(0)])
+    const { app } = await server("follow-external")
+    const res = await app.fetch(new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...ATTRIBUTION_HEADERS },
+      body: JSON.stringify({ model: LUNA.model, messages: [{ role: "user", content: "hi" }] }),
+    }))
+    expect(res.status).toBe(404)
+    expect(await res.json()).toMatchObject({ error: { type: "not_found_error" } })
+    expect(upstreamCalls).toHaveLength(0)
+    expect(sdkCalls).toBe(0)
   })
 
   it("serves an unlisted OpenAI model from ChatGPT, never from Claude", async () => {
@@ -320,18 +376,18 @@ describe("ChatGPT image generation", () => {
   const image = (extra: Record<string, string> = {}) => new Response(JSON.stringify({ created: 1, data: [{ b64_json: PNG_B64 }] }), {
     status: 200, headers: { "content-type": "application/json", "set-cookie": "must-not-leak=1", ...extra },
   })
-  const imagesRequest = (route: string, body: Record<string, unknown>) => new Request(`http://localhost${route}`, {
+  const imagesRequest = (route: string, body: Record<string, unknown>, headers: Record<string, string> = {}) => new Request(`http://localhost${route}`, {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: "Bearer any-client-key" },
+    headers: { "content-type": "application/json", authorization: "Bearer any-client-key", ...headers },
     body: JSON.stringify(body),
   })
   const GENERATE = { prompt: "a lighthouse at dusk", background: "opaque", model: "gpt-image-2", quality: "auto", size: "auto" }
 
-  it("generates an image on a seat's plan, passing the body and the answer through untouched", async () => {
+  it("generates an image on a seat's plan and keeps client attribution local", async () => {
     writePool([account(0), account(1)])
     respond = () => image()
     const { app } = await server("follow-external")
-    const res = await app.fetch(imagesRequest("/v1/images/generations", GENERATE))
+    const res = await app.fetch(imagesRequest("/v1/images/generations", GENERATE, ATTRIBUTION_HEADERS))
     expect(res.status).toBe(200)
     expect(res.headers.get("set-cookie")).toBeNull()
     expect(await res.json()).toEqual({ created: 1, data: [{ b64_json: PNG_B64 }] })
@@ -341,22 +397,25 @@ describe("ChatGPT image generation", () => {
     expect(call!.url).toBe(`${IMAGES_PREFIX}generations`)
     expect(call!.authorization).toBe("Bearer at-0")
     expect(call!.accountId).toBe("workspace-0")
+    expect(call!.meridianHeaders).toEqual([])
     expect(call!.body).toEqual(GENERATE)
     expect(sdkCalls).toBe(0)
 
     const [metric] = telemetryStore.getRecent({ limit: 1 })
-    expect(metric).toMatchObject({ adapter: "chatgpt", requestModel: "gpt-image-2", status: 200, mode: "non-stream" })
+    expect(metric).toMatchObject({ adapter: "chatgpt", requestModel: "gpt-image-2", status: 200, mode: "non-stream", ...ATTRIBUTION })
   })
 
-  it("sends reference images to the edits endpoint", async () => {
+  it("sends reference images to the edits endpoint and keeps client attribution local", async () => {
     writePool([account(0)])
     respond = () => image()
     const { app } = await server("follow-external")
     const edit = { ...GENERATE, images: [{ image_url: `data:image/png;base64,${PNG_B64}` }] }
-    const res = await app.fetch(imagesRequest("/v1/images/edits", edit))
+    const res = await app.fetch(imagesRequest("/v1/images/edits", edit, ATTRIBUTION_HEADERS))
     expect(res.status).toBe(200)
-    expect(upstreamCalls.map(call => call.url)).toEqual([`${IMAGES_PREFIX}edits`])
+    expect(upstreamCalls.map(call => [call.url, call.meridianHeaders])).toEqual([[`${IMAGES_PREFIX}edits`, []]])
     expect(upstreamCalls[0]!.body).toEqual(edit)
+    const [metric] = telemetryStore.getRecent({ limit: 1 })
+    expect(metric).toMatchObject({ adapter: "chatgpt", requestModel: "gpt-image-2", status: 200, ...ATTRIBUTION })
   })
 
   it("moves an image request past a seat whose plan is spent, and benches that seat", async () => {
@@ -636,16 +695,6 @@ describe("offered models follow the backend's catalog", () => {
 })
 
 describe("ChatGPT seats on the profile surface", () => {
-  it("health excludes a recorded dead login that the native seat source still calls eligible", async () => {
-    const rejected = account(0)
-    writePool([rejected, account(1)])
-    noteRefreshRejected(chatGptAuthLifecycleKey(rejected.accountUserId), { detail: "rejected" })
-    const { app } = await server("follow-external")
-
-    const response = await app.fetch(new Request("http://localhost/health"))
-
-    expect(await response.json()).toMatchObject({ chatgpt: { accounts: 2, eligible: 1, ready: 1, unavailable: { requires_reauth: 1 } } })
-  })
 
   type ListBody = { profiles: Array<Record<string, unknown>>; activeProfile: string | null; activeProfiles?: { claude: string | null; chatgpt: string | null } }
   type QuotaBody = { profiles: Array<{ id: string; type: string; isActive: boolean; windows: Array<{ type: string; utilization: number | null; resetsAt: number | null }>; windowsReported: string[] | null; windowSource: string | null; error: string | null; spent: unknown }>; activeProfile: string | null; activeProfiles?: { chatgpt: string | null } }
@@ -724,9 +773,16 @@ describe("ChatGPT seats on the profile surface", () => {
     saveSettings({ routingManagedExcludedProfiles: ["seat0-pace-0"] })
     expect((await post(app, "/profiles/active", { profile: "seat0-pace-0" })).status).toBe(409)
     expect((await post(app, "/profiles/active", { profile: "nobody" })).status).toBe(400)
+    // The supervisor's list keeps the seat out of unpinned work only; a pin is the user choosing it.
     const pinned = await app.fetch(responses(LUNA, { "x-meridian-profile": "seat0-pace-0" }))
-    expect(pinned.status).toBe(409)
-    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-1"])
+    expect(pinned.status).toBe(200)
+    await pinned.text()
+    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-1", "workspace-0"])
+
+    saveSettings({ routingManagedExcludedProfiles: [], routingExcludedProfiles: ["seat0-pace-0"] })
+    const refused = await app.fetch(responses(LUNA, { "x-meridian-profile": "seat0-pace-0" }))
+    expect(refused.status).toBe(409)
+    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-1", "workspace-0"])
 
     // A held seat is refused as held, not as excluded, so a supervisor can tell them apart.
     saveSettings({ routingManagedExcludedProfiles: [], routingHeldProfiles: ["seat1-pace-1"] })
@@ -750,14 +806,18 @@ describe("ChatGPT seats on the profile surface", () => {
     saveSettings({ routingManagedExcludedProfiles: ["seat1-pace-1"] })
     const before = snapshotPoolDir()
     const { app } = await server("follow-external")
-    const res = await post(app, "/profiles/seat1-pace-1/warm")
+    const res = await app.fetch(new Request("http://localhost/profiles/seat1-pace-1/warm", {
+      method: "POST", headers: ATTRIBUTION_HEADERS,
+    }))
     expect(res.status).toBe(200)
     await res.text()
     expect(upstreamCalls).toHaveLength(1)
     expect(upstreamCalls[0]!.authorization).toBe("Bearer at-1")
     expect(upstreamCalls[0]!.body).toMatchObject({ model: "gpt-6-luna", store: false, reasoning: { effort: "low" } })
     expect(upstreamCalls[0]!.body).not.toHaveProperty("max_output_tokens")
-    expect(telemetryStore.getRecent({ limit: 1 })[0]).toMatchObject({ adapter: "chatgpt", requestSource: "warm", profileId: "seat1-pace-1" })
+    const [warm] = telemetryStore.getRecent({ limit: 1 })
+    expect(warm).toMatchObject({ adapter: "chatgpt", requestSource: "warm", profileId: "seat1-pace-1", client: { name: "meridian" }, purpose: "warm" })
+    expect(warm?.clientSessionId).toBeUndefined()
     expect(tokenCalls).toBe(0)
     expect(snapshotPoolDir()).toEqual(before)
     expect((await post(app, "/profiles/nobody/warm")).status).toBe(404)
@@ -874,6 +934,180 @@ describe("ChatGPT seats on the profile surface", () => {
     }) : undefined
     return live
   }
+
+  function refusalCatalog(model = LUNA.model, effort = "low") {
+    catalog = () => Response.json({ models: [{
+      slug: model, visibility: "list", available_in_plans: ["pro"],
+      supported_reasoning_levels: [{ effort }],
+    }] })
+  }
+
+  const refusalCases = [
+    { name: "fresh quota", marker: "1", status: 429, upstream: 0 },
+    { name: "Sol xhigh", model: "gpt-6.2-sol", effort: "xhigh", marker: "1", status: 429, upstream: 0 },
+    { name: "Sol max", model: "gpt-6.2-sol", effort: "max", marker: "1", status: 429, upstream: 0 },
+    { name: "Astra high", model: "gpt-6.2-astra", effort: "high", marker: "1", status: 429, upstream: 0 },
+    { name: "Terra high", model: "gpt-6.1-terra", effort: "high", marker: "1", status: 429, upstream: 0 },
+    { name: "Luna Fast low", model: "gpt-6-luna-fast", effort: "low", marker: "1", status: 429, upstream: 0 },
+    { name: "managed weekly reserve", marker: "1", status: 429, upstream: 0, managed: "fresh" },
+    { name: "stale managed proof", marker: null, status: 503, upstream: 0, managed: "stale" },
+    { name: "partial managed proof", marker: null, status: 503, upstream: 0, managed: "partial" },
+    { name: "mixed managed reasons", marker: null, status: 503, upstream: 0, managed: "mixed" },
+    { name: "managed label with unknown usage", marker: null, status: 503, upstream: 0, managed: "unknown" },
+    { name: "revoked managed proof cannot replay", marker: null, status: 503, upstream: 0, managed: "revoked" },
+    { name: "a paid credit lane", marker: null, status: 200, upstream: 1, allowedCredits: true },
+    { name: "unknown allowed credits", marker: null, status: 429, upstream: 0, allowedCredits: true, creditReading: {} },
+    { name: "known empty allowed credits", marker: "1", status: 429, upstream: 0, allowedCredits: true,
+      creditReading: { has_credits: false, unlimited: false, overage_limit_reached: false, balance: "0" } },
+    { name: "an eligible loaner", marker: null, status: 200, upstream: 1, loaner: true },
+    { name: "a quota stamp masking near-expiry auth", marker: null, status: 429, upstream: 0, nearExpiry: true },
+    { name: "a model-specific cooldown", marker: null, status: 503, upstream: 0, modelCooldown: true },
+    { name: "a manual hold", marker: null, status: 503, upstream: 0, manual: true },
+    { name: "billing-capped credits", marker: null, status: 429, upstream: 0, allowedCredits: true,
+      creditReading: { has_credits: true, unlimited: false, overage_limit_reached: true, balance: "0" } },
+    { name: "an explicit seat pin", marker: null, status: 429, upstream: 0, pin: true },
+    { name: "CVP requirement", marker: null, status: 429, upstream: 0, cvp: true },
+    { name: "unadvertised effort", marker: null, status: 429, upstream: 0, effort: "unknown" },
+    { name: "unbound request", marker: null, status: 429, upstream: 0, unbound: true },
+    { name: "upstream lookalike", marker: null, status: 429, upstream: 1, forged: true },
+  ] as const
+
+  it.each(refusalCases.map(testCase => [testCase.name, testCase] as const))("only attests safe GPT refusals over HTTP: %s", async (_name, testCase) => {
+    const live = stampedSeatWithCredits()
+    const mixed = "managed" in testCase && testCase.managed === "mixed"
+    writePool([account(0, { accessToken: live, planType: "pro",
+    }),
+      ...("loaner" in testCase ? [account(1, { accessToken: seatToken(1), planType: "free" })] : []),
+      ...(mixed ? [account(1, { accessToken: seatToken(1), planType: "pro" })] : []),
+    ])
+    const model = "model" in testCase ? testCase.model : LUNA.model
+    const effort = "effort" in testCase ? testCase.effort : "low"
+    refusalCatalog(model, "model" in testCase ? testCase.effort : "low")
+    if ("allowedCredits" in testCase) saveSettings({ chatgpt: { creditsPolicy: "reserve" } })
+    if ("manual" in testCase) saveSettings({ routingHeldProfiles: ["seat0-pace-0"] })
+    if ("creditReading" in testCase) {
+      wham = url => url.endsWith("/wham/usage") ? Response.json({
+        user_id: "user-0", account_id: "workspace-0", plan_type: "pro",
+        rate_limit: { primary_window: { used_percent: 100, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 3600 } },
+        credits: testCase.creditReading,
+      }) : undefined
+    }
+    if ("managed" in testCase || "forged" in testCase) {
+      wham = (url, authorization) => {
+        if (!url.endsWith("/wham/usage")) return undefined
+        const n = authorization === `Bearer ${live}` ? 0 : 1
+        return Response.json({
+          user_id: `user-${n}`, account_id: `workspace-${n}`, plan_type: "pro",
+          ...("managed" in testCase && testCase.managed === "unknown" ? {} : { rate_limit: {
+            primary_window: { used_percent: 20, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 3600 },
+          } }),
+        })
+      }
+    }
+    const proxy = await server("follow-external")
+    const listener = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => proxy.app.fetch(request) })
+    try {
+      await (await realFetch(new URL("/v1/models", listener.url))).json()
+      await (await realFetch(new URL("/v1/usage/quota/all", listener.url))).json()
+      if ("nearExpiry" in testCase || "modelCooldown" in testCase) {
+        writePool([account(0, { accessToken: live, planType: "pro",
+          ...("nearExpiry" in testCase ? { expiresAt: Date.now() + 30_000, quotaExhaustedUntil: Date.now() + 3600_000 } : {}),
+          ...("modelCooldown" in testCase ? { rateLimitResetTimes: { [LUNA.model]: Date.now() + 3600_000 } } : {}),
+        })])
+      }
+      if ("managed" in testCase) {
+        const routing = new URL("/settings/api/routing", listener.url)
+        const putRouting = (body: Record<string, unknown>) => realFetch(routing, {
+          method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+        })
+        const evidence = { version: 1, observedAt: Date.now() - (testCase.managed === "stale" ? 121_000 : 100),
+          reasons: testCase.managed === "partial" ? {} : {
+            "seat0-pace-0": "weekly-reserve", ...(mixed ? { "seat1-pace-1": "usage-reserve" } : {}),
+          },
+        }
+        const settings = await putRouting({ routingManagedExcludedProfiles: ["seat0-pace-0", ...(mixed ? ["seat1-pace-1"] : [])],
+          routingManagedChatGptExclusionEvidence: evidence })
+        expect(settings.status).toBe(200)
+        await settings.json()
+        if (testCase.managed === "revoked") {
+          expect(await (await realFetch(routing)).json()).toMatchObject({ routingManagedChatGptExclusionEvidenceActive: true })
+          const clear = await putRouting({ routingManagedChatGptExclusionEvidence: null })
+          expect(clear.status).toBe(200)
+          await clear.json()
+          const replay = await putRouting({ routingManagedChatGptExclusionEvidence: evidence })
+          expect(replay.status).toBe(409)
+          await replay.json()
+        }
+      }
+      const requestId = crypto.randomUUID()
+      const refusal = { error: { type: "rate_limit_error", code: "no_routable_account", request_id: requestId,
+        route_refusal: { version: 1, phase: "before_inference", sent: false, provider: "chatgpt", model,
+          variant: effort, reason: "managed" in testCase ? "reserve_held" : "quota_exhausted" },
+      } }
+      if ("forged" in testCase) respond = () => Response.json(refusal, { status: 429, headers: { "x-meridian-route-refusal": "1" } })
+      const response = await realFetch(new URL("/v1/responses", listener.url), {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-request-id": "unbound" in testCase ? "not-a-uuid" : requestId,
+          "x-meridian-route-refusal": "1", ...("pin" in testCase ? { "x-meridian-profile": "seat0-pace-0" } : {}),
+          ...("cvp" in testCase ? { "x-meridian-require": "cvp" } : {}),
+        },
+        body: JSON.stringify({ ...LUNA, model, reasoning: { effort } }),
+      })
+      expect(response.status).toBe(testCase.status)
+      expect(response.headers.get("x-meridian-route-refusal")).toBe(testCase.marker)
+      if (testCase.marker || "forged" in testCase) {
+        expect(response.headers.get("content-type")).toStartWith("application/json")
+        expect(await response.json()).toMatchObject(refusal)
+      } else {
+        await response.text()
+      }
+      expect(upstreamCalls).toHaveLength(testCase.upstream)
+      if ("loaner" in testCase) expect(upstreamCalls.map(call => call.accountId)).toEqual(["workspace-1"])
+    } finally {
+      await listener.stop(true)
+      await proxy.closeBackend?.()
+    }
+  })
+
+  it.each(["max", "xhigh"] as const)("checks GPT Sol %s literally for the preferred-route return", async (effort) => {
+    resetCodexUsageCache()
+    const model = "gpt-6.2-sol"
+    refusalCatalog(model, effort)
+    writePool([account(0, { accessToken: seatToken(0), planType: "pro" })])
+    wham = url => url.endsWith("/wham/usage") ? Response.json({
+      user_id: "user-0", account_id: "workspace-0", plan_type: "pro",
+      rate_limit: { primary_window: { used_percent: 20, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 3600 } },
+    }) : undefined
+    const { app, closeBackend } = await server("follow-external")
+    const listener = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => app.fetch(request) })
+    try {
+      await (await realFetch(new URL("/v1/models", listener.url))).json()
+      await (await realFetch(new URL("/v1/usage/quota/all", listener.url))).json()
+      const usageCallsBefore = whamCalls.length
+      const clock = Date.now
+      const check = async (variant: string, available: boolean, headers?: Record<string, string>) => {
+        const url = new URL("/profiles/route-availability", listener.url)
+        url.search = new URLSearchParams({ provider: "chatgpt", model, variant }).toString()
+        const response = await realFetch(url, { headers })
+        expect(response.headers.get("cache-control")).toBe("no-store")
+        expect(await response.json()).toMatchObject({ version: 1, provider: "chatgpt", model, variant, available })
+      }
+      await check(effort, true)
+      await check(effort === "max" ? "xhigh" : "max", false)
+      await check("default", false)
+      await check(effort, false, { "x-meridian-profile": "seat0-pace-0" })
+      await check(effort, false, { "x-meridian-require": "cvp" })
+      Date.now = () => clock() + 31_000
+      try { await check(effort, false) } finally { Date.now = clock }
+      writePool([account(0, { accessToken: seatToken(0, Math.floor(NOW / 1000) + 7200), planType: "pro" })])
+      await check(effort, false)
+      expect(whamCalls).toHaveLength(usageCallsBefore)
+      expect(upstreamCalls).toEqual([])
+    } finally {
+      await listener.stop(true)
+      await closeBackend?.()
+    }
+  })
   type CreditsQuota = { profiles: Array<{ id: string; credits: { balance: number | null } | null; creditsPolicy: string | null; creditsPolicySource: string | null; planSpent: boolean; servingOnCredits: boolean }> }
 
   it("serves a seat the owner stamped as spent on its Codex credits under the reserve policy, and says so on its card", async () => {
@@ -1133,7 +1367,9 @@ describe("owned mode signs its own seats in", () => {
     try {
       const startedRes = await post(proxy.app, "/profiles/chatgpt/connect/start", {})
       const started = await startedRes.json() as { connectId: string; authorizeUrl: string; announcements: unknown[] }
-      expect(started.announcements).toEqual([{ target: "command cat", ok: true, detail: "laptop: forwarding 127.0.0.1:1455" }])
+      // What the command printed stays in the log; the response carries its status.
+      expect(started.announcements).toEqual([{ target: "command MERIDIAN_HOOK_COMMAND", ok: true, detail: "exit 0" }])
+      expect(JSON.stringify(started)).not.toContain("laptop")
       const listening = JSON.parse(readFileSync(events, "utf8").trim()) as { event: string; callback: { id: string; url: string; redirect: { port: number } } }
       expect(listening).toMatchObject({ event: "oauth.callback.listening", callback: { redirect: { port: 1455 } } })
       expect(listening.callback.url).toBe(`https://meridian.example/callback/${listening.callback.id}`)
@@ -1167,25 +1403,95 @@ describe("owned mode signs its own seats in", () => {
     }
   })
 
-  it("keeps hook settings behind validation and reports the environment's targets by label only", async () => {
+  it("keeps hook settings behind validation and names every target by a fixed label only", async () => {
     process.env.MERIDIAN_HOOK_COMMAND = "TOKEN=secret-value /opt/bin/vibeterm-oauth-relay --flag"
     const proxy = await server("owned")
     try {
-      const put = (body: unknown) => proxy.app.fetch(new Request("http://localhost/settings/api/hooks", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }))
+      const put = (body: unknown) => hookRoute(proxy.app, "PUT", "/settings/api/hooks", body)
       expect((await put({ hooks: { webhooks: [{ url: "ftp://x" }] } })).status).toBe(400)
       expect((await put({ publicUrl: "https://u:p@host.example" })).status).toBe(400)
       expect((await put({ hooks: { webhooks: [{ url: "https://hooks.example/a" }] }, publicUrl: "https://meridian.example/" })).status).toBe(200)
-      const text = await (await proxy.app.fetch(new Request("http://localhost/settings/api/hooks"))).text()
+      const text = await (await hookRoute(proxy.app, "GET", "/settings/api/hooks")).text()
       expect(text).not.toContain("secret-value")
+      expect(text).not.toContain("oauth-relay")
       expect(JSON.parse(text)).toMatchObject({
         saved: { webhooks: [{ url: "https://hooks.example/a" }] },
-        environment: { webhook: null, command: "command vibeterm-oauth-relay" },
+        environment: { webhook: null, command: "command MERIDIAN_HOOK_COMMAND" },
         publicUrl: { saved: "https://meridian.example", env: null, effective: "https://meridian.example" },
       })
       expect((await put({ hooks: {}, publicUrl: null })).status).toBe(200)
       expect(getSetting("publicUrl")).toBeUndefined()
     } finally {
       delete process.env.MERIDIAN_HOOK_COMMAND
+    }
+  })
+
+  it("never lets HTTP create, edit, remove, read or run a command target", async () => {
+    const marker = join(dir, "command-ran")
+    const proxy = await server("owned")
+    try {
+      saveSettings({ hooks: { commands: [{ command: `TOKEN=saved-secret touch '${marker}'`, events: ["oauth.callback.closed", "hooks.test"] }] } })
+      const saved = getSetting("hooks")?.commands
+      const put = (body: unknown) => hookRoute(proxy.app, "PUT", "/settings/api/hooks", body)
+      expect((await put({ hooks: { commands: [] } })).status).toBe(403)
+      expect((await put({ hooks: { webhooks: [], commands: [{ command: "true" }] } })).status).toBe(403)
+      expect(getSetting("hooks")?.commands).toEqual(saved)
+      // Saving webhooks, or nothing, keeps the operator's commands.
+      expect((await put({ hooks: { webhooks: [{ url: "https://hooks.example/b" }] } })).status).toBe(200)
+      expect((await put({ hooks: {} })).status).toBe(200)
+      expect(getSetting("hooks")?.commands).toEqual(saved)
+
+      const listed = await (await hookRoute(proxy.app, "GET", "/settings/api/hooks")).text()
+      expect(listed).not.toContain("saved-secret")
+      expect(listed).not.toContain(marker)
+      expect(JSON.parse(listed).commands).toEqual([{ target: "command #1", events: ["oauth.callback.closed", "hooks.test"] }])
+
+      // The test action reaches webhooks only, even a command that lists hooks.test.
+      const tested = await (await hookRoute(proxy.app, "POST", "/settings/api/hooks/test")).json() as { deliveries: unknown[] }
+      expect(tested.deliveries).toEqual([])
+      expect(existsSync(marker)).toBe(false)
+
+      // Writers of other settings cannot set hooks either.
+      for (const path of ["/settings/api/routing", "/settings/api/telemetry"]) {
+        await proxy.app.fetch(new Request(`http://localhost${path}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ hooks: { commands: [{ command: "true" }] }, publicUrl: "https://elsewhere.example" }),
+        }))
+      }
+      expect(getSetting("hooks")?.commands).toEqual(saved)
+      expect(getSetting("publicUrl")).toBeUndefined()
+    } finally {
+      saveSettings({ hooks: undefined })
+    }
+  })
+
+  it("answers hook settings only to a management client", async () => {
+    const proxy = await server("owned")
+    const attempt = (headers: Record<string, string>, peer: string | undefined) => Promise.all([
+      proxy.app.fetch(new Request("http://127.0.0.1/settings/api/hooks", { headers }), peer ? { incoming: { socket: { remoteAddress: peer } } } : undefined),
+      proxy.app.fetch(new Request("http://127.0.0.1/settings/api/hooks", { method: "PUT", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ publicUrl: "https://elsewhere.example" }) }), peer ? { incoming: { socket: { remoteAddress: peer } } } : undefined),
+      proxy.app.fetch(new Request("http://127.0.0.1/settings/api/hooks/test", { method: "POST", headers }), peer ? { incoming: { socket: { remoteAddress: peer } } } : undefined),
+    ]).then(responses => responses.map(response => response.status))
+    try {
+      // No API key configured: only this machine, at its loopback address.
+      expect(await attempt({ host: "127.0.0.1:3456" }, "127.0.0.1")).toEqual([200, 200, 200])
+      expect(await attempt({ host: "localhost:3456" }, "::1")).toEqual([200, 200, 200])
+      expect(await attempt({ host: "127.0.0.1:3456" }, "192.168.1.20")).toEqual([403, 403, 403])
+      expect(await attempt({ host: "127.0.0.1:3456" }, undefined)).toEqual([403, 403, 403])
+      expect(await attempt({ host: "meridian.example" }, "127.0.0.1")).toEqual([403, 403, 403])
+      expect(await attempt({ host: "127.0.0.1:3456", "x-forwarded-for": "203.0.113.9" }, "127.0.0.1")).toEqual([403, 403, 403])
+      expect(await attempt({ host: "127.0.0.1:3456", origin: "https://elsewhere.example" }, "127.0.0.1")).toEqual([403, 403, 403])
+      saveSettings({ publicUrl: undefined })
+
+      // With a key, the key is the authentication, from anywhere.
+      process.env.MERIDIAN_API_KEY = "test-management-key"
+      expect(await attempt({ host: "meridian.example" }, "192.168.1.20")).toEqual([401, 401, 401])
+      expect(await attempt({ host: "meridian.example", "x-api-key": "test-management-key" }, "192.168.1.20")).toEqual([200, 200, 200])
+      expect(await attempt({ host: "meridian.example", "x-api-key": "test-management-key", origin: "https://elsewhere.example" }, "192.168.1.20")).toEqual([403, 403, 403])
+    } finally {
+      delete process.env.MERIDIAN_API_KEY
+      saveSettings({ publicUrl: undefined })
     }
   })
 
@@ -1428,31 +1734,27 @@ describe("owned mode signs its own seats in", () => {
         const listed = async () => {
           await proxy.app.fetch(new Request("http://localhost/v1/usage/quota/all"))
           const list = await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as {
-            profiles: Array<{ seat?: string; loggedIn: boolean; tokenState?: string; firstUnauthedAt?: number | null }>
+            profiles: Array<{ seat?: string; loggedIn: boolean; tokenState?: string; firstUnauthedAt?: number | null; renewals?: unknown[] }>
           }
           return list.profiles.find(p => p.seat === seat)!
         }
-        const kinds = () => (authLifecycleFor(chatGptAuthLifecycleKey(seat))?.events ?? []).map(e => e.kind)
         expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok" })
 
         const pass = proxy.chatGpt!.renewDue()
         while (!started) await new Promise(resolve => setTimeout(resolve, 5))
         expect(JSON.parse(readFileSync(storePath, "utf8")).accounts[0].exchangeStartedAt).not.toBeNull()
-        expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok" })
-        expect(kinds()).toEqual([])
+        expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok", renewals: [] })
 
         if (ending === "renewed") {
           answer(Response.json({ access_token: token(Date.now()), refresh_token: "rt-renewed", expires_in: 10 * 86_400 }))
           expect(await pass).toBe(true)
-          expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok" })
-          expect(kinds()).toEqual([])
+          expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok", renewals: [{ outcome: "rotated" }] })
         } else {
           answer(new Response(JSON.stringify({ error: { code: "refresh_token_reused" } }), { status: 401, headers: { "content-type": "application/json" } }))
           expect(await pass).toBe(false)
-          expect(await listed()).toMatchObject({ loggedIn: false, tokenState: "requires_reauth" })
-          const events = authLifecycleFor(chatGptAuthLifecycleKey(seat))!.events
-          expect(events.map(e => e.kind)).toEqual(["logged_out"])
-          expect(events[0]).toMatchObject({ reason: "refresh_rejected", detail: "rejected: refresh token already used" })
+          const after = await listed()
+          expect(after).toMatchObject({ loggedIn: false, tokenState: "requires_reauth" })
+          expect(after.renewals).toEqual([{ at: expect.any(Number), outcome: "refused", cause: "refresh token already used" }])
         }
       } finally {
         proxy.chatGpt!.release()
@@ -1511,7 +1813,6 @@ describe("owned mode signs its own seats in", () => {
       const after = await listed()
       expect(after).toMatchObject({ loggedIn: true, tokenState: "ok" })
       expect(after.renewalRetryAt ?? null).toBeNull()
-      expect(authLifecycleFor(chatGptAuthLifecycleKey(seat))!.events.at(-1)).toMatchObject({ kind: "recovered", detail: "renewed after its access token was refused" })
     } finally {
       proxy.chatGpt!.release()
     }
@@ -1566,8 +1867,10 @@ describe("owned mode signs its own seats in", () => {
       accountUserId: `user-${n}__workspace-${n}`, accountId: `workspace-${n}`, email: `s${n}@example.test`,
       refreshToken: `rt-${n}`, accessToken: signedIn, expiresAt, tokenRotatedAt: NOW, exchangeStartedAt: null,
     })
-    writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [seat(0, Date.now() + 3_600_000)] }), { mode: 0o600 })
+    const history = [{ at: NOW, outcome: "kept", expiresAt: NOW + 3_600_000 }]
+    writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [{ ...seat(0, Date.now() + 3_600_000), renewals: history }] }), { mode: 0o600 })
     const before = readFileSync(storePath, "utf8")
+    saveSettings({ chatgpt: { seatRenewalHours: { "user-0__workspace-0": 6 } } })
     let refreshes = 0
     const serve = globalThis.fetch
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -1588,7 +1891,10 @@ describe("owned mode signs its own seats in", () => {
         const res = await post(proxy.app, path, { profile: "s0-kspace-0" })
         expect([path, res.status]).toEqual([path, 403])
       }
+      // Its own renewal interval long past, the seat is still not renewed here.
       expect(await proxy.chatGpt!.renewDue()).toBe(false)
+      const listed = await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as { profiles: Array<{ seat?: string; renewalHours?: number | null; renewals?: unknown[] }> }
+      expect(listed.profiles.find(p => p.seat === "user-0__workspace-0")).toMatchObject({ renewalHours: 6, renewals: history })
 
       // A token the owner has not renewed is not renewed here either.
       writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [seat(0, Date.now() - 1000)] }), { mode: 0o600 })

@@ -6,6 +6,8 @@ import { ClaudeProviderFacts, disabledProvider, providerSnapshot } from './backe
 import { chatGptProvider, CHATGPT_ADAPTER } from './backends/chatgptStatus'
 import { chatGptVerdict, combineBackendVerdicts, type BackendStatus } from './chatgpt/health'
 import { createChatGptBackend, type ChatGptSeatCreditState, type ChatGptSeatRefusal, type ChatGptTurnEvent, type ObservedSeatLimits } from './backends/chatgpt'
+import { internalClientAttributionHeaders, meridianWarmAttribution, readClientAttribution, readClientSessionId } from "./clientIdentity"
+import { sanitizeClaudeEgressEnv } from "./claudeEgress"
 import { resolveChatGptSource } from './chatgpt/config'
 import { startRenewalSchedule } from './chatgpt/owned'
 import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, createUnpricedModelWarning, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
@@ -15,11 +17,16 @@ import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
 import { computeSummary } from '../telemetry/percentiles'
 import { CATALOG_CLIENT_VERSION, chatGptModelList, createChatGptModelCatalog, type CatalogModel } from './chatgpt/catalog'
+import { createHash } from 'node:crypto'
+import { claudeReturnUsage, isExactClaudeWireModel, routeAvailability } from './routeAvailability'
+import { freshPlanExhaustion } from './freshPlanExhaustion'
+import { capacityObservationIsFresh, parseManagedExclusionEvidence, type ManagedExclusionEvidence } from './managedExclusionEvidence'
+import { CHATGPT_MANAGED_PROTECTION_REASONS, chatGptRefusalPoolKey, proveChatGptRouteRefusal } from './chatgpt/routeRefusal'
 import { createCodexClientVersion } from './chatgpt/clientVersion'
 import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
-import { chatGptNameProblem, type ChatGptProfile } from './chatgpt/profiles'
+import { chatGptNameProblem, seatWindows, type ChatGptProfile } from './chatgpt/profiles'
 import { applyChatGptRemoval, applyChatGptRename } from './chatgpt/seatOps'
-import { getCodexUsage } from './codex/service'
+import { currentCodexUsageEvidence, getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, isImageEndpoint, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
 import { createClaudeBackend } from './upstream/claude'
@@ -30,6 +37,7 @@ import { cors } from "hono/cors"
 import { stream } from "hono/streaming"
 import { serve, createAdaptorServer } from "@hono/node-server"
 import { getConnInfo } from "@hono/node-server/conninfo"
+import { z } from "zod"
 import { socketActivationFd, parseIdleExitSeconds, isModelRequestPath } from "./socketActivation"
 import type { Server } from "node:http"
 import { hostname } from "node:os"
@@ -39,13 +47,15 @@ import { query } from "@anthropic-ai/claude-agent-sdk"
 import { rateLimitStore } from "./rateLimitStore"
 import { guardUpstreamIdle, UpstreamIdleError, type LateIdleDeadline } from "./streamIdleGuard"
 import { IdleStallCeilingError, IdleStallTracker, idleStallRequestKey } from "./idleStallCeiling"
+import { resolveSessionGcLimits } from "./sessionGcLimits"
 import { isClientStop, linkRequestAbort, type RequestAbortLink } from "./requestAbort"
 import { processSessionTree, truncateSessionKey, type SessionTreeRegistration } from "./sessionTree"
 import {
   CacheKeepaliveScheduler,
   cacheKeepaliveAccountBlock,
   classifyCacheTier,
-  resolveCacheKeepaliveEnabled,
+  resolveCacheKeepaliveMode,
+  resolveCacheKeepaliveMaxBeats,
   resolveCacheKeepaliveMaxInFlight,
   type CacheTierUsage,
 } from "./cacheKeepalive"
@@ -57,13 +67,13 @@ import {
   type CacheKeepaliveRecipe,
 } from "./cacheKeepaliveRunner"
 import { AbortableSemaphore, getProcessSdkSemaphore, type SemaphoreLease } from "./concurrency"
-import { InflightRegistry, isLoopbackPeer, onResponseDone, type InflightHandle } from "./inflight"
+import { InflightRegistry, isLoopbackHost, isLoopbackPeer, onResponseDone, type InflightHandle } from "./inflight"
 import { plog, setProxyDiagnosticSink, setProxyLogSilent } from "./operationalLog"
 import { AdmissionHold, parseDrainOptions, type AdmissionReservation } from "./admissionHold"
 import { DrainBodyError, readDrainBody } from "./drainBody"
 import { isGenerationSubmission, onGenerationResponseSettled } from "./generationAdmission"
 import { closeServerWithGracePeriod, joinShutdownCleanup, ShutdownProgress, trackServerConnections, waitForShutdownIdle, withShutdownDeadline } from "./shutdown"
-import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage, clearOAuthUsageForProfile, quotaResetBody, redeemOAuthQuotaResetOnce } from "./oauthUsage"
+import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage, peekSuccessfulOAuthUsage, clearOAuthUsageForProfile, quotaResetBody, redeemOAuthQuotaResetOnce } from "./oauthUsage"
 import { isSameOriginRequest } from "../sameOrigin"
 import { resolveSdkWorkingDirectory } from "./cwd"
 import type { Context } from "hono"
@@ -104,6 +114,9 @@ import { parseToolInputObject } from "./toolInputJson"
 import { createPassthroughMcpServer, sharedPassthroughMcpServer, sharedToolList, createPassthroughReplayToolNameRenderer, resolveClientToolName, normalizeToolInput, hasRepairableToolInput, computeToolSetKey, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, passthroughMcpPrefix, resolveAutoDeferDecision, clientOwnsToolSearch, sdkOwnsPrefixedToolSearch, referencedToolNames, clientSearchRegistrationTools } from "./passthroughTools"
 import { describeLocalBootIdentity } from "./session/processIncarnation"
 import { openCodePrimaryAgentContextHash, requiresOpenCodeAgentReplay } from "./adapters/opencodeAgentContext"
+import { openCodeInstructionSections } from "./adapters/opencodeInstructionSections"
+import { PendingSystemPromptResets, requestsSystemPromptReset, SYSTEM_PROMPT_RESET_HEADER } from "./systemPromptReset"
+import { hasInstructionSectionChange, instructionSectionState, planInstructionSections, renderInstructionSectionReminder } from "./session/instructionSections"
 import { getOpenCodeSourceFeatureOverrides } from "./adapters/opencodeSourceFeatures"
 import { detectServerTools, serverToolErrorMessage } from "./tools"
 import { isSdkToolSearchCall, clientAbortDisposition, coalesceCompleteToolResultContinuation, createEarlyStopTracker, isClientForwardedToolUse, noteAssistantMessage, noteUserContent, settledToolCallAssistantUuid, settlesCheckpointThenContinues, shouldEarlyStop, trackerCoversStreamedCalls } from "./passthroughEarlyStop"
@@ -118,8 +131,8 @@ import type { RequestMetric } from "../telemetry"
 import { assistantRefusalOf, type AssistantRefusal, canRecoverCapturedToolUses, uncapturedRecoveryVeto, streamedToolBlockVeto, cliRejectedToolResults, type StreamedToolBlockRecord, type UncapturedDeliveryVeto, classifyError, extractSdkTermination, formatSdkTermination, classifyResumeRefusal, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError, isAccountFailoverError, isQuotaRefusal, isOutputTokenCapExceeded } from "./errors"
 import { createSseRelayStream, relayStreamAttempt } from "./sseFailureSniff"
 import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, readStoredCredentialSnapshot, getAuthRenewalStatus, getStoredPlanFields, renewalStatusFor, resolveRenewalWarnDays, type CredentialStore, type StoredPlanFields, type AuthRenewalStatus } from "./tokenRefresh"
-import { describeAuthLifecycleEvent, noteCredentialObserved, noteProviderAccepted, onAuthLifecycleTransition, type AuthLifecycleTransition } from "./authLifecycle"
-import { noteClaudeAuthenticationFailure, profileLoginState, reconcileClaudeProfileAuth } from "./profileLoginState"
+import { authLifecycleFor, authLifecycleLoggedOut, describeAuthLifecycleEvent, observeCredentialInBackground, onAuthLifecycleTransition, type AuthLifecycleTransition } from "./authLifecycle"
+import { profileLoginState, reconcileClaudeProfileAuth } from "./profileLoginState"
 import { planAllowance } from "./planAllowance"
 import { isCredentialsReadOnly, logCredentialsModeBanner } from "./credentialsMode"
 import { runtimeCancelWarning } from "./runtimeCancelWarning"
@@ -140,18 +153,20 @@ import { buildRuntime } from "./buildRuntime"
 import { checkPluginsNow, getLatestVersion, isUpdateCheckEnabled, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
 import { getPluginUpdates, trackPlugins } from "./pluginUpdateCheck"
 import { createAuthStatusOwner } from "./authStatusOwnership"
-import { mapModelToClaudeModel, claudeModelFamily, type ClaudeModelFamily, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, isExtendedContextKnownUnavailable, subscriptionIncludesExtendedContext } from "./models"
+import { mapModelToClaudeModel, claudeModelFamily, type ClaudeModelFamily, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, recheckClaudeAuthStatus, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, isExtendedContextKnownUnavailable, subscriptionIncludesExtendedContext } from "./models"
 import { livenessReport, readinessReport, renderProbe } from "./probes"
 import { UpstreamReachability, DEFAULT_OVERRIDE_TTL_MS, MAX_OVERRIDE_TTL_MS, unreachableDetail, withReachability } from "./upstreamReachability"
 import { resolveReachabilityThresholds } from "./upstreamReachabilityConfig"
 import type { AnthropicSseEvent } from "./openai"
 import { translateOpenAiToAnthropic, translateAnthropicToOpenAi, buildModelList, createSseTranslator, translateAnthropicSseError } from "./openai"
+import { accountModelReadDue, accountModelsState, accountOffersModelEffort, clearAccountModels, fetchAccountModels, toAccountModelList, type AccountModel } from "./accountModels"
+import { cvpAccessFor, cvpReadingBody, cvpAccessOn, lastClaudeAiReadingAt, cvpActive, cyberVerificationField, cyberVerificationOf, forgetCvpAccess, isCvpModelId, normalizeCvpModel, parseRoutingRequirements, recordCvpReading, routingRequireOf, recordCvpRefusal, ROUTING_REQUIRE_HEADER, setCvpOrganizationLookup, type CyberVerificationField } from "./cvpAccess"
 import { normalizeJcodeSessionId } from "./adapters/jcode"
 import { extractLettaConversationId, LETTA_CONVERSATION_HEADER } from "./adapters/letta"
 import { isClaudeCodeClient } from "./adapters/claudecode"
 import { openAiAdapter, deriveToolLoopSessionId, SYNTHESIZED_SESSION_HEADER } from "./adapters/openai"
 import { translateResponsesToAnthropic, translateAnthropicToResponses, createResponsesSseTranslator, reasoningRequested, buildResponsesToolAliases, resolveCodexThreadIdentity, type ResponsesRequest, type AnthropicSseEvent as ResponsesAnthropicSseEvent } from "./openaiResponses"
-import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages, coalesceTrailingSystemReminders, layoutReplayBlocks, type ReplayPart } from "./replay"
+import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages, coalesceTrailingSystemReminders, withTrailingText, layoutReplayBlocks, type ReplayPart } from "./replay"
 import { unstreamedAssistantBlockFrames } from "./unstreamedAssistant"
 import { extractAdvisorModel, extractSystemText, getLastUserMessage, stripAdvisorTools, stripNonStandardStreamFields, MULTIMODAL_TYPES, buildToolUseIndex, frameReplayTurns } from "./messages"
 import { requireAuth, authEnabled } from "./auth"
@@ -160,6 +175,7 @@ import { rootSessionIdOf } from "./adapter"
 import { buildQueryOptions, isCliThinkingDisplay, promptCachingDisabled, passthroughThinking, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
 import { resolveTranscriptRetention } from "./transcriptRetention"
 import {
+  canonicalConfigDir,
   cleanupDue,
   createTranscriptSweep,
   DEFAULT_TRANSCRIPT_SWEEP_INTERVAL_MS,
@@ -182,14 +198,14 @@ import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
 import { authKeepaliveTargets, resolveProfile, unknownPinnedProfile, unknownProfileResponse, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, hasProfiles, restoreActiveProfile, invalidateDiskProfileCache, shareableCredentialDir, resetActiveProfile, type ProfileConfig, type ResolvedProfile } from "./profiles"
 import { applyProfileRemove } from "./profileRemove"
-import { adoptedProfiles, followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
+import { adoptedProfiles, followStatus, isFollowEnabled, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
 import { createChatGptLogin } from "./chatgpt/login"
 import { createHookDispatcher, HOOK_EVENTS, HOOK_LIMITS, hookTargetLabel, parseHookSettings, resolveHookTargets } from "./hooks"
 import { createOAuthCallbackRegistry, normalizePublicUrl, requestPublicOrigin } from "./oauthCallbacks"
 import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
 import { filterEligibleProfileIds, mergeRoutingExcludedProfiles, parseRoutingExcludedProfiles } from "./routingExclusions"
-import { canonicalRoutingExcludedProfileIds, evaluateRoutingProfileAccess, noEligibleProfilesResponse, profileExcludedResponse, profileHeldResponse, replacementForExcludedActive } from "./routingExclusionRuntime"
+import { canonicalRoutingExcludedProfileIds, evaluateRoutingProfileAccess, noEligibleProfilesResponse, profileExcludedResponse, profileHeldResponse, profileNoCvpResponse, replacementForExcludedActive } from "./routingExclusionRuntime"
 import {
   describeUsageReserveHold,
   newestClaudeWindows,
@@ -207,6 +223,9 @@ import { activateProfile } from "./profileActivation"
 import { organizationNames, organizationNeedsRefresh, organizationRecordCurrent, organizationLookupEnabled, refreshOrganizationNameSoon, refreshOrganizationNow, type OrganizationRecord } from "./organizationName"
 import { findDuplicateProfiles, type IdentifiedProfile } from "./duplicateProfiles"
 import { ProfileFactsRefresh } from "./profileFactsRefresh"
+import { describeActivationRefusal, forcedProfileFor, liveForcedProfile, parseRoutingManagedReasons, withoutForcedProfile, type ActivationRefusal, type ActivationRefusalKind, type ForcedProfile } from "./forcedProfile"
+import { UsageRefreshGate, claudeRefreshNote, openedWindowTypes, usageReadState } from "./usageRefresh"
+import { SKIPPED_WITHOUT_LOGIN, accountChanged, claudeLoginPart, cvpPart, modelsPart, seatLoginPart, tooSoonPart, type RefreshPart, type RefreshPartState } from "./profileRefresh"
 import {
   getRoutingMode,
   classifyRouteKind,
@@ -215,6 +234,7 @@ import {
   resolvePriorityOrder,
   choosePriorityProfile,
   chooseActivePriorityCandidates,
+  lastMappedProfile,
   isPoolRouting,
   ACTIVE_PRIORITY,
   ROUTING_MODES,
@@ -227,6 +247,7 @@ import {
   perModelRefusalFamily,
   parseWeeklyReserves,
   WeeklyReserveTracker,
+  weeklyReserveHolds,
   drawsExtraUsage,
   getClaudeExtraUsagePolicy,
   orderForExtraUsage,
@@ -277,6 +298,7 @@ import {
   reconcileReturnedSessionUuids,
   inheritSdkUuids,
   independentRequestCause,
+  auxiliaryLineage,
   formatDivergence,
   type LineageResult,
   type TokenUsageIteration,
@@ -440,6 +462,7 @@ const SHUTDOWN_CLEANUP_SLOW_MS = 2_000
 
 interface RequestMeta {
   requestId: string
+  readonly clientSessionId?: string
   endpoint: string
   queueEnteredAt: number
   sessionQueueWaitMs: number
@@ -882,6 +905,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     authOwner.run(() => getClaudeAuthStatusAsync(profileId, envOverrides))
   const finalConfig = resolveBackendConfig(config)
   const claudeProviderFacts = new ClaudeProviderFacts()
+  setCvpOrganizationLookup(() => Object.fromEntries(Object.entries(organizationNames()).map(([id, record]) => [id, record.organizationUuid ?? null])))
+  const pendingSystemPromptResets = new PendingSystemPromptResets()
   const antigravity = finalConfig.backend === "combined" ? createAntigravityServer({ ...finalConfig, profiles: undefined, defaultProfile: undefined }) : undefined
   // Decided once per instance. Absent means GPT model names keep meaning
   // Claude, exactly as before ChatGPT support existed.
@@ -987,23 +1012,24 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   )
   const SESSION_GC_CONTINUATION_MS = 5 * 60_000
   const SESSION_GC_SATURATION_LOG_INTERVAL_MS = 10 * 60_000
+  // The backlog follows the grace, so a longer turn hold cannot throttle
+  // retirement below the deletion rate (sessionGcLimits.ts).
+  const sessionGcLimits = resolveSessionGcLimits(envInt, SESSION_TURN_MAX_HOLD_MS)
   const sessionGcOptions: SessionLifecycleOptions = {
-    // Retired transcripts hold a pending slot through their grace period, so
-    // the budget caps deletion throughput at maxPending per grace: 256 per 11
-    // minutes is below the rate busy agents supersede forks (one per resumed
-    // request), and the excess piled up as live transcripts.
-    maxPending: Math.max(1, envInt("SESSION_GC_MAX_PENDING", 2048)),
-    maxDeletesPerRun: Math.max(1, envInt("SESSION_GC_MAX_DELETES", 64)),
+    maxPending: sessionGcLimits.maxPending,
+    maxDeletesPerRun: sessionGcLimits.maxDeletesPerRun,
+    // Also reaches a sweep already running when beginDrain flips the state.
+    // The lifecycle lowers remaining work only between joined transactions.
+    maxRemainingDeletes: () => draining
+      ? sessionGcLimits.shutdownMaxDeletesPerRun
+      : sessionGcLimits.maxDeletesPerRun,
     // A prepared fork is an active write lease. Never age it out before the
     // request watchdog plus a drain margin, even if an unsafe lower value is configured.
     preparedGraceMs: Math.max(
       SESSION_TURN_MAX_HOLD_MS + 60_000,
       envInt("SESSION_GC_PREPARED_GRACE_MS", SESSION_TURN_MAX_HOLD_MS + 60_000),
     ),
-    retiredGraceMs: Math.max(
-      0,
-      envInt("SESSION_GC_GRACE_MS", SESSION_TURN_MAX_HOLD_MS + 60_000),
-    ),
+    retiredGraceMs: sessionGcLimits.retiredGraceMs,
     // JSON budgets external acquisition at the FIFO head. SQLite uses the shared
     // admission deadline from enqueue, including local FIFO wait.
     ...(bookkeepingMode() === "json"
@@ -1129,7 +1155,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // rather than a full interval later, up to a bounded sweep length.
       const sweepDeadline = Date.now() + SESSION_GC_CONTINUATION_MS
       for (;;) {
-        const result = await sessionDeletionOwner.run(() => runSessionGc(collectSessionGcPins(), sessionGcOptions))
+        // A draining sweep starts at the shutdown cap; maxRemainingDeletes
+        // also lowers one already running that close() joins.
+        const runOptions = draining
+          ? { ...sessionGcOptions, maxDeletesPerRun: sessionGcLimits.shutdownMaxDeletesPerRun }
+          : sessionGcOptions
+        const result = await sessionDeletionOwner.run(() => runSessionGc(collectSessionGcPins(), runOptions))
         if (result.deleted || result.notFound || result.failed) {
           claudeLog("session.gc", { ...result })
           if (result.failed) {
@@ -1182,7 +1213,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   const busySdkRoots = new Map<string, number>()
   let sweepReservation: { readonly configDir: string; readonly preempt: AbortController } | undefined
   const markSdkRootBusy = (options: Parameters<typeof query>[0]["options"]): (() => void) => {
-    const root = resolveQueryConfigDir(options?.env ?? process.env, false, options?.cwd)
+    const root = canonicalConfigDir(resolveQueryConfigDir(options?.env ?? process.env, false, options?.cwd))
     busySdkRoots.set(root, (busySdkRoots.get(root) ?? 0) + 1)
     if (sweepReservation?.configDir === root) sweepReservation.preempt.abort()
     let released = false
@@ -1195,7 +1226,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
   }
   const reserveSweepRoot = (configDir: string): RootReservation | undefined => {
-    const root = resolve(configDir)
+    const root = canonicalConfigDir(configDir)
     if (sweepReservation || busySdkRoots.has(root)) return undefined
     const reservation = { configDir: root, preempt: new AbortController() }
     sweepReservation = reservation
@@ -1243,28 +1274,56 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // exempted by a per-instance token rather than a fixed header name, so the
   // exemption can never be claimed from the wire.
   const internalHopToken = randomUUID()
+  const isMeridianWarm = (headers: Headers): boolean =>
+    headers.get("x-meridian-internal-hop") === internalHopToken && headers.get("x-meridian-routing-purpose") === "warm"
 
   // Work-routing exclusions: accounts an operator has taken out of rotation.
   // `routingExcludedProfiles` is the manual list edited from /settings;
   // `routingManagedExcludedProfiles` is the one an external supervisor owns.
   // Both are merged and canonicalised against rename aliases, so an exclusion
   // written under a profile's former name still bites after the rename.
+  //
+  // A profile the user forced active (forcedProfile.ts) is taken out of the
+  // supervisor's lists while the force holds, so neither the active-pointer
+  // reconcile nor dispatch moves work off it; the user's own list still bites.
+  // A force holds only while its profile is the active pointer.
+  const liveForced = (): ForcedProfile | null => {
+    const forced = liveForcedProfile(getSetting("forcedActiveProfile"), Date.now())
+    return forced && getActiveProfileId() === forced.profile ? forced : null
+  }
+  const forcedProfileId = (): string | null => liveForced()?.profile ?? null
   const configuredRoutingExcludedProfileIds = () => mergeRoutingExcludedProfiles(
     parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles")),
-    parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")),
+    withoutForcedProfile(parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")), forcedProfileId()),
   )
   const routingExcludedProfileIdsFor = (profiles: readonly ProfileConfig[]) => canonicalRoutingExcludedProfileIds(
     profiles,
     configuredRoutingExcludedProfileIds(),
   )
   const routingExcludedProfileIds = () => routingExcludedProfileIdsFor(getEffectiveProfiles(finalConfig.profiles))
+  // The two lists split again where a pin is judged: the user's own refuses
+  // a pin, the supervisor's only keeps unpinned work away.
+  const userRoutingExcludedProfileIds = () => parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles"))
+  const managedRoutingExcludedProfileIds = () => withoutForcedProfile(parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")), forcedProfileId())
+  let managedExclusionEvidence: ManagedExclusionEvidence | undefined
+  let managedChatGptExclusionEvidence: ManagedExclusionEvidence | undefined
+  let managedChatGptEvidenceHighWater = 0
+  let managedChatGptEvidencePolicy: string | undefined
+  // `x-meridian-require: cvp` work answers to the cybersec switcher's managed
+  // list instead of the general one: the two switchers own separate lists, so
+  // an account rested from general work can still take cvp work.
+  const cvpManagedExcludedProfileIds = () => parseRoutingExcludedProfiles(getSetting("cvpManagedExcludedProfiles"))
+  const cvpExcludedProfileIdsFor = (profiles: readonly ProfileConfig[]) => canonicalRoutingExcludedProfileIds(
+    profiles,
+    mergeRoutingExcludedProfiles(userRoutingExcludedProfileIds(), cvpManagedExcludedProfileIds()),
+  )
   // Held profiles (`routingHeldProfiles`, supervisor-owned): out of every
   // unpinned pick and every warm, yet served when a request pins one - the
   // account a measured run spends alone.
   const configuredRoutingHeldProfileIds = () => parseRoutingExcludedProfiles(getSetting("routingHeldProfiles"))
   const routingHeldProfileIdsFor = (profiles: readonly ProfileConfig[]) => canonicalRoutingExcludedProfileIds(
     profiles,
-    configuredRoutingHeldProfileIds(),
+    withoutForcedProfile(configuredRoutingHeldProfileIds(), forcedProfileId()),
   )
   const routingHeldProfileIds = () => routingHeldProfileIdsFor(getEffectiveProfiles(finalConfig.profiles))
   /** What unpinned work never reaches: excluded and held profiles alike. */
@@ -1278,11 +1337,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
    * it use, which is a capacity wait; a pool the user's own list empties is a
    * configuration error.
    */
-  const someOutOnlyByManagedExclusion = (): boolean => {
+  const someOutOnlyByManagedExclusion = (managed: readonly string[] = managedRoutingExcludedProfileIds()): boolean => {
     const profiles = getEffectiveProfiles(finalConfig.profiles)
     const manual = new Set(canonicalRoutingExcludedProfileIds(profiles, parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles"))))
     const held = new Set(routingHeldProfileIdsFor(profiles))
-    return canonicalRoutingExcludedProfileIds(profiles, parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")))
+    return canonicalRoutingExcludedProfileIds(profiles, managed)
       .some(id => !manual.has(id) && !held.has(id) && profiles.some(p => p.id === id))
   }
 
@@ -1324,6 +1383,36 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
   reconcileActiveProfileWithExclusions()
 
+  // A force that runs out puts the ordinary rules back at that moment, rather
+  // than whenever a supervisor next writes its list.
+  let forcedExpiryTimer: ReturnType<typeof setTimeout> | undefined
+  function scheduleForcedExpiry(): void {
+    if (forcedExpiryTimer) clearTimeout(forcedExpiryTimer)
+    forcedExpiryTimer = undefined
+    const forced = liveForcedProfile(getSetting("forcedActiveProfile"), Date.now())
+    if (!forced) return
+    forcedExpiryTimer = setTimeout(() => {
+      forcedExpiryTimer = undefined
+      if (liveForcedProfile(getSetting("forcedActiveProfile"), Date.now())) return scheduleForcedExpiry()
+      setSetting("forcedActiveProfile", undefined)
+      claudeLog("profile.force_expired", { profile: forced.profile })
+      reconcileActiveProfileWithExclusions()
+    }, Math.min(forced.until - Date.now() + 1_000, 2 ** 31 - 1))
+    forcedExpiryTimer.unref?.()
+  }
+  function releaseForcedProfile(source: string): string | null {
+    const forced = liveForcedProfile(getSetting("forcedActiveProfile"), Date.now())
+    if (getSetting("forcedActiveProfile") !== undefined) setSetting("forcedActiveProfile", undefined)
+    scheduleForcedExpiry()
+    if (forced) {
+      claudeLog("profile.force_released", { profile: forced.profile, source })
+      plog(`[PROXY] Forced profile ${forced.profile} released (${source})`)
+    }
+    reconcileActiveProfileWithExclusions()
+    return forced?.profile ?? null
+  }
+  scheduleForcedExpiry()
+
   /** Which error envelope a public route speaks. */
   type ErrorShape = "anthropic" | "openai"
   const errorEnvelope = (shape: ErrorShape, type: string, message: string) =>
@@ -1358,6 +1447,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
   interface ClaudeAdmissionOwner {
     readonly requestId: string
+    responsesClientSessionId?: string | null
     readonly enteredAt: number
     readonly abort: AbortController
     readonly abortLink: RequestAbortLink
@@ -1594,8 +1684,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     activeLocators: readonly TranscriptLocator[],
     custody: { readonly observeUpstream?: boolean; readonly joinUntilExit?: boolean } = {},
   ) {
-    // When this query started, for the login record a successful answer writes.
-    const startedAt = Date.now()
     // The sweep reserves its own root; its child must not preempt itself.
     const releaseSdkRoot = mode === TRANSCRIPT_SWEEP_MODE ? undefined : markSdkRootBusy(params.options)
     let sdkQuery: ReturnType<typeof query> | undefined
@@ -1626,6 +1714,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         params.options.spawnClaudeCodeProcess = processGate.spawnClaudeCodeProcess
       }
       signal.throwIfAborted()
+      const upstreamEnv = sanitizeClaudeEgressEnv(params.options?.env)
+      if (upstreamEnv !== params.options?.env) (params.options ??= {}).env = upstreamEnv
       sdkQuery = query(params)
       if (custody.observeUpstream === false) {
         yield* sdkQuery
@@ -1640,10 +1730,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         claudeReachability,
         { includePartialMessages: params.options?.includePartialMessages === true },
       )) {
-        if (message.type === "result" && !message.is_error && !params.options?.env?.ANTHROPIC_API_KEY && !params.options?.env?.CLAUDE_CODE_OAUTH_TOKEN) {
-          const store = createPlatformCredentialStore({ claudeConfigDir: params.options?.env?.CLAUDE_CONFIG_DIR })
-          noteProviderAccepted(store.refreshKey, { startedAt })
-        }
         yield message
       }
     } finally {
@@ -1673,10 +1759,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // Prompt-cache keepalive (src/proxy/SPEC.md → Decisions). Off unless the
   // operator switches it on; beats run on the same gated SDK path as turns
   // and count as in-flight work for shutdown.
-  const cacheKeepaliveEnabled = (): boolean =>
-    resolveCacheKeepaliveEnabled(env("CACHE_KEEPALIVE"), () => getSetting("cacheKeepalive"))
+  const cacheKeepaliveMode = () =>
+    resolveCacheKeepaliveMode(env("CACHE_KEEPALIVE"), () => getSetting("cacheKeepalive"))
+  const cacheKeepaliveEnabled = (): boolean => cacheKeepaliveMode() !== "off"
   const cacheKeepalive = new CacheKeepaliveScheduler<CacheKeepaliveRecipe>({
     enabled: cacheKeepaliveEnabled,
+    autoBeats: () => cacheKeepaliveMode() === "auto",
+    maxBeats: resolveCacheKeepaliveMaxBeats(envIntValue("CACHE_KEEPALIVE_MAX_BEATS")),
     maxInFlight: resolveCacheKeepaliveMaxInFlight(envIntValue("CACHE_KEEPALIVE_MAX_IN_FLIGHT")),
     currentSessionId: currentCacheKeepaliveSessionId,
     beat: createCacheKeepaliveRunner({
@@ -1705,6 +1794,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // a client turn, and holds it until the process is joined.
   const transcriptSweep = createTranscriptSweep({
     listRoots: () => {
+      // A follower shares the followed instance's directories, whose pins live
+      // in that instance's store; it alone sweeps them.
+      if (isFollowEnabled()) return []
       const profiles = getEffectiveProfiles(finalConfig.profiles)
       const resolved = profiles.length === 0
         ? [resolveProfile(finalConfig.profiles, finalConfig.defaultProfile)]
@@ -1903,6 +1995,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return Array.isArray(setting) && setting.length > 0 ? setting : undefined
   }
 
+  /** The order `x-meridian-require: cvp` work walks: its own, else the pool order. */
+  function cvpProfileOrderSetting(): string[] | undefined {
+    const setting = parseRoutingExcludedProfiles(getSetting("cvpProfileOrder"))
+    return setting.length > 0 ? setting : priorityProfileOrderSetting()
+  }
+
   /** Already-observed weekly usage for one profile: never fetches. */
   function weeklyUsageReadings(profileId: string): WeeklyUsageReading[] {
     const readings: WeeklyUsageReading[] = []
@@ -1965,7 +2063,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   /** The window a Claude profile's usage reserve holds it back on, from its newest reading; null when none does. */
   function claudeReserveHold(profileId: string, reserves: UsageReserveMap, now = Date.now()): UsageReserveState | null {
     const reserve = reserves[profileId]
-    if (!reserve) return null
+    if (!reserve || profileId === forcedProfileId()) return null
     const snapshot = peekOAuthUsage(profileId)
     if (!snapshot || now - snapshot.fetchedAt > USAGE_RESERVE_READING_MAX_AGE_MS) refreshReserveReading(profileId)
     return usageReserveHold(newestClaudeWindows(snapshot, rateLimitStore.getAll(profileId)), reserve, now)
@@ -2082,6 +2180,28 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return diagnosis
   }
 
+  /** Add the profile's CVP reading to each `/v1/models` entry it knows. */
+  function withCyberVerification<T extends { id: string }>(models: readonly T[], profileId: string): Array<T & { cyber_verification?: CyberVerificationField }> {
+    return models.map(model => {
+      const entry = cvpAccessOn(profileId, model.id)
+      return entry ? { ...model, cyber_verification: cyberVerificationField(entry) } : model
+    })
+  }
+
+  /**
+   * Learn from a refusal's `stop_details.cyber_verification`: it says whether
+   * this account holds CVP access on the model that refused. Subagent rows
+   * count too; the access is the account's, not the conversation's.
+   */
+  function noteCvpRefusal(profileId: string, row: { readonly message?: unknown }, requestedModel: unknown): void {
+    const found = cyberVerificationOf(row)
+    if (!found) return
+    const model = found.model !== null && isCvpModelId(found.model) ? found.model : typeof requestedModel === "string" ? requestedModel : ""
+    if (recordCvpRefusal(profileId, model, found.value)) {
+      claudeLog("cvp.observed", { profile: profileId, model: normalizeCvpModel(model), access: cvpAccessOn(profileId, model)?.type ?? null })
+    }
+  }
+
   /**
    * Why each Claude profile cannot take a request that no account could take.
    * A profile with nothing against it is left out: it was outside this
@@ -2092,8 +2212,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     reserveHold: (id: string) => UsageReserveState | null
     weeklyHolds?: ReadonlyMap<string, WeeklyReserveHold>
     extraUsageOff?: (id: string) => boolean
+    /** The request requires CVP access this profile's map does not show. */
+    noCvp?: (id: string) => boolean
+    /** The exclusions that applied when they are not the general ones (cvp work). */
+    excluded?: readonly string[]
   }): NoRoutableProfile[] {
-    const excluded = new Set(routingExcludedProfileIds())
+    const excluded = new Set(input.excluded ?? routingExcludedProfileIds())
     const held = new Set(routingHeldProfileIds())
     const now = Date.now()
     const benchedUntil = new Map(priorityExhaustion.snapshot().map(e => [e.id, e.until]))
@@ -2103,6 +2227,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return getEffectiveProfiles(finalConfig.profiles).flatMap(({ id }): NoRoutableProfile[] => {
       if (excluded.has(id)) return [{ id, reason: "excluded", resetsAt: knownUsageReset(id, now) }]
       if (held.has(id)) return [{ id, reason: "held", resetsAt: knownUsageReset(id, now) }]
+      if (input.noCvp?.(id)) return [{ id, reason: "no_cvp", resetsAt: null }]
       const reserve = input.reserveHold(id)
       if (reserve) return [{ id, reason: "reserve_held", resetsAt: reserve.opensAt }]
       const weekly = input.weeklyHolds?.get(id)
@@ -2784,7 +2909,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         status: "ok",
         service: "meridian",
         format: "anthropic",
-        endpoints: ["/v1/messages", "/messages", "/v1/chat/completions", "/v1/responses", "/v1/models", "/v1/sessions/:key/cancel", "/v1/design/*", "/design-login", "/telemetry", "/metrics", "/health"]
+        endpoints: ["/v1/messages", "/messages", "/v1/chat/completions", "/v1/responses", "/v1/models", "/v1/sessions/:key/cancel", "/v1/sessions/:key/cache-beat", "/v1/design/*", "/design-login", "/telemetry", "/metrics", "/health"]
       })
     }
     return c.html(withSavedLayout(landingHtml))
@@ -2796,6 +2921,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     options: HandleMessagesOptions,
   ) => {
     const requestStartAt = requestMeta.queueEnteredAt
+    const routingRequire = routingRequireOf(c.req.header(ROUTING_REQUIRE_HEADER))
+    const attribution = isMeridianWarm(c.req.raw.headers) ? meridianWarmAttribution : readClientAttribution(c.req.raw.headers)
     const requestSignal = options.turnWatchdogSignal
       ? AbortSignal.any([c.req.raw.signal, options.turnWatchdogSignal])
       : c.req.raw.signal
@@ -3189,6 +3316,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // not persist it as durable conversation ancestry.
         const lineageMessages = adapter.canonicalizeMessagesForLineage?.(body.messages)
           ?? body.messages
+        // Where the reply sits in the client's next request, which is where its
+        // SDK message UUID is recorded: after the messages the conversation
+        // keeps. A trailing turn sent for this request only is gone by then.
+        const replyPosition = lineageMessages.length
 
         // Native Anthropic server tools (web_search_*, web_fetch_*) can't run
         // through the Max/SDK path — fail fast with an actionable message
@@ -3226,17 +3357,54 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // no way to tell. Warm hops are exempt by design — keeping an excluded
         // account's prompt cache alive is the whole reason for excluding it
         // from work instead of removing it.
-        const warmProfileId = c.req.header("x-meridian-internal-hop") === internalHopToken
-          && c.req.header("x-meridian-routing-purpose") === "warm"
+        const warmProfileId = isMeridianWarm(c.req.raw.headers)
           ? c.req.header("x-meridian-profile")
           : undefined
         const requestedProfileId = options.forcedProfileId || warmProfileId || c.req.header("x-meridian-profile") || undefined
+        // `x-meridian-require: cvp` limits unpinned work to accounts whose CVP
+        // map shows access on the requested model, in the cvp order behind the
+        // cvp pointer, past the cvp managed list. A pin, a warm and a priority
+        // hop (whose candidates were already chosen) are exempt from that
+        // routing; a pin is still refused below when its account lacks CVP.
+        const requirements = parseRoutingRequirements(c.req.header(ROUTING_REQUIRE_HEADER))
+        if (requirements.unknown.length > 0) {
+          return c.json({
+            type: "error",
+            error: { type: "invalid_request_error", message: `${ROUTING_REQUIRE_HEADER}: unknown requirement ${requirements.unknown.join(", ")}` },
+          }, 400)
+        }
+        const cvpModel = typeof body.model === "string" ? body.model : ""
+        const requireCvp = requirements.cvp && !warmProfileId && !options.forcedProfileId && !c.req.header("x-meridian-profile")
+        const attestedModel = isPoolRouting(routingMode) && !requirements.cvp && !requestedProfileId && !forcedProfileId() &&
+          c.req.header("x-meridian-route-refusal") === "1" &&
+          c.req.header("x-request-id") === requestMeta.requestId &&
+          /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(requestMeta.requestId) &&
+          isExactClaudeWireModel(cvpModel) ? cvpModel : undefined
+        const freshFleetEvidence = () => managedExclusionEvidence && capacityObservationIsFresh(managedExclusionEvidence.observedAt, Date.now())
+          ? managedExclusionEvidence.profiles : undefined
+        const lacksCvp = requireCvp ? (id: string) => !cvpActive(id, cvpModel) : undefined
+        // What took a profile out of this request's routing, when cvp work's
+        // own list applies instead of the general managed one.
+        const cvpExcluded = requireCvp ? cvpExcludedProfileIdsFor(getEffectiveProfiles(finalConfig.profiles)) : undefined
+        const refuseNoCvp = (sessionKey: string | null, profiles: NoRoutableProfile[]): Response => {
+          claudeLog("routing.no_cvp", { model: normalizeCvpModel(cvpModel), routing: routingMode })
+          return noRoutableAccountResponse(noRoutableAccount({
+            requestId: requestMeta.requestId,
+            sessionKey,
+            routing: routingMode,
+            lead: `no eligible profile holds CVP access on ${normalizeCvpModel(cvpModel) || "the requested model"}`,
+            reason: "no_cvp",
+            lastTried: null,
+            profiles,
+          }))
+        }
         const routingAccess = evaluateRoutingProfileAccess({
           profiles: getEffectiveProfiles(finalConfig.profiles),
           defaultProfile: finalConfig.defaultProfile,
           purpose: warmProfileId ? "warm" : "work",
           explicitProfileId: requestedProfileId,
-          excludedProfileIds: routingExcludedProfileIds(),
+          excludedProfileIds: userRoutingExcludedProfileIds(),
+          managedExcludedProfileIds: requireCvp ? cvpManagedExcludedProfileIds() : managedRoutingExcludedProfileIds(),
           heldProfileIds: routingHeldProfileIds(),
         })
         switch (routingAccess.access.kind) {
@@ -3245,10 +3413,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           case "explicit_held":
             return profileHeldResponse(routingAccess.access.profileId)
           case "no_eligible_profiles": {
-            if (!someOutOnlyByManagedExclusion()) return noEligibleProfilesResponse()
+            if (!someOutOnlyByManagedExclusion(requireCvp ? cvpManagedExcludedProfileIds() : undefined)) return noEligibleProfilesResponse()
             claudeLog("routing.managed_exclusion_refused", { routing: routingMode })
             const reserves = usageReserves()
-            return noRoutableAccountResponse(noRoutableAccount({
+            const refusal = noRoutableAccount({
               requestId: requestMeta.requestId,
               sessionKey: null,
               routing: routingMode,
@@ -3258,8 +3426,21 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               profiles: unroutableProfiles({
                 modelFamily: claudeModelFamily(typeof body.model === "string" ? body.model : "sonnet"),
                 reserveHold: id => claudeReserveHold(id, reserves),
+                excluded: cvpExcluded,
               }),
-            }))
+            })
+            const fleetEvidence = freshFleetEvidence()
+            if (attestedModel && fleetEvidence) {
+              const pool = getEffectiveProfiles(finalConfig.profiles)
+              const managed = new Set(canonicalRoutingExcludedProfileIds(pool, managedRoutingExcludedProfileIds()))
+              const manual = new Set(canonicalRoutingExcludedProfileIds(pool, userRoutingExcludedProfileIds()))
+              const held = new Set(routingHeldProfileIds())
+              if (pool.length > 0 && pool.every(({ id }) => !manual.has(id) && !held.has(id) && managed.has(id) && fleetEvidence.has(id))) {
+                refusal.error.route_refusal = { version: 1, phase: "before_inference", sent: false,
+                  provider: "claude", model: attestedModel, reason: "quota_exhausted" }
+              }
+            }
+            return noRoutableAccountResponse(refusal)
           }
           case "allowed":
             break
@@ -3268,15 +3449,38 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             return exhaustive
           }
         }
+        // A pin carrying the requirement goes to that account, but not when its
+        // map says it lacks CVP on the model: the client asked for CVP work on
+        // that account, and sending it would only get it refused upstream. A
+        // profile with no reading is sent, and its refusal teaches the map.
+        const pinnedForCvp = requirements.cvp && !warmProfileId && !options.forcedProfileId ? c.req.header("x-meridian-profile") : undefined
+        if (pinnedForCvp && cvpModel && cvpAccessOn(pinnedForCvp, cvpModel)?.type === "inactive") {
+          claudeLog("routing.pin_no_cvp", { profile: pinnedForCvp, model: normalizeCvpModel(cvpModel) })
+          return profileNoCvpResponse(pinnedForCvp, normalizeCvpModel(cvpModel))
+        }
         // Priority mode (opt-in): unpinned requests are dispatched across the
         if (isPoolRouting(routingMode) && !options.forcedProfileId && !c.req.header("x-meridian-profile")) {
           const effectivePool = getEffectiveProfiles(finalConfig.profiles)
           if (effectivePool.length > 1) {
-            const { order: configuredOrder, unknown: notClaude } = resolvePriorityOrder(effectivePool.map(p => p.id), priorityProfileOrderSetting())
+            const { order: configuredOrder, unknown: notClaude } = resolvePriorityOrder(
+              effectivePool.map(p => p.id),
+              requireCvp ? cvpProfileOrderSetting() : priorityProfileOrderSetting(),
+            )
             // The saved order lists ChatGPT seats as well; those are not typos.
             const unknown = notClaude.filter(id => !chatGptProfiles?.resolve(id))
             if (unknown.length > 0) claudeLog("priority.unknown_order_ids", { unknown })
-            const eligibleOrder = filterEligibleProfileIds(configuredOrder, routingAccess.excludedProfileIds)
+            const allowedOrder = filterEligibleProfileIds(configuredOrder, routingAccess.excludedProfileIds)
+            const eligibleOrder = lacksCvp ? allowedOrder.filter(id => !lacksCvp(id)) : allowedOrder
+            const poolModelFamily = claudeModelFamily(typeof body.model === "string" ? body.model : "sonnet")
+            if (eligibleOrder.length === 0) {
+              const reserves = usageReserves()
+              return refuseNoCvp(null, unroutableProfiles({
+                modelFamily: poolModelFamily,
+                reserveHold: id => claudeReserveHold(id, reserves),
+                noCvp: lacksCvp,
+                excluded: cvpExcluded,
+              }))
+            }
             // Upstream's opt-in weekly reserve (#1484) passes a holding profile
             // over unless every eligible one holds.
             const weeklyHolds = currentWeeklyReserveHolds(eligibleOrder)
@@ -3294,12 +3498,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             }
             // A per-model weekly bench (#1524) skips a profile only for
             // requests of that model; profile-wide marks skip it for every request.
-            const modelFamily = claudeModelFamily(typeof body.model === "string" ? body.model : "sonnet")
+            const modelFamily = poolModelFamily
             const benched = (id: string) => priorityExhaustion.isExhausted(id, modelFamily)
             const unavailable = (id: string) => benched(id) || weeklyHolds.has(id) || heldBy(id) !== null
             const extraUsagePolicy = getClaudeExtraUsagePolicy(process.env.MERIDIAN_CLAUDE_EXTRA_USAGE ?? getSetting("claudeExtraUsage"))
             const extraUsageOff = (id: string) => extraUsagePolicy === "never" && profileDrawsExtraUsage(id)
-            const describeUnroutable = () => unroutableProfiles({ modelFamily, reserveHold: heldBy, weeklyHolds, extraUsageOff })
+            const describeUnroutable = () => unroutableProfiles({ modelFamily, reserveHold: heldBy, weeklyHolds, extraUsageOff, noCvp: lacksCvp, excluded: cvpExcluded })
             const extraUsage = orderForExtraUsage(
               allReserveHeld ? eligibleOrder : routable,
               extraUsagePolicy,
@@ -3319,8 +3523,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             // subagent keyed apart from its parent stays on the parent's
             // account (AgentIdentity.getRootSessionId).
             const adapterSessionId = adapter.getSessionId(c, body)
+            const rootSessionId = rootSessionIdOf(adapter, c, body)
             const sessionKey = getPriorityAssignmentKey(
-              rootSessionIdOf(adapter, c, body),
+              rootSessionId,
               lineageMessages,
               assignmentCwd,
             )
@@ -3414,8 +3619,35 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   publicationTurn = trustedTurn
                 } else if (sessionKey) {
                   // A process-local assignment preserves legacy/keyless affinity
-                  // but can never create durable promotion authority.
+                  // but can never create durable promotion authority. A restart
+                  // empties it; the account holding the conversation's most
+                  // recently used mapping stands in (see profiles-routing spec,
+                  // *A restart keeps a running conversation on its account*).
                   assignment = priorityAssignments.get(sessionKey)
+                  if (!assignment) {
+                    const lastUsed = new Map<string, number>()
+                    for (const id of configuredOrder) {
+                      for (const sessionId of new Set([rootSessionId ?? adapterSessionId, adapterSessionId])) {
+                        const mapped = lookupSharedSessionResult(mappingKeyOn(id, sessionId))
+                        if (mapped.status === "error") {
+                          return c.json({
+                            type: "error",
+                            error: { type: "overloaded_error", message: "Durable priority session state is unavailable" },
+                          }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
+                        }
+                        if (mapped.status === "found") {
+                          lastUsed.set(id, Math.max(lastUsed.get(id) ?? 0, mapped.session.lastUsedAt))
+                        }
+                      }
+                    }
+                    const restored = lastMappedProfile(configuredOrder, id => lastUsed.get(id))
+                    if (restored !== undefined) {
+                      assignment = { profileId: restored, requestId: undefined }
+                      claudeLog("priority.assignment_restored", {
+                        routeKey, sessionKey, profileId: restored, lastUsedAt: lastUsed.get(restored),
+                      })
+                    }
+                  }
                 }
               } else if (sessionKey) {
                 assignment = priorityAssignments.get(sessionKey)
@@ -3441,30 +3673,69 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               const retainOnlyProfile = durableRoute && !promotionTurn
                 ? assignedProfile
                 : undefined
+              if (retainOnlyProfile !== undefined && lacksCvp?.(retainOnlyProfile)) {
+                return refuseNoCvp(sessionKey, describeUnroutable())
+              }
               if (retainOnlyProfile !== undefined && !eligibleOrder.includes(retainOnlyProfile)) {
                 return c.json({
                   type: "error",
                   error: { type: "overloaded_error", message: "Durable priority routing state is unavailable" },
                 }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
               }
-              const refuseUnsent = (lead: string, reason: string): Response => noRoutableAccountResponse(noRoutableAccount({
-                requestId: requestMeta.requestId,
-                sessionKey,
-                routing: routingMode,
-                lead,
-                reason,
-                lastTried: null,
-                profiles: describeUnroutable(),
-              }))
+              // An account-shaped error after dispatch cannot attest that the request was unsent.
+              const attestPool = retainOnlyProfile === undefined && !forcedProfileId() ? attestedModel : undefined
+              const refuseUnsent = (input: {
+                lead: string; reason: "weekly_held" | "extra_usage_off" | "reserve_held" | "quota_exhausted";
+                provenProfiles?: NoRoutableProfile[];
+              }): Response => {
+                const profiles = input.provenProfiles ?? describeUnroutable()
+                const refusal = noRoutableAccount({ requestId: requestMeta.requestId, sessionKey, routing: routingMode,
+                  lead: input.lead, reason: input.reason, lastTried: null, profiles })
+                if (attestPool && (input.provenProfiles || input.reason !== "extra_usage_off" &&
+                  profiles.length === effectivePool.length && profiles.every(p => p.reason === input.reason))) {
+                  refusal.error.route_refusal = {
+                    version: 1, phase: "before_inference", sent: false,
+                    provider: "claude", model: attestPool, reason: input.reason === "quota_exhausted" ? "quota_exhausted" : "reserve_held",
+                  }
+                }
+                return noRoutableAccountResponse(refusal)
+              }
               if (allReserveHeld && retainOnlyProfile === undefined) {
-                return refuseUnsent("every profile is holding its weekly reserve", "weekly_held")
+                return refuseUnsent({ lead: "every profile is holding its weekly reserve", reason: "weekly_held" })
+              }
+              if (attestPool) {
+                const fleetEvidence = freshFleetEvidence()
+                const managed = new Set(canonicalRoutingExcludedProfileIds(effectivePool, managedRoutingExcludedProfileIds()))
+                const manual = new Set(canonicalRoutingExcludedProfileIds(effectivePool, userRoutingExcludedProfileIds()))
+                const held = new Set(routingHeldProfileIds())
+                const eligible = new Set(eligibleOrder)
+                const now = Date.now()
+                const profiles = effectivePool.flatMap((profile): NoRoutableProfile[] => {
+                  if (manual.has(profile.id) || held.has(profile.id)) return []
+                  if (managed.has(profile.id) && !eligible.has(profile.id) && fleetEvidence?.has(profile.id)) {
+                    return [{ id: profile.id, reason: "excluded", resetsAt: knownUsageReset(profile.id, now) }]
+                  }
+                  if (!eligible.has(profile.id) || (profile.type ?? "claude-max") !== "claude-max") return []
+                  const resetsAt = freshPlanExhaustion({ now, policy: extraUsagePolicy,
+                    oauth: peekOAuthUsage(profile.id), sdk: rateLimitStore.getAll(profile.id) })
+                  return resetsAt === null ? [] : [{ id: profile.id, reason: "spent", resetsAt }]
+                })
+                if (profiles.length === effectivePool.length && profiles.some(profile => profile.reason === "spent")) {
+                  return refuseUnsent({ lead: "every permitted profile has a fresh spent plan window", reason: "quota_exhausted", provenProfiles: profiles })
+                }
               }
               if (extraUsage.refused && retainOnlyProfile === undefined) {
-                return refuseUnsent("every profile's plan usage is spent and Extra Usage is off for this instance", "extra_usage_off")
+                return refuseUnsent({ lead: "every profile's plan usage is spent and Extra Usage is off for this instance", reason: "extra_usage_off" })
               }
               let candidates: string[]
               if (routingMode === ACTIVE_PRIORITY) {
-                const activeId = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile).id
+                // cvp work is led by the cvp pointer, never the general one, and
+                // only while it qualifies: chooseActivePriorityCandidates would
+                // put any head first, eligible or not.
+                const cvpPointer = getSetting("cvpActiveProfile")
+                const activeId = requireCvp
+                  ? (cvpPointer !== undefined && order.includes(cvpPointer) ? cvpPointer : order[0]!)
+                  : resolveProfile(finalConfig.profiles, finalConfig.defaultProfile).id
                 candidates = retainOnlyProfile
                   ? [retainOnlyProfile]
                   : [
@@ -3504,7 +3775,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 claudeLog("routing.usage_reserve_refused", { held: [...holds.keys()], retained: retainOnlyProfile ?? null })
                 return retainedHold && retainOnlyProfile !== undefined
                   ? usageReserveResponse(`${heldMessage(retainOnlyProfile, retainedHold)}.`, retainedHold.opensAt, Date.now())
-                  : refuseUnsent("every eligible profile is held back by its usage reserve", "reserve_held")
+                  : refuseUnsent({ lead: "every eligible profile is held back by its usage reserve", reason: "reserve_held" })
               }
               if (serving.length < candidates.length) {
                 claudeLog("routing.usage_reserve", { held: candidates.filter(id => !serving.includes(id)) })
@@ -3595,6 +3866,36 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, next, stickyOptions)
           }
         }
+        // Outside pool routing, work that requires CVP access goes to the cvp
+        // pointer, else the first in the cvp order, whose map shows it and
+        // whose usage reserve does not hold it back. Sticky routing keeps its
+        // hashed profile while that one qualifies.
+        if (lacksCvp) {
+          const reserves = usageReserves()
+          const now = Date.now()
+          const qualifies = (id: string) => !lacksCvp(id)
+            && (eligibleProfileIds.size === 0 || eligibleProfileIds.has(id))
+            && claudeReserveHold(id, reserves, now) === null
+          const cvpPointer = getSetting("cvpActiveProfile")
+          const ordered = [...new Set([
+            ...(routingMode === "sticky" ? [profile.id] : []),
+            ...(cvpPointer !== undefined ? [cvpPointer] : []),
+            ...resolvePriorityOrder([...eligibleProfileIds], cvpProfileOrderSetting()).order,
+          ])]
+          const next = ordered.find(qualifies)
+          if (next === undefined) {
+            return refuseNoCvp(null, unroutableProfiles({
+              modelFamily: claudeModelFamily(cvpModel || "sonnet"),
+              reserveHold: id => claudeReserveHold(id, reserves, now),
+              noCvp: lacksCvp,
+              excluded: cvpExcluded,
+            }))
+          }
+          if (next !== profile.id) {
+            claudeLog("routing.cvp", { from: profile.id, to: next })
+            profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, next, stickyOptions)
+          }
+        }
         // Also identifies failure telemetry; priority retries resolve each account here.
         resolvedProfileId = profile.id
         attributedProfileId = profile.id
@@ -3657,7 +3958,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // An auxiliary replay carries a 5-minute breakpoint of its own
         // (layoutReplayBlocks). The API rejects a longer-lived breakpoint
         // after a shorter one, and the CLI may choose 1h for its own, so pin
-        // the CLI to 5 minutes for these requests.
+        // the CLI to 5 minutes for these requests. The pin is decided before
+        // the lineage and also covers an auxiliary fork: the fork still reads
+        // the conversation's cache (TTL is not part of a cache hit), and the
+        // tail only it writes, which no later turn of the conversation reads,
+        // is written at the cheaper 5-minute rate.
         const envOverrides = requestMeta.auxiliaryRequest
           ? { ...explicitModelPin(requestedModel), FORCE_PROMPT_CACHING_5M: "1" }
           : explicitModelPin(requestedModel)
@@ -3881,8 +4186,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           projectDir: workingDirectory,
         })
         const managedSdkAttemptLocators = (): TranscriptLocator[] => {
+          // An auxiliary fork runs beside the conversation's own turn, which
+          // holds the writer lease on the same source. The fork only reads the
+          // source (the SDK copies it into the target), so it leases its target
+          // alone; this process's GC pin (prepareManagedFork) keeps the source.
           const locators = [
-            managedForkSource,
+            requestMeta.auxiliaryRequest ? undefined : managedForkSource,
             managedForkTarget,
           ].filter((locator): locator is TranscriptLocator => locator !== undefined)
           return [...new Map(
@@ -4017,7 +4326,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // can differ per attempt), but "did this session advance" is only
         // meaningful within one profile's cache scope — so commits and the
         // conflict check below both carry profileSessionId.
+        // An armed reset holds until a turn of this conversation publishes:
+        // that turn ran in a fresh SDK session (see executionReplay below).
+        const systemPromptResetArmed = Boolean(agentSessionId && pendingSystemPromptResets.isArmed(agentSessionId))
         const commitSessionTurn = (committedSdkSessionId: string | undefined) => {
+          if (systemPromptResetArmed && agentSessionId) pendingSystemPromptResets.settle(agentSessionId)
           if (profileSessionId) {
             requestMeta.sessionTurnLease?.markCommitted(profileSessionId)
             // Tool inheritance belongs to the successfully published branch.
@@ -4161,6 +4474,19 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           }
           return refreshed.generation
         }
+        // A resumed turn that must replay fresh first evicts the mapping it
+        // could not continue. An auxiliary fork never owned that mapping, so it
+        // replays without touching it.
+        const evictBeforeFreshFallback = async (fallback: string): Promise<void> => {
+          if (independentCause === "auxiliary-request") return
+          if (!(await evictSession(
+            profileSessionId,
+            profileScopedCwd,
+            lineageMessages,
+            mappingExpectedGeneration,
+          ))) throw new Error(`Session mapping changed before ${fallback} fallback eviction`)
+          mappingExpectedGeneration = refreshGenerationAfterEviction()
+        }
         // Legacy passthrough boundaries are intentionally treated as a missing
         // resumable session, but their real durable generation still fences the
         // replay that replaces them.
@@ -4180,9 +4506,30 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const advancedAcrossProcesses = arrivalRevision !== undefined
           ? arrivalRevision !== currentDurableRevision && !waitedOutOwnInterruption(arrivalRevision, interruptedClaim)
           : durableMappingAtTurn.status === "found"
-        let lineageResult: LineageResult = isIndependentSession
-          ? { type: "diverged", reason: "independent-request" }
-          : lookupSession(profileSessionId, lineageMessages, profileScopedCwd)
+        // An auxiliary request is still independent: it never takes the turn
+        // lease, publishes or invalidates the mapping. An adapter whose side
+        // calls share the conversation's system prompt and tools
+        // (forksAuxiliaryRequests) has it read the conversation's lineage, to
+        // fork the conversation's session when it adds nothing but user text
+        // to a completed turn (auxiliaryLineage). A legacy mapping without a
+        // transcript locator would need a durable write to attach one first,
+        // so it replays fresh instead.
+        const auxiliaryFork = independentCause === "auxiliary-request" && adapter.forksAuxiliaryRequests === true
+          ? auxiliaryLineage(lookupSession(profileSessionId, lineageMessages, profileScopedCwd), lineageMessages)
+          : undefined
+        const forkLineage = auxiliaryFork?.lineage
+        const auxiliaryResume = forkLineage?.type === "continuation"
+          && forkLineage.session.currentTranscript?.sessionId === forkLineage.session.claudeSessionId
+          ? forkLineage
+          : undefined
+        // Why a forking adapter's side call replays fresh, for the request log.
+        let auxiliaryRefusal: string | undefined = auxiliaryFork && !auxiliaryResume
+          ? auxiliaryFork.refusal ?? "no-transcript-locator"
+          : undefined
+        let lineageResult: LineageResult = auxiliaryResume
+          ?? (isIndependentSession
+            ? { type: "diverged", reason: "independent-request" }
+            : lookupSession(profileSessionId, lineageMessages, profileScopedCwd))
         // The stored mapping withholds its resume proof while it is
         // interrupted. Restore it only when this request adds nothing but user
         // content to what the session holds; otherwise the client kept output
@@ -4390,7 +4737,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           const conflictTotalMs = Date.now() - requestStartAt
           const conflictQueueWaitMs = totalQueueWaitMs(requestMeta)
           telemetryStore.record({
+            ...attribution,
             requestId: requestMeta.requestId,
+            clientSessionId: requestMeta.clientSessionId,
+            routingRequire,
             timestamp: Date.now(),
             adapter: adapter.name,
             model,
@@ -4571,12 +4921,17 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           cachedSession.resumeContextHash,
           resumeContextHash,
         ))
+        // Claude Code resends the system prompt a transcript recorded; only a
+        // fresh session renders the client's current one.
+        const systemPromptReset = Boolean(cachedSession) && (systemPromptResetArmed
+          || requestsSystemPromptReset(c.req.header(SYSTEM_PROMPT_RESET_HEADER)))
         const executionReplay = executionHistory.changed || Boolean(cachedSession && !cachedSession.lineageHash)
-          || agentContextReplay
+          || agentContextReplay || systemPromptReset
         const executionReplayToolSessionId = executionReplay && isResume ? resumeSessionId : undefined
         const executionReplayReason = !executionReplay ? undefined
           : executionHistory.changed ? "transformed_history"
-            : agentContextReplay ? "changed_or_unproved_primary_agent" : "unproved_sdk_prefix"
+            : agentContextReplay ? "changed_or_unproved_primary_agent"
+              : systemPromptReset ? "system_prompt_reset" : "unproved_sdk_prefix"
         if (executionReplay) {
           claudeLog("session.execution_replay", { reason: executionReplayReason })
           isResume = false
@@ -4584,6 +4939,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           sdkUndo = false
           undoRollbackUuid = undefined
           resumeSessionId = undefined
+        }
+        // A side call whose fork was cancelled above replays fresh like any
+        // other auxiliary request, and says so on its log line.
+        if (independentCause === "auxiliary-request" && !isResume && lineageResult.type === "continuation") {
+          lineageResult = { type: "diverged", reason: "independent-request" }
+          auxiliaryRefusal = executionReplayReason ? `replay-${executionReplayReason.replaceAll("_", "-")}` : "transcript-locator-changed"
         }
         // Early-stopped sessions resume at the assistant tool-use turn, before synthetic denials.
         let passthroughToolCallAssistantUuid = passthrough && isResume ? cachedSession?.passthroughToolCallAssistantUuid : undefined
@@ -4607,7 +4968,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const msgCount = Array.isArray(body.messages) ? body.messages.length : 0
         const toolCount = body.tools?.length ?? 0
         const sdkSnapshot = sdkSemaphore.snapshot
-        const requestLogLine = `${requestMeta.requestId} adapter=${adapter.name}${requestSource ? ` source=${requestSource}` : ""}${profile.id !== "default" ? ` profile=${profile.id}${routingMode === "sticky" ? "(sticky)" : options.forcedProfileId ? "(priority)" : ""}` : ""} model=${model} stream=${stream} tools=${toolCount} lineage=${lineageType} session=${resumeSessionId?.slice(0, 8) || "new"}${isUndo && undoRollbackUuid ? ` rollback=${undoRollbackUuid.slice(0, 8)}` : ""}${divergedReason ? ` diverged=${divergedReason}` : ""}${executionReplayReason ? ` replay=${executionReplayReason.replaceAll("_", "-")}` : ""}${agentMode ? ` agent=${agentMode}` : ""} sdkActive=${sdkSnapshot.active}/${sdkSnapshot.limit} sdkQueued=${sdkSnapshot.queued} sessionWait=${requestMeta.sessionQueueWaitMs}ms msgCount=${msgCount}`
+        const requestLogLine = `${requestMeta.requestId} adapter=${adapter.name}${requestSource ? ` source=${requestSource}` : ""}${profile.id !== "default" ? ` profile=${profile.id}${routingMode === "sticky" ? "(sticky)" : options.forcedProfileId ? "(priority)" : ""}` : ""} model=${model} stream=${stream} tools=${toolCount} lineage=${lineageType} session=${resumeSessionId?.slice(0, 8) || "new"}${isUndo && undoRollbackUuid ? ` rollback=${undoRollbackUuid.slice(0, 8)}` : ""}${divergedReason ? ` diverged=${divergedReason}` : ""}${auxiliaryFork ? (isResume ? " auxiliary=fork" : ` auxiliary=replay:${auxiliaryRefusal}`) : ""}${executionReplayReason ? ` replay=${executionReplayReason.replaceAll("_", "-")}` : ""}${agentMode ? ` agent=${agentMode}` : ""} sdkActive=${sdkSnapshot.active}/${sdkSnapshot.limit} sdkQueued=${sdkSnapshot.queued} sessionWait=${requestMeta.sessionQueueWaitMs}ms msgCount=${msgCount}`
         plog(`[PROXY] ${requestLogLine} msgs=${msgSummary}`)
         diagnosticLog.session(`${requestLogLine}`, requestMeta.requestId)
 
@@ -4774,6 +5135,33 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // Budget only the replay payload, never the lineage or SDK UUID mapping.
       const replaySource = messagesToConvert
       const freshReplay = !isResume && !resumeSessionId
+      // NOTE: OpenCode-specific section extraction (adapters/opencodeInstructionSections.ts).
+      // A resumed transcript keeps the system prompt its first turn recorded,
+      // so compare the client's instruction files against what it has seen.
+      const instructionSections = adapterBase === "opencode" && sdkFeatures.clientSystemPrompt !== false
+        ? openCodeInstructionSections(extractSystemText(body.system))
+        : undefined
+      const instructionPlan = instructionSections
+        ? planInstructionSections(cachedSession?.instructionSections, instructionSections, !freshReplay)
+        : undefined
+      // A fallback that replays into a fresh session renders the current prompt.
+      let instructionSectionPublication = instructionPlan?.state
+      const publishFreshInstructionSections = () => {
+        if (instructionSections) instructionSectionPublication = instructionSectionState(instructionSections)
+      }
+      // The resumed model is told what changed in this turn's input; once
+      // published, the transcript holds it, so the current sections are seen.
+      // The reminder is SDK input only: lineage and UUID mapping hash the
+      // client messages, which it never enters.
+      let instructionReminder: string | undefined
+      if (instructionSections && instructionPlan && hasInstructionSectionChange(instructionPlan.change)) {
+        claudeLog("session.instruction_sections_changed", {
+          changed: instructionPlan.change.changed.length,
+          removed: instructionPlan.change.removed,
+        })
+        instructionReminder = renderInstructionSectionReminder(instructionPlan.change, instructionSections)
+        instructionSectionPublication = instructionSectionState(instructionSections)
+      }
       // Client usage describes its resumed context, not the fresh transcript;
       // derive replay capacity from the actual SDK model's window instead.
       const modelReplayBudget = () => replayBudgetFor(model, model === "sonnet" ? resolvedSonnetModel : resolvedHaikuModel())
@@ -4818,30 +5206,40 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // with the exact durable generation and ID before registering it for GC; otherwise a
         // crash before target publication could leave the still-current source
         // unpinned and eligible for deletion.
-        const attachedGeneration = lifecycleMappingKey
-          ? await inDurableOrder(() => attachPinnedTranscript(
-            managedForkSource!,
-            () => {
-              assertDurableWritesAllowed()
-              return attachSharedTranscriptLocator(
-                lifecycleMappingKey,
-                sourceSessionId,
-                managedForkSource!,
-                mappingExpectedGeneration ?? undefined,
-                assertDurableWritesAllowed,
-              )
-            },
-            admissionLifecycleOptions,
-          ))
-          : false
-        if (!attachedGeneration) {
-          throw new Error("Session mapping changed before managed fork preparation; retry the turn")
+        //
+        // An auxiliary fork neither attaches nor registers its source: it
+        // resumes only a source the mapping already names (see the
+        // auxiliaryResume lineage) and holds no turn lease, so the
+        // conversation's own turn may publish and retire that source
+        // meanwhile. Registering it would revive a retired transcript; a
+        // source that is gone is refused by the SDK, and the side call then
+        // replays fresh.
+        if (independentCause !== "auxiliary-request") {
+          const attachedGeneration = lifecycleMappingKey
+            ? await inDurableOrder(() => attachPinnedTranscript(
+              managedForkSource!,
+              () => {
+                assertDurableWritesAllowed()
+                return attachSharedTranscriptLocator(
+                  lifecycleMappingKey,
+                  sourceSessionId,
+                  managedForkSource!,
+                  mappingExpectedGeneration ?? undefined,
+                  assertDurableWritesAllowed,
+                )
+              },
+              admissionLifecycleOptions,
+            ))
+            : false
+          if (!attachedGeneration) {
+            throw new Error("Session mapping changed before managed fork preparation; retry the turn")
+          }
+          mappingExpectedGeneration = attachedGeneration
+          // Journal both ownership and the chosen target before query() can create
+          // a fork file. This closes the crash window where the SDK file exists
+          // but no emitted event or shared mapping names it yet.
+          managedForkSource = await registerLiveTranscript(managedForkSource, admissionLifecycleOptions)
         }
-        mappingExpectedGeneration = attachedGeneration
-        // Journal both ownership and the chosen target before query() can create
-        // a fork file. This closes the crash window where the SDK file exists
-        // but no emitted event or shared mapping names it yet.
-        managedForkSource = await registerLiveTranscript(managedForkSource, admissionLifecycleOptions)
         managedForkTarget = await prepareForkForPublication(managedForkTarget, admissionLifecycleOptions)
         claudeLog("session.fork_prepared", {
           sourceSessionId: managedForkSource.sessionId,
@@ -5079,8 +5477,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           // Resume deltas are tail-only and stay bare.
           const resumeDelta = promptTurns.map((t: { text: string }) => t.text).filter(Boolean).join("\n\n") || ""
           textPrompt = isResume ? resumeDelta : frameReplayTurns(promptTurns)
-          // An auxiliary request always replays fresh, often every few
-          // seconds over the same growing history. The same text split into
+          // An auxiliary request that is not forked replays fresh, often every
+          // few seconds over the same growing history. The same text split into
           // blocks, with one breakpoint at the client's reusable prefix, lets
           // the next one read that prefix from cache instead of rewriting it.
           // One SDK input: several would be answered as several turns.
@@ -5133,10 +5531,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // Create a fresh prompt value — can be called multiple times for retry
       function makePrompt(): string | AsyncIterable<any> {
         if (structuredMessages) {
-          const msgs = structuredMessages
+          const msgs = instructionReminder ? withTrailingText(structuredMessages, instructionReminder) : structuredMessages
           return (async function* () { for (const msg of msgs) yield msg })()
         }
-        return textPrompt!
+        return instructionReminder ? `${instructionReminder}\n\n${textPrompt!}` : textPrompt!
       }
 
       // Passthrough tool_use capture. `capturedToolUses` holds the DISTINCT
@@ -5615,7 +6013,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             ? inheritSdkUuids(cachedSession, lineageResult, lineageMessages)
             : []
           // Pad to current message count (the last user message has no UUID yet)
-          while (sdkUuidMap.length < allMessages.length) sdkUuidMap.push(null)
+          while (sdkUuidMap.length < replyPosition) sdkUuidMap.push(null)
           let currentClientAssistantUuid: string | null = null
 
           claudeLog("upstream.start", { mode: "non_stream", model })
@@ -5797,29 +6195,24 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   // is gone whatever the last attempt was refused with, so a
                   // wording that alternates cannot escape to the client. Evict
                   // and replay the history as a fresh session (one-shot).
-                  // An auxiliary request never resumed the session, so it has no
-                  // mapping to evict or history to replay.
-                  if (independentCause !== "auxiliary-request" && (refusal === "missing-message" || sawUnresumableRefusal)) {
+                  // An auxiliary fork never owned the mapping: it replays
+                  // fresh without evicting it.
+                  if (refusal === "missing-message" || sawUnresumableRefusal) {
                     claudeLog("session.resume_replay", {
                       mode: "non_stream",
                       refusal,
                       rollbackUuid: undoRollbackUuid,
                       resumeSessionId,
                     })
-                    plog(`[PROXY] ${requestMeta.requestId} session unusable (${refusal}), evicting and replaying as fresh session`)
+                    plog(`[PROXY] ${requestMeta.requestId} session unusable (${refusal}), ${independentCause === "auxiliary-request" ? "replaying" : "evicting and replaying"} as fresh session`)
                     managedForkSuperseded = true
                     await abandonManagedFork("resume_replay")
-                    if (!(await evictSession(
-                      profileSessionId,
-                      profileScopedCwd,
-                      lineageMessages,
-                      mappingExpectedGeneration,
-                    ))) throw new Error("Session mapping changed before resume fallback eviction")
-                    mappingExpectedGeneration = refreshGenerationAfterEviction()
+                    await evictBeforeFreshFallback("resume")
                     await replaceWithFreshTarget("non_stream_resume_replay")
+                    publishFreshInstructionSections()
                     currentSessionId = managedForkTarget?.sessionId
                     sdkUuidMap.length = 0
-                    for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
+                    for (let i = 0; i < replyPosition; i++) sdkUuidMap.push(null)
                     yield* runSdkQueryAttempt(buildQueryOptions({
                       prompt: buildFreshPrompt(executionMessages, sanitizeOpts, renderReplayToolName, modelReplayBudget(), "non_stream_resume_replay"),
                       model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
@@ -5870,17 +6263,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     plog(`[PROXY] ${requestMeta.requestId} extra usage persisted on resumed ${model}, retrying as fresh session`)
                     managedForkSuperseded = true
                     await abandonManagedFork("fresh_model_fallback")
-                    if (!(await evictSession(
-                      profileSessionId,
-                      profileScopedCwd,
-                      lineageMessages,
-                      mappingExpectedGeneration,
-                    ))) throw new Error("Session mapping changed before model fallback eviction")
-                    mappingExpectedGeneration = refreshGenerationAfterEviction()
+                    await evictBeforeFreshFallback("model")
                     await replaceWithFreshTarget("non_stream_model_fallback")
+                    publishFreshInstructionSections()
                     currentSessionId = managedForkTarget?.sessionId
                     sdkUuidMap.length = 0
-                    for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
+                    for (let i = 0; i < replyPosition; i++) sdkUuidMap.push(null)
                     yield* runSdkQueryAttempt(buildQueryOptions({
                       prompt: buildFreshPrompt(executionMessages, sanitizeOpts, renderReplayToolName, modelReplayBudget(), "non_stream_model_fallback"),
                       model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
@@ -6089,6 +6477,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 }
               }
               if (message.type === "assistant") {
+                noteCvpRefusal(profile.id, message, body.model)
                 if (!sawTurnBoundarySignal) releaseHeldDenies("assistant_message")
                 assistantMessages += 1
                 // One Anthropic assistant response may combine several SDK
@@ -6096,10 +6485,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 if (!passthrough || earlyStop.expected.size === 0 || assistantAddedForwardedCall) {
                   sdkUuidMap = withClientAssistantUuid(
                     sdkUuidMap,
-                    allMessages.length,
+                    replyPosition,
                     (message as any).uuid
                   )
-                  currentClientAssistantUuid = sdkUuidMap[allMessages.length] ?? null
+                  currentClientAssistantUuid = sdkUuidMap[replyPosition] ?? null
                 }
                 if (!firstChunkAt) {
                   firstChunkAt = Date.now()
@@ -6463,7 +6852,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           )
           if (!warmProfileId) noteClaudeServed(profile.id, requestMeta.requestId, attributedRoutingMode)
           telemetryStore.record({
+            ...attribution,
             requestId: requestMeta.requestId,
+            clientSessionId: requestMeta.clientSessionId,
+            routingRequire,
             timestamp: Date.now(),
             adapter: adapter.name,
             profileId: profile.id,
@@ -6558,7 +6950,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                           profileScopedCwd,
                           reconcileReturnedSessionUuids(
                             sdkUuidMap,
-                            allMessages.length,
+                            replyPosition,
                             currentClientAssistantUuid,
                             resumeSessionId,
                             currentSessionId,
@@ -6572,6 +6964,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                           options.priorityPublication,
                           !executionHistory.changed,
                           resumeContextHash,
+                          instructionSectionPublication,
                           assertDurableWritesAllowed,
                         ), stored => {
                           // JSON cancellation shares this request queue; SQL flags wait for COMMIT below.
@@ -6795,7 +7188,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             let sdkUuidMap: Array<string | null> = (isResume || sdkUndo) && cachedSession
               ? inheritSdkUuids(cachedSession, lineageResult, lineageMessages)
               : []
-            while (sdkUuidMap.length < allMessages.length) sdkUuidMap.push(null)
+            while (sdkUuidMap.length < replyPosition) sdkUuidMap.push(null)
             let currentClientAssistantUuid: string | null = null
 
             let messageStartEmitted = false
@@ -7089,7 +7482,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               const totalMs = Date.now() - requestStartAt
               const queueWaitMs = totalQueueWaitMs(requestMeta)
               observeStreamFailure(() => telemetryStore.record({
-                requestId: requestMeta.requestId, timestamp: Date.now(), adapter: adapter.name,
+                ...attribution,
+                requestId: requestMeta.requestId, timestamp: Date.now(), adapter: adapter.name, routingRequire,
+                clientSessionId: requestMeta.clientSessionId,
                 profileId: profile.id, routeKind, routeGroupId, routeAttempt, requestSource, model,
                 requestModel: body.model || undefined, resolvedModel: resolvedHaikuModel(), mode: "stream", isResume,
                 isPassthrough: passthrough, hasDeferredTools, toolCount, lineageType,
@@ -7232,29 +7627,24 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     // The session cannot serve this turn — evict and replay
                     // the history as a fresh session (one-shot). See the
                     // non-stream branch above for the full rationale.
-                    // An auxiliary request never resumed the session, so it has no
-                    // mapping to evict or history to replay.
-                    if (independentCause !== "auxiliary-request" && (refusal === "missing-message" || sawUnresumableRefusal)) {
+                    // An auxiliary fork never owned the mapping: it replays
+                    // fresh without evicting it.
+                    if (refusal === "missing-message" || sawUnresumableRefusal) {
                       claudeLog("session.resume_replay", {
                         mode: "stream",
                         refusal,
                         rollbackUuid: undoRollbackUuid,
                         resumeSessionId,
                       })
-                      plog(`[PROXY] ${requestMeta.requestId} session unusable (${refusal}), evicting and replaying as fresh session`)
+                      plog(`[PROXY] ${requestMeta.requestId} session unusable (${refusal}), ${independentCause === "auxiliary-request" ? "replaying" : "evicting and replaying"} as fresh session`)
                       managedForkSuperseded = true
                       await abandonManagedFork("resume_replay")
-                      if (!(await evictSession(
-                        profileSessionId,
-                        profileScopedCwd,
-                        lineageMessages,
-                        mappingExpectedGeneration,
-                      ))) throw new Error("Session mapping changed before resume fallback eviction")
-                      mappingExpectedGeneration = refreshGenerationAfterEviction()
+                      await evictBeforeFreshFallback("resume")
                       await replaceWithFreshTarget("stream_resume_replay")
+                      publishFreshInstructionSections()
                       currentSessionId = managedForkTarget?.sessionId
                       sdkUuidMap.length = 0
-                      for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
+                      for (let i = 0; i < replyPosition; i++) sdkUuidMap.push(null)
                       yield* runSdkQueryAttempt(buildQueryOptions({
                         prompt: buildFreshPrompt(executionMessages, sanitizeOpts, renderReplayToolName, modelReplayBudget(), "stream_resume_replay"),
                         model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
@@ -7301,17 +7691,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                       plog(`[PROXY] ${requestMeta.requestId} extra usage persisted on resumed ${model}, retrying as fresh session`)
                       managedForkSuperseded = true
                       await abandonManagedFork("fresh_model_fallback")
-                      if (!(await evictSession(
-                        profileSessionId,
-                        profileScopedCwd,
-                        lineageMessages,
-                        mappingExpectedGeneration,
-                      ))) throw new Error("Session mapping changed before model fallback eviction")
-                      mappingExpectedGeneration = refreshGenerationAfterEviction()
+                      await evictBeforeFreshFallback("model")
                       await replaceWithFreshTarget("stream_model_fallback")
+                      publishFreshInstructionSections()
                       currentSessionId = managedForkTarget?.sessionId
                       sdkUuidMap.length = 0
-                      for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
+                      for (let i = 0; i < replyPosition; i++) sdkUuidMap.push(null)
                       yield* runSdkQueryAttempt(buildQueryOptions({
                         prompt: buildFreshPrompt(executionMessages, sanitizeOpts, renderReplayToolName, modelReplayBudget(), "stream_model_fallback"),
                         model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
@@ -7522,12 +7907,15 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   ) {
                     sdkUuidMap = withClientAssistantUuid(
                       sdkUuidMap,
-                      allMessages.length,
+                      replyPosition,
                       (message as any).uuid
                     )
-                    currentClientAssistantUuid = sdkUuidMap[allMessages.length] ?? null
+                    currentClientAssistantUuid = sdkUuidMap[replyPosition] ?? null
                   }
-                  if (message.type === "assistant") assistantRefusal = assistantRefusalOf(message)
+                  if (message.type === "assistant") {
+                    assistantRefusal = assistantRefusalOf(message)
+                    noteCvpRefusal(profile.id, message, body.model)
+                  }
                   if (message.type === "assistant" && !messageStartEmitted) {
                     const unstreamed = (message as { message?: (typeof unstreamedAssistants)[number] }).message
                     if (unstreamed) {
@@ -8038,7 +8426,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                         profileScopedCwd,
                         reconcileReturnedSessionUuids(
                           sdkUuidMap,
-                          allMessages.length,
+                          replyPosition,
                           currentClientAssistantUuid,
                           resumeSessionId,
                           currentSessionId,
@@ -8052,6 +8440,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                         options.priorityPublication,
                         !executionHistory.changed,
                         resumeContextHash,
+                        instructionSectionPublication,
                         assertDurableWritesAllowed,
                       ), stored => {
                         // JSON cancellation shares this request queue; SQL flags wait for COMMIT below.
@@ -8382,7 +8771,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   recoveryCompleted && silentTurnRecovered && recoverySessionId &&
                   !isIndependentSession && !sawDuplicateToolUse
                 ) {
-                  const recoverySdkUuidMap = allMessages.map(() => null)
+                  const recoverySdkUuidMap: Array<string | null> = Array.from({ length: replyPosition }, () => null)
                   if (!bookkeepingHandle) await commitFork(recoveryForkTarget, admissionLifecycleOptions)
                   assertDurableWritesAllowed()
                   const recoveryMappingStored = await publishPinnedTranscript(
@@ -8404,6 +8793,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                         options.priorityPublication,
                         !executionHistory.changed,
                         resumeContextHash,
+                        instructionSectionPublication,
                         assertDurableWritesAllowed,
                       ), stored => {
                         // JSON cancellation shares this request queue; SQL flags wait for COMMIT below.
@@ -8680,7 +9070,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 )
                 if (!warmProfileId) noteClaudeServed(profile.id, requestMeta.requestId, attributedRoutingMode)
                 telemetryStore.record({
+                  ...attribution,
                   requestId: requestMeta.requestId,
+                  clientSessionId: requestMeta.clientSessionId,
+                  routingRequire,
                   timestamp: Date.now(),
                   adapter: adapter.name,
             profileId: profile.id,
@@ -8830,7 +9223,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               } else {
                 streamErr = classifyBookkeepingFailure(error, errMsg, model)
               }
-              await noteClaudeAuthenticationFailure(profile, { message: errMsg, startedAt: requestMeta.currentSdkStartedAt ?? requestStartAt })
               // Failure events mean the turn did not recover; recovered capped
               // turns log upstream.completed. Finally also covers publication
               // throws and rejected awaits before either recovered return.
@@ -9120,7 +9512,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                         profileScopedCwd,
                         reconcileReturnedSessionUuids(
                           sdkUuidMap,
-                          allMessages.length,
+                          replyPosition,
                           currentClientAssistantUuid,
                           resumeSessionId,
                           currentSessionId,
@@ -9134,6 +9526,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                         options.priorityPublication,
                         !executionHistory.changed,
                         resumeContextHash,
+                        instructionSectionPublication,
                         assertDurableWritesAllowed,
                       ), stored => {
                         // JSON cancellation shares this request queue; SQL flags wait for COMMIT below.
@@ -9229,7 +9622,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 const recoverQueueWaitMs = totalQueueWaitMs(requestMeta)
                 if (!warmProfileId) noteClaudeServed(profile.id, requestMeta.requestId, attributedRoutingMode)
                 telemetryStore.record({
+                  ...attribution,
                   requestId: requestMeta.requestId,
+                  clientSessionId: requestMeta.clientSessionId,
+                  routingRequire,
                   timestamp: Date.now(),
                   adapter: adapter.name,
                   profileId: profile.id,
@@ -9381,7 +9777,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 const cappedQueueWaitMs = totalQueueWaitMs(requestMeta)
                 if (!warmProfileId) noteClaudeServed(profile.id, requestMeta.requestId, attributedRoutingMode)
                 telemetryStore.record({
+                  ...attribution,
                   requestId: requestMeta.requestId,
+                  clientSessionId: requestMeta.clientSessionId,
+                  routingRequire,
                   timestamp: Date.now(),
                   adapter: adapter.name,
                   profileId: profile.id,
@@ -9458,7 +9857,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               const streamErrTotalMs = Date.now() - requestStartAt
               const streamErrQueueWaitMs = totalQueueWaitMs(requestMeta)
               telemetryStore.record({
+                ...attribution,
                 requestId: requestMeta.requestId,
+                clientSessionId: requestMeta.clientSessionId,
+                routingRequire,
                 timestamp: Date.now(),
                 adapter: adapter.name,
                 profileId: profile.id,
@@ -9662,7 +10064,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             : classifyBookkeepingFailure(error, errMsg)
 
         if (resolvedProfileId && !requestAbort.controller.signal.aborted) {
-          await noteClaudeAuthenticationFailure(resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, resolvedProfileId), { message: errMsg, startedAt: requestMeta.currentSdkStartedAt ?? requestStartAt })
         }
 
         // Non-streaming failures still own their headers here, so the hint goes
@@ -9701,7 +10102,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const errorQueueWaitMs = totalQueueWaitMs(requestMeta)
         const errorTotalMs = Date.now() - requestStartAt
         telemetryStore.record({
+          ...attribution,
           requestId: requestMeta.requestId,
+          clientSessionId: requestMeta.clientSessionId,
+          routingRequire,
           timestamp: Date.now(),
           adapter: adapter.name,
           profileId: attributedProfileId ?? resolvedProfileId,
@@ -9935,6 +10339,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // client-session identity.
       const adapter = detectAdapter(c)
       const agentSessionId = Array.isArray(body?.messages) ? adapter.getSessionId(c, body) : undefined
+      const synthesizedSession = c.req.header("x-meridian-internal-hop") === internalHopToken
+        && c.req.header(SYNTHESIZED_SESSION_HEADER) === "1"
+      const responsesClientSessionId = inheritedOwner?.responsesClientSessionId
+      const resolvedClientSessionId = responsesClientSessionId !== undefined
+        ? responsesClientSessionId ?? undefined
+        : synthesizedSession ? undefined : adapter.getClientSessionId?.(c, body) ?? agentSessionId
+      const clientSessionId = resolvedClientSessionId ?? readClientSessionId(c.req.raw.headers)
       if (Array.isArray(body?.messages)) {
         routingTurnIdentity = adapter.getRoutingTurnIdentity?.(c, body)
         auxiliaryRequest = agentSessionId !== undefined && adapter.isAuxiliaryRequest?.(c, body) === true
@@ -10039,9 +10450,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             // symptom this whole feature can cause.
             const cancelledWaitMs = Date.now() - queueEnteredAt
             telemetryStore.record({
+              ...readClientAttribution(c.req.raw.headers),
               requestId,
+              clientSessionId,
               timestamp: Date.now(),
               adapter: adapter.name,
+              routingRequire: routingRequireOf(c.req.header(ROUTING_REQUIRE_HEADER)),
               model: "unknown",
               requestModel: undefined,
               mode: "non-stream",
@@ -10090,6 +10504,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
       const requestMeta: RequestMeta = {
         requestId,
+        clientSessionId,
         endpoint,
         queueEnteredAt,
         sessionQueueWaitMs: (sessionTurnLease?.waitedMs ?? 0) + (crossProcessTurnLease?.waitedMs ?? 0),
@@ -10154,9 +10569,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   let chatGptUsage: CodexUsageResponse | null = null
   let chatGptUsageAt = 0
   let chatGptUsageRefresh: Promise<void> | undefined
-  const refreshChatGptUsage = (): Promise<void> | undefined => {
+  const refreshChatGptUsage = (force = false): Promise<void> | undefined => {
     if (!chatGptSource) return undefined
-    if (!chatGptUsageRefresh && Date.now() - chatGptUsageAt >= 30_000) {
+    if (!chatGptUsageRefresh && (force || Date.now() - chatGptUsageAt >= 30_000)) {
       const startedAt = Date.now()
       chatGptUsageAt = startedAt
       chatGptUsageRefresh = getCodexUsage({ loadPool: () => chatGptSource.usagePool() })
@@ -10220,13 +10635,33 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     aliases: () => getSetting("chatGptProfileAliases"),
     activeSeat: () => getSetting("chatGptActiveSeat"),
     excluded: configuredRoutingExcludedProfileIds,
+    pinExcluded: userRoutingExcludedProfileIds,
     held: configuredRoutingHeldProfileIds,
     order: priorityProfileOrderSetting,
     spent: (profileId) => spentProfiles.get(profileId),
     freeSeatOrder: () => getChatGptFeatures().freeSeatOrder,
+    renewalHours: (seat) => getChatGptFeatures().seatRenewalHours[seat] ?? null,
   }) : undefined
+  const claudeProfileIds = (): string[] => listProfiles(finalConfig.profiles, finalConfig.defaultProfile).map(p => p.id)
+  /**
+   * Per model, the profiles whose CVP map shows active access, in `order`, and
+   * of those the ones holding it by organization inference, each with the
+   * sibling whose reading it is.
+   */
+  const cvpHoldersByModel = (order: readonly string[]): { holders: Record<string, string[]>; inferred: Record<string, Record<string, string>> } => {
+    const holders: Record<string, string[]> = {}
+    const inferred: Record<string, Record<string, string>> = {}
+    for (const id of order) {
+      for (const entry of cvpAccessFor(id)) {
+        if (entry.type !== "active") continue
+        ;(holders[entry.model] ??= []).push(id)
+        if (entry.inferredFrom) (inferred[entry.model] ??= {})[id] = entry.inferredFrom
+      }
+    }
+    return { holders, inferred }
+  }
   const orderableProfileIds = (): string[] => [
-    ...listProfiles(finalConfig.profiles, finalConfig.defaultProfile).map(p => p.id),
+    ...claudeProfileIds(),
     ...(chatGptProfiles?.profiles().map(p => p.id) ?? []),
   ]
 
@@ -10292,9 +10727,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const tokens = usage ? chatGptTokenFields(usage) : undefined
     telemetryStore.record({
       requestId: event.requestId,
+      clientSessionId: event.clientSessionId,
       timestamp: Date.now(),
       adapter: CHATGPT_ADAPTER,
       requestSource: event.requestSource,
+      client: event.client,
+      purpose: event.purpose,
       // `model` is what served the turn (the fallback when one ran) and is
       // what the cost estimate prices a GPT row by; `requestModel` is the
       // client's own id.
@@ -10321,6 +10759,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     plog(`[PROXY] ${event.requestId} chatgpt model=${event.model ?? event.requestModel ?? "unknown"} seat=${profileId ?? "none"} status=${event.status}${event.servedOnCredits ? " credits=1" : ""} attempts=${event.attempts.length} adapted=${event.adaptations.join(",") || "none"}${usage ? ` in=${usage.inputTokens} cached=${usage.cachedInputTokens} out=${usage.outputTokens} reasoning=${usage.reasoningTokens}` : ""}${decoration.fallbackFromModel ? ` fallback_from=${decoration.fallbackFromModel}` : ""}${decoration.error ? ` error=${decoration.error}` : ""}`)
   }
 
+  const chatGptEvidencePolicy = () => {
+    const profiles = chatGptProfiles?.profiles()
+    if (!profiles) return
+    const features = getChatGptFeatures()
+    return JSON.stringify(profiles.map(profile => [profile.id, profile.seat, effectiveCreditsPolicy(features, profile.seat).policy]))
+  }
   const chatGptBackend = chatGptSource ? createChatGptBackend<Context>({
     source: chatGptSource,
     // Rebuilt rather than forwarded: dispatch has already read this body to
@@ -10349,6 +10793,42 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       if (pending) await Promise.race([pending, new Promise(resolve => setTimeout(resolve, CHATGPT_QUOTA_WAIT_MS))])
     },
     creditsPolicy: (seat) => effectiveCreditsPolicy(getChatGptFeatures(), seat).policy,
+    routeRefusalProof: (input, c) => {
+      if (forcedProfileId() || chatGptBodyOverrides.has(c) || !chatGptSource.isServing() || !chatGptProfiles || !chatGptCatalog || !chatGptUsage) return
+      const features = getChatGptFeatures()
+      const admitted = chatGptLedger.open(c, features).features
+      if (features.fallbackModel || admitted.fallbackModel || features.maxBudgetUsd > 0 || admitted.maxBudgetUsd > 0) return
+      const currentRoute = chatGptProfiles.route(undefined, "work")
+      if (currentRoute.kind !== "pool") return
+      const manual = new Set([...userRoutingExcludedProfileIds(), ...configuredRoutingHeldProfileIds()])
+      const profiles = chatGptProfiles.profiles()
+      if (profiles.some(profile => [profile.id, profile.seat, ...profile.aliases].some(id => manual.has(id)))) return
+      const bySeat = new Map(profiles.map(profile => [profile.seat, profile.id]))
+      const uncertain = new Set(chatGptExhaustion.snapshot().filter(mark => mark.reason !== "quota_spent").map(mark => mark.id))
+      const pool = chatGptSource.refusalPool?.(input.binding.model)
+      if (!pool?.pool || chatGptRefusalPoolKey(pool) !== input.poolKey) return
+      const seats = pool.pool.accounts.flatMap(account => account.accountUserId ? [account.accountUserId] : [])
+      if (seats.length !== pool.pool.accounts.length || seats.length !== bySeat.size || new Set(seats).size !== seats.length ||
+          seats.some(seat => !bySeat.has(seat))) return
+      const usageEvidence = currentCodexUsageEvidence(pool)
+      const now = Date.now()
+      const reserves = usageReserves()
+      return proveChatGptRouteRefusal(input, {
+        managed: managedChatGptEvidencePolicy === chatGptEvidencePolicy() ? managedChatGptExclusionEvidence : undefined,
+        now, seats, entries: chatGptUsage.entries, usageEvidence,
+        currentExclusions: currentRoute.excluded,
+        profile: seat => bySeat.get(seat),
+        blocked: seat => uncertain.has(seat) || chatGptProfiles.loginState(seat) !== "authenticated",
+        currentReserve: seat => {
+          const id = bySeat.get(seat)
+          const reserve = id ? reserves[id] : undefined
+          const usage = usageEvidence.get(seat)
+          return reserve && usage ? usageReserveHold(seatWindows({ usage: { ...usage, stale: false } }).windows, reserve, now) : null
+        },
+        creditsPolicy: seat => effectiveCreditsPolicy(features, seat).policy,
+        routeOffered: plan => chatGptCatalog.routeOffered(input.binding.model, input.binding.variant, plan),
+      })
+    },
     reasoningSummary: () => forcedReasoningSummary(getChatGptFeatures()),
     planWindows: (seat) => {
       const entry = chatGptUsage?.entries.find(candidate => candidate.id === seat)
@@ -10362,8 +10842,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // Only an internal hop carrying this instance's token may claim to be a
     // warm, which is what lets it use a seat excluded from work.
     route: (turn) => {
-      const warm = turn.headers.get("x-meridian-internal-hop") === internalHopToken
-        && turn.headers.get("x-meridian-routing-purpose") === "warm"
+      const warm = isMeridianWarm(turn.headers)
       const route = chatGptProfiles!.route(turn.headers.get("x-meridian-profile") ?? undefined, warm ? "warm" : "work")
       if (route.kind === "unknown") return { kind: "refuse", error: "unknown_profile", response: unknownProfileResponse(route.id) }
       if (route.kind !== "refuse") return warm ? { ...route, spendCredits: false, warm: true } : route
@@ -10391,6 +10870,88 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       onRefusalsSettled: recordChatGptRefusalOutcome,
     },
   }) : undefined
+  let returnModelRead: Promise<unknown> | undefined
+  app.get("/profiles/route-availability", async (c) => {
+    const provider = c.req.query("provider")
+    const model = c.req.query("model")
+    const variant = c.req.query("variant")
+    c.header("Cache-Control", "no-store")
+    if ((provider !== "claude" && provider !== "chatgpt") || !model || model.length > 128 || !variant || variant.length > 32) {
+      return c.json({ error: "Expected a Claude or ChatGPT provider and exact model and variant" }, 400)
+    }
+    const now = Date.now()
+    if (provider === "claude") {
+      const query = { provider, model, variant }
+      const unpinnedPool = () => isPoolRouting(getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing"))) &&
+        !forcedProfileId() && getClaudeExtraUsagePolicy(process.env.MERIDIAN_CLAUDE_EXTRA_USAGE ?? getSetting("claudeExtraUsage")) !== "immediately"
+      const requirements = parseRoutingRequirements(c.req.header(ROUTING_REQUIRE_HEADER))
+      if (!isExactClaudeWireModel(model) || !normalizeEffort(variant) || !unpinnedPool() ||
+        c.req.header("x-meridian-profile") !== undefined || requirements.cvp || requirements.unknown.length > 0) {
+        return c.json(routeAvailability(query, [], now))
+      }
+      const family = claudeModelFamily(model)
+      const pool = () => evaluateRoutingProfileAccess({
+        profiles: getEffectiveProfiles(finalConfig.profiles), defaultProfile: finalConfig.defaultProfile, purpose: "work",
+        excludedProfileIds: userRoutingExcludedProfileIds(), managedExcludedProfileIds: managedRoutingExcludedProfileIds(),
+        heldProfileIds: routingHeldProfileIds(),
+      })
+      const observed = await Promise.all(pool().profiles.flatMap(profile => {
+        if ((profile.type ?? "claude-max") !== "claude-max" || !peekSuccessfulOAuthUsage(profile.id)) return []
+        const account = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, profile.id)
+        const store = credentialStoreForProfile(account)
+        if (!store) return []
+        return [store.read().then(value => ({ account, store, credential: value?.claudeAiOauth }), () => ({ account, store, credential: undefined }))]
+      }))
+      const checkedAt = Date.now()
+      if (!unpinnedPool()) return c.json(routeAvailability(query, [], checkedAt))
+      const routable = pool().profiles.map(profile => profile.id)
+      const weekly = weeklyReserveHolds(routable,
+        parseWeeklyReserves(process.env.MERIDIAN_WEEKLY_RESERVE, getSetting("weeklyReserve")).reserves, weeklyUsageReadings, checkedAt)
+      const reserves = usageReserves()
+      let catalogProbe: (typeof observed)[number] | undefined
+      const eligible = observed.flatMap(candidate => {
+        const { account: { id }, store, credential } = candidate
+        if (!routable.includes(id) || weekly.has(id) || priorityExhaustion.isExhausted(id, family) || profileDrawsExtraUsage(id) ||
+          typeof credential?.accessToken !== "string" || !credential.accessToken || !Number.isFinite(credential.expiresAt) || credential.expiresAt <= checkedAt ||
+          authLifecycleFor(store.refreshKey)?.firstUnauthedAt !== undefined) return []
+        const tokenDigest = createHash("sha256").update(credential.accessToken).digest("hex")
+        const snapshot = peekSuccessfulOAuthUsage(id, tokenDigest)
+        if (!snapshot?.extraUsage) return []
+        const sdk = rateLimitStore.getAll(id)
+        const usage = claudeReturnUsage(model, snapshot, sdk)
+        if (!usage || !routeAvailability(query, [usage], checkedAt).available || usageReserveHold(usage.windows, reserves[id], checkedAt)) return []
+        if (accountOffersModelEffort(id, query, { now: checkedAt, tokenDigest })) return [usage]
+        if (accountModelReadDue(id, checkedAt, tokenDigest)) catalogProbe ??= candidate
+        return []
+      })
+      if (eligible.length === 0 && !returnModelRead && catalogProbe) {
+        const { account, store } = catalogProbe
+        returnModelRead = fetchAccountModels({ cacheKey: account.id, force: true,
+          auth: () => resolveDesignAuthHeaders({ designToken: null, profile: account, credentialStore: store }),
+        }).finally(() => { returnModelRead = undefined })
+      }
+      return c.json(routeAvailability(query, eligible, checkedAt))
+    }
+    const query = { provider, model, variant }
+    if (forcedProfileId() || c.req.header("x-meridian-profile") !== undefined || c.req.header(ROUTING_REQUIRE_HEADER) !== undefined) {
+      return c.json(routeAvailability(query, [], now))
+    }
+    const route = chatGptProfiles?.route(undefined, "work")
+    if (route?.kind !== "pool" || !chatGptSource?.isServing() || !chatGptBackend || !chatGptCatalog || !chatGptUsage) {
+      return c.json(routeAvailability(query, [], now))
+    }
+    const seats = new Map(chatGptSource.seats(model).map(seat => [seat.id, seat]))
+    const current = currentCodexUsageEvidence(chatGptSource.usagePool())
+    const eligible = chatGptUsage.entries.filter(entry => {
+      const seat = seats.get(entry.id)
+      const evidence = current.get(entry.id)
+      return evidence?.identityConfirmed === true && evidence.fetchedAt === entry.fetchedAt &&
+        entry.plan !== null && seat?.eligible && seat.expiresAt !== null && seat.expiresAt > now &&
+        !route.excluded.has(entry.id) && chatGptProfiles?.loginState(entry.id) === "authenticated" &&
+        chatGptBackend.planSeatAvailable(entry.id, model) && chatGptCatalog.routeOffered(model, variant, entry.plan.slug)
+    })
+    return c.json(routeAvailability(query, eligible, now))
+  })
   if (chatGptBackend) {
     chatGptObserved = () => chatGptBackend.observedLimits()
     chatGptCreditState = (seat) => chatGptBackend.seatCreditState(seat)
@@ -10473,10 +11034,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
   }
 
-  // The client session a ChatGPT turn belongs to: the adapter's own key when
-  // the client sends one (header-derived, read-only), else prompt_cache_key,
-  // which Responses clients set per conversation.
-  const chatGptSessionKey = async (c: Context): Promise<{ key: string; parent?: string } | undefined> => {
+  const chatGptSessionKey = async (c: Context) => {
     let body: Record<string, unknown> | undefined
     try {
       const parsed = JSON.parse(await c.req.text()) as unknown
@@ -10486,8 +11044,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
     const adapter = detectAdapter(c)
     const cacheKey = typeof body?.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : undefined
-    const key = adapter.getSessionId(c, body) ?? cacheKey
-    return key ? { key, parent: adapter.getParentSessionId?.(c, body) } : undefined
+    const adapterKey = adapter.getSessionId(c, body)
+    const key = adapterKey ?? cacheKey
+    const clientSessionId = adapter.getClientSessionId?.(c, body) ?? adapterKey
+      ?? resolveCodexThreadIdentity(body ?? {}, c.req.header("x-codex-turn-metadata")).threadId
+      ?? readClientSessionId(c.req.raw.headers)
+    return { key, parent: key ? adapter.getParentSessionId?.(c, body) : undefined, clientSessionId }
   }
 
   const dispatchUpstream = async (c: Context, endpoint: UpstreamEndpoint, route: string) => {
@@ -10559,13 +11121,16 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // Registered in the session tree like a Claude turn, so
         // /v1/sessions/:key/cancel stops a ChatGPT turn of that session too.
         const session = await chatGptSessionKey(c)
-        treeEntry = session ? processSessionTree.register({
+        treeEntry = session.key ? processSessionTree.register({
           requestId: `chatgpt-${randomUUID()}`,
           sessionKey: session.key,
           parentKey: session.parent,
           abort: (reason) => controller.abort(reason),
         }) : undefined
-        const response = await backend.handle({ context: c, endpoint, route })
+        const response = await backend.handle({
+          context: c, endpoint, route, clientSessionId: session.clientSessionId,
+          meridianWarm: isMeridianWarm(c.req.raw.headers),
+        })
         return completeUpstreamResponse(response, controller.signal, complete)
       } catch (error) {
         complete()
@@ -10618,6 +11183,43 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     })
   })
 
+  /**
+   * Arm a system prompt reset for a session key: its next turn that publishes
+   * replays the client history into a fresh SDK session, which renders the
+   * client's current system prompt. Process-local; gated by `/v1/*` auth.
+   */
+  app.post("/v1/sessions/:key/system-prompt-reset", (c) => {
+    const key = c.req.param("key")
+    if (!key) {
+      return c.json({ type: "error", error: { type: "invalid_request_error", message: "Session key is required" } }, 400)
+    }
+    pendingSystemPromptResets.arm(key)
+    claudeLog("session.system_prompt_reset_armed", { session: truncateSessionKey(key) })
+    return c.json({ session: key, pending: true })
+  })
+
+  /**
+   * Refresh a session's prompt cache now (prompt-cache keepalive in `client`
+   * mode, src/proxy/SPEC.md → Decisions). `:key` is the client's session key
+   * (`x-session-affinity`, `x-opencode-session`, ...). The beat is the same
+   * read-only one the automatic schedule sends; this only lets a client that
+   * knows whether its user is coming back decide when, within the operator's
+   * per-period cap and a minimum gap. Answers `disabled` unless the operator
+   * chose client mode, otherwise once the beat has finished, with its outcome.
+   */
+  app.post("/v1/sessions/:key/cache-beat", async (c) => {
+    const key = c.req.param("key")
+    if (!key) {
+      return c.json({ type: "error", error: { type: "invalid_request_error", message: "Session key is required" } }, 400)
+    }
+    if (cacheKeepaliveMode() !== "client") return c.json({ session: key, outcome: "disabled" })
+    const trackedKeys = cacheKeepalive.keysForSession(key)
+    if (trackedKeys.length === 0) return c.json({ session: key, outcome: "untracked" })
+    const outcomes = await Promise.all(trackedKeys.map((trackedKey) => cacheKeepalive.beatNow(trackedKey)))
+    const outcome = outcomes.find((value) => value === "reached") ?? outcomes[0]
+    return c.json({ session: key, outcome })
+  })
+
   // Telemetry dashboard and API
   app.route("/telemetry", createTelemetryRoutes({
     getSessionTree: () => processSessionTree.stats(),
@@ -10658,6 +11260,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // still take precedence when set (reported so the UI can say so).
   app.get("/settings/api/routing", (c) => {
     const profileIds = orderableProfileIds()
+    const cvpEffectiveOrder = resolvePriorityOrder(claudeProfileIds(), cvpProfileOrderSetting()).order
+    const cvpHolders = cvpHoldersByModel(cvpEffectiveOrder)
     return c.json({
       routing: getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing")),
       modes: ROUTING_MODES,
@@ -10665,10 +11269,25 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       routingExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles")),
       routingManagedExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")),
       routingHeldProfiles: configuredRoutingHeldProfileIds(),
+      routingManagedReasons: parseRoutingManagedReasons(getSetting("routingManagedReasons")),
+      routingManagedChatGptExclusionEvidenceActive: managedChatGptExclusionEvidence !== undefined &&
+        capacityObservationIsFresh(managedChatGptExclusionEvidence.observedAt, Date.now()),
+      allowForcingForbiddenProfile: getSetting("allowForcingForbiddenProfile") === true,
+      // The force in effect: while it holds, the supervisor's lists above
+      // still name the profile but do not act on it (forcedProfile.ts).
+      forcedActiveProfile: liveForced(),
       usageReserves: usageReserves(),
+      // The cybersec switcher's half: what it saved, what `x-meridian-require:
+      // cvp` work walks, and who holds access on each model in that order.
+      cvpProfileOrder: parseRoutingExcludedProfiles(getSetting("cvpProfileOrder")),
+      cvpEffectiveProfileOrder: cvpEffectiveOrder,
+      cvpActiveProfile: getSetting("cvpActiveProfile") ?? null,
+      cvpManagedExcludedProfiles: cvpManagedExcludedProfileIds(),
+      cvpHolders: cvpHolders.holders,
+      cvpInferredHolders: cvpHolders.inferred,
       // What a supervisor may rely on this build doing; read rather than
       // guessed from a version, which forks share.
-      capabilities: ["managed-exclusion-no-routable"],
+      capabilities: ["managed-exclusion-no-routable", "managed-exclusion-evidence-v1", "managed-chatgpt-exclusion-evidence-v1", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order", "cvp-organization-inference", "forced-active-profile", "managed-exclusion-reasons", "usage-refresh", "profile-refresh"],
       profiles: profileIds,
       saved: {
         routing: getSetting("routing") ?? null,
@@ -10693,7 +11312,14 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       routingExcludedProfiles?: unknown
       routingManagedExcludedProfiles?: unknown
       routingHeldProfiles?: unknown
+      routingManagedReasons?: unknown
+      routingManagedExclusionEvidence?: unknown
+      routingManagedChatGptExclusionEvidence?: unknown
+      allowForcingForbiddenProfile?: unknown
       usageReserves?: unknown
+      cvpProfileOrder?: unknown
+      cvpActiveProfile?: unknown
+      cvpManagedExcludedProfiles?: unknown
     }
     try { body = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
     // One form submits routing, order and exclusions together, so a later
@@ -10732,6 +11358,23 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       }
       updates.routingHeldProfiles = parseRoutingExcludedProfiles(body.routingHeldProfiles)
     }
+    // The whole map, as the lists are written: a profile left out has no reason.
+    if (body.routingManagedReasons !== undefined) {
+      if (body.routingManagedReasons === null || typeof body.routingManagedReasons !== "object" || Array.isArray(body.routingManagedReasons)) {
+        return c.json({ error: "routingManagedReasons must be an object of profile id to reason text" }, 400)
+      }
+      updates.routingManagedReasons = parseRoutingManagedReasons(body.routingManagedReasons)
+    }
+    if (body.allowForcingForbiddenProfile !== undefined) {
+      if (typeof body.allowForcingForbiddenProfile !== "boolean") {
+        return c.json({ error: "allowForcingForbiddenProfile must be a boolean" }, 400)
+      }
+      // A browser on another site must not switch on the override.
+      if (!isSameOriginRequest(c.req.raw)) {
+        return c.json({ error: "allowForcingForbiddenProfile requires a same-origin request" }, 403)
+      }
+      updates.allowForcingForbiddenProfile = body.allowForcingForbiddenProfile
+    }
     // The whole map at once, as the managed exclusions are written: the
     // supervisor that owns the policy sends every reserve it means, and a
     // profile it leaves out has none.
@@ -10743,8 +11386,72 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       if (unknown.length > 0) return c.json({ error: `Unknown profiles: ${unknown.join(", ")}` }, 400)
       updates.usageReserves = parsed.value
     }
+    // The cybersec switcher's settings name Claude profiles only: cvp work
+    // never reaches a ChatGPT seat.
+    if (body.cvpProfileOrder !== undefined) {
+      if (!Array.isArray(body.cvpProfileOrder) || body.cvpProfileOrder.some(x => typeof x !== "string")) {
+        return c.json({ error: "cvpProfileOrder must be an array of Claude profile ids" }, 400)
+      }
+      const known = new Set(claudeProfileIds())
+      const unknown = (body.cvpProfileOrder as string[]).filter(id => !known.has(id))
+      if (unknown.length > 0) return c.json({ error: `Unknown Claude profiles: ${unknown.join(", ")}` }, 400)
+      updates.cvpProfileOrder = parseRoutingExcludedProfiles(body.cvpProfileOrder)
+    }
+    if (body.cvpActiveProfile !== undefined) {
+      if (body.cvpActiveProfile !== null && (typeof body.cvpActiveProfile !== "string" || !claudeProfileIds().includes(body.cvpActiveProfile))) {
+        return c.json({ error: "cvpActiveProfile must be a Claude profile id or null" }, 400)
+      }
+      updates.cvpActiveProfile = body.cvpActiveProfile ?? undefined
+    }
+    if (body.cvpManagedExcludedProfiles !== undefined) {
+      if (!Array.isArray(body.cvpManagedExcludedProfiles) || body.cvpManagedExcludedProfiles.some(profileId => typeof profileId !== "string")) {
+        return c.json({ error: "cvpManagedExcludedProfiles must be an array of profile ids" }, 400)
+      }
+      updates.cvpManagedExcludedProfiles = parseRoutingExcludedProfiles(body.cvpManagedExcludedProfiles)
+    }
+    let evidence: ManagedExclusionEvidence | undefined
+    if (body.routingManagedExclusionEvidence !== undefined) {
+      if (!isSameOriginRequest(c.req.raw)) return c.json({ error: "Managed exclusion evidence requires a same-origin request" }, 403)
+      if (body.routingManagedExclusionEvidence !== null) {
+        const known = new Set(claudeProfileIds())
+        const excluded = new Set((updates.routingManagedExcludedProfiles ?? managedRoutingExcludedProfileIds()).filter(id => known.has(id)))
+        evidence = parseManagedExclusionEvidence(body.routingManagedExclusionEvidence, excluded)
+        if (!evidence || evidence.observedAt > Date.now()) return c.json({ error: "Invalid managed exclusion evidence" }, 400)
+        if (managedExclusionEvidence && evidence.observedAt < managedExclusionEvidence.observedAt) {
+          return c.json({ error: "Newer managed exclusion evidence is already recorded" }, 409)
+        }
+      }
+    }
+    let chatGptEvidence: ManagedExclusionEvidence | undefined
+    if (body.routingManagedChatGptExclusionEvidence !== undefined) {
+      if (!isSameOriginRequest(c.req.raw)) return c.json({ error: "Managed ChatGPT exclusion evidence requires a same-origin request" }, 403)
+      if (body.routingManagedChatGptExclusionEvidence !== null) {
+        const known = new Set(chatGptProfiles?.profiles().map(profile => profile.id))
+        const excluded = new Set((updates.routingManagedExcludedProfiles ?? managedRoutingExcludedProfileIds()).filter(id => known.has(id)))
+        chatGptEvidence = parseManagedExclusionEvidence(body.routingManagedChatGptExclusionEvidence, excluded, CHATGPT_MANAGED_PROTECTION_REASONS)
+        if (!chatGptEvidence || chatGptEvidence.observedAt > Date.now()) return c.json({ error: "Invalid managed ChatGPT exclusion evidence" }, 400)
+        if (chatGptEvidence.observedAt < managedChatGptEvidenceHighWater ||
+            (chatGptEvidence.observedAt === managedChatGptEvidenceHighWater && (!managedChatGptExclusionEvidence ||
+              [...chatGptEvidence.reasons].some(([id, reason]) => managedChatGptExclusionEvidence?.reasons.get(id) !== reason)))) {
+          return c.json({ error: "Newer managed ChatGPT exclusion evidence is already recorded" }, 409)
+        }
+      }
+    }
     if (Object.keys(updates).length > 0) saveSettings(updates)
-    if (body.routingExcludedProfiles !== undefined || body.routingManagedExcludedProfiles !== undefined || body.routingHeldProfiles !== undefined) {
+    const changedEvidenceInputs = body.routingManagedExcludedProfiles !== undefined ||
+      body.routingManagedReasons !== undefined || body.routingExcludedProfiles !== undefined || body.routingHeldProfiles !== undefined ||
+      body.usageReserves !== undefined
+    if (body.routingManagedExclusionEvidence !== undefined || changedEvidenceInputs) managedExclusionEvidence = evidence
+    if (body.routingManagedChatGptExclusionEvidence !== undefined || changedEvidenceInputs) {
+      managedChatGptExclusionEvidence = chatGptEvidence
+      managedChatGptEvidencePolicy = chatGptEvidence ? chatGptEvidencePolicy() : undefined
+      if (chatGptEvidence) managedChatGptEvidenceHighWater = chatGptEvidence.observedAt
+    }
+    // Turning forcing off ends a force in effect: the switch says no profile
+    // is forced past a supervisor any more.
+    if (updates.allowForcingForbiddenProfile === false && getSetting("forcedActiveProfile") !== undefined) {
+      releaseForcedProfile("setting_off")
+    } else if (body.routingExcludedProfiles !== undefined || body.routingManagedExcludedProfiles !== undefined || body.routingHeldProfiles !== undefined) {
       reconcileActiveProfileWithExclusions()
     }
     plog(`[PROXY] Routing settings updated: routing=${getSetting("routing") ?? "active"} order=${(getSetting("profileOrder") ?? []).join(",") || "(config order)"}`)
@@ -10897,9 +11604,40 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return undefined
   }
 
-  // Event hooks (hooks.ts). `saved` is what the form edits; `environment`
-  // names the env targets by label only, since a command line or webhook URL
-  // may carry a credential. `recent` is the last deliveries, newest first.
+  // Event hooks (hooks.ts). `saved` is what the form edits: the webhooks.
+  // Command targets run a shell as this user, so HTTP can neither set nor
+  // read them: they come from settings.json `hooks.commands` or
+  // MERIDIAN_HOOK_COMMAND, and are listed by fixed label only, like the env
+  // targets. `recent` is the last deliveries, newest first, by status only.
+  //
+  // A saved webhook URL can hold a token and is where event data leaves this
+  // host, and the public URL steers relays, so every hook route answers only
+  // a management client: one of this server's own pages or a client without
+  // an Origin (sameOrigin.ts), AND either the configured MERIDIAN_API_KEY
+  // (requireAuth on /settings/*) or, with no key, a client on this machine
+  // talking to its loopback address. Same-origin alone is not enough: a page
+  // under a name that resolves to 127.0.0.1 is same-origin with itself, but
+  // its Host is not a loopback name. A reverse proxy on this machine is
+  // refused by its forwarding headers or its public Host (isLoopbackHost).
+  const hookManagement = async (c: Context, next: () => Promise<void>) => {
+    c.header("Cache-Control", "no-store")
+    if (!isSameOriginRequest(c.req.raw)) return c.json({ error: "Event hook settings require a same-origin request" }, 403)
+    if (!authEnabled()) {
+      let remoteAddress: string | undefined
+      try {
+        remoteAddress = getConnInfo(c).remote.address
+      } catch {
+        // Served by something other than @hono/node-server: no peer to trust.
+        remoteAddress = undefined
+      }
+      if (!isLoopbackPeer(remoteAddress, c.req.raw.headers) || !isLoopbackHost(c.req.header("host"))) {
+        return c.json({ error: "Event hook settings need MERIDIAN_API_KEY, or a request from this machine to its loopback address (http://127.0.0.1:<port>)" }, 403)
+      }
+    }
+    await next()
+  }
+  app.use("/settings/api/hooks", hookManagement)
+  app.use("/settings/api/hooks/*", hookManagement)
   app.get("/settings/api/hooks", (c) => {
     const environment = hookEnvironment()
     const envPublicUrl = env("PUBLIC_URL")
@@ -10908,10 +11646,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // accepted one is echoed back.
     const envPublicUrlNormalized = envPublicUrl ? normalizePublicUrl(envPublicUrl) : undefined
     return c.json({
-      saved: getSetting("hooks") ?? {},
+      saved: { webhooks: getSetting("hooks")?.webhooks ?? [] },
+      commands: resolveHookTargets({ commands: getSetting("hooks")?.commands }, {})
+        .map(target => ({ target: hookTargetLabel(target), events: target.events ?? null })),
       environment: {
-        webhook: environment.url?.trim() ? hookTargetLabel({ kind: "webhook", value: environment.url.trim() }) : null,
-        command: environment.command?.trim() ? hookTargetLabel({ kind: "command", value: environment.command.trim() }) : null,
+        webhook: environment.url?.trim() ? hookTargetLabel({ kind: "webhook", value: environment.url.trim(), source: "env" }) : null,
+        command: environment.command?.trim() ? hookTargetLabel({ kind: "command", value: environment.command.trim(), source: "env" }) : null,
       },
       publicUrl: {
         saved: getSetting("publicUrl") ?? null,
@@ -10931,9 +11671,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     try { body = await c.req.json() as Record<string, unknown> } catch { return c.json({ error: "Invalid JSON" }, 400) }
     const updates: Partial<MeridianSettings> = {}
     if (body.hooks !== undefined) {
+      if (typeof body.hooks === "object" && body.hooks !== null && "commands" in body.hooks) {
+        return c.json({ error: "Command hooks run shell commands, so they are set only in settings.json (hooks.commands) or MERIDIAN_HOOK_COMMAND, never over HTTP" }, 403)
+      }
       const parsed = parseHookSettings(body.hooks)
       if (!parsed.ok) return c.json({ error: parsed.error }, 400)
-      updates.hooks = parsed.value
+      const commands = getSetting("hooks")?.commands
+      updates.hooks = { ...parsed.value, ...(commands ? { commands } : {}) }
     }
     if (body.publicUrl !== undefined) {
       if (body.publicUrl === null || body.publicUrl === "") {
@@ -11505,20 +12249,22 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         && organizationRecordCurrent(organization, credentialMark)
       if (accountCurrent) currentAccounts.set(p.id, organization)
       const email = (accountCurrent ? organization.email : null) || auth?.email || null
-      // How long the login has left, and what is on record about it. Only an
-      // account with its own OAuth credential has a login: an API-key profile
-      // would otherwise be credited with the host's own ~/.claude.
-      const renewal: AuthRenewalStatus = stored
-        ? renewalStatusFor(stored.refreshTokenExpiresAt, renewalWarnDays, expiryObservedAt)
-        : { renewalRequiredSoon: false }
+      const renewal = renewalStatusFor(stored?.refreshTokenExpiresAt, renewalWarnDays, expiryObservedAt)
+      // Login history, updated from this read of the credential. A refused
+      // renewal only counts as logged out once the access token it left
+      // behind has run out; until then the account still serves.
       const lifecycle = profileStore && stored
-        ? noteCredentialObserved(profileStore.refreshKey, { presence, refreshTokenExpiresAt: stored.refreshTokenExpiresAt })
+        ? observeCredentialInBackground(profileStore.refreshKey, stored)
         : undefined
+      const loggedOut = authLifecycleLoggedOut(lifecycle, stored?.accessTokenExpiresAt, expiryObservedAt)
       return {
         ...p,
         email,
         subscriptionType: auth?.subscriptionType || null,
         organizationName: organization?.name ?? null,
+        // Additive: the models this account holds Cyber Verification Program
+        // access on, as far as Meridian has learned (cvpAccess.ts).
+        cvpAccess: cvpAccessFor(p.id),
         rateLimitTier: plan.rateLimitTier ?? null,
         seatTier: plan.seatTier ?? null,
         allowance: allowance.multiplier,
@@ -11526,7 +12272,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         planLabel: allowance.label,
         accountType: allowance.accountType,
         planName: allowance.planName,
-        loggedIn: profileLoginState({ loggedIn: auth?.loggedIn, presence, firstUnauthedAt: lifecycle?.firstUnauthedAt }) === "authenticated",
+        loggedIn: presence === "absent" || loggedOut ? false : (auth?.loggedIn ?? false),
         lastCheckedAt: cacheInfo.lastCheckedAt || null,
         lastSuccessAt: cacheInfo.lastSuccessAt || null,
         // Additive: which reading the three fields above came from. A failed
@@ -11546,6 +12292,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         daysUntilRenewal: renewal.daysUntilRenewal ?? null,
         renewalRequiredSoon: renewal.renewalRequiredSoon,
         accessTokenExpiresAt: stored?.accessTokenExpiresAt ?? null,
+        // Meridian's own login history for this credential (authLifecycle.ts),
+        // null when nothing is on record or the profile has no stored login.
         authObtainedAt: lifecycle?.authObtainedAt ?? null,
         authObtainedVia: lifecycle?.authObtainedVia ?? null,
         lastRefreshAt: lifecycle?.lastRefreshAt ?? null,
@@ -11576,6 +12324,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // Additive: follow state, so UIs can say where the active profile comes
     // from and why switching is refused. Absent unless MERIDIAN_FOLLOW_ACTIVE.
     const follow = followStatus(profiles.map(p => p.id))
+    const forcedNow = liveForced()
     const listed = chatGptProfiles ? [...enriched, ...chatGptProfiles.listEntries()] : enriched
     const duplicates = findDuplicateProfiles(listed.map((entry): IdentifiedProfile => {
       if ("seat" in entry && typeof entry.seat === "string") {
@@ -11601,7 +12350,15 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // reader can tell "none" from an instance too old to say.
       // `factsRefresh` (additive, null when idle): a sign-in finished and its
       // facts are being re-read (`updating`), or that read failed (`failed`).
-      profiles: listed.map(entry => ({ ...entry, ...duplicates.get(entry.id), factsRefresh: profileFactsRefresh.view(entry.id) })),
+      // `forced` (additive, null unless this profile is forced active past a
+      // supervisor): when the force ends unless released first.
+      profiles: listed.map(entry => ({
+        ...entry,
+        ...duplicates.get(entry.id),
+        factsRefresh: profileFactsRefresh.view(entry.id),
+        forced: forcedNow && forcedNow.profile === entry.id ? { forcedAt: forcedNow.forcedAt, until: forcedNow.until } : null,
+      })),
+      forcedActiveProfile: forcedNow,
       ...activeProfileFields(listedProfiles.length > 0 ? activeProfile : null, activeProfile),
       // Additive (#383): current routing mode so UIs can surface it.
       routing: routingModeNow,
@@ -11662,6 +12419,27 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return c.html(withSavedLayout(profilePageHtml))
   })
 
+  // Every refusal of `POST /profiles/active` carries `refusal`: who keeps the
+  // profile out and why, in words, and whether "Allow forcing a forbidden
+  // profile" can override it (forcedProfile.ts).
+  const activationRefusal = (kind: ActivationRefusalKind, profile: string, extra?: {
+    readonly detail?: string
+    readonly seat?: boolean
+    readonly forced?: ForcedProfile | null
+    readonly targetBlocker?: ActivationRefusal
+  }): ActivationRefusal =>
+    describeActivationRefusal({
+      kind,
+      profile,
+      allowForcing: getSetting("allowForcingForbiddenProfile") === true,
+      supervisorReason: kind === "managed_excluded" || kind === "held"
+        ? parseRoutingManagedReasons(getSetting("routingManagedReasons"))[profile]
+        : undefined,
+      ...extra,
+      forced: (extra?.forced === undefined ? liveForced() : extra.forced) ?? undefined,
+    })
+
+  const releaseForceForSchema = z.object({ profile: z.string().min(1), forcedAt: z.number() }).optional()
   app.post("/profiles/active", async (c) => {
     // A ChatGPT seat has its own pointer, which follow mode does not follow,
     // so it is decided before the Claude checks below. Hono memoizes the
@@ -11670,15 +12448,21 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const requested = await c.req.json().then(body => (body as { profile?: unknown } | null)?.profile, () => undefined)
       const seat = typeof requested === "string" ? chatGptProfiles.resolve(requested) : undefined
       const seatHold = seat ? chatGptReserveHold(seat.seat) : null
-      if (seat && seatHold) return c.json({ error: heldMessage(seat.id, seatHold), code: "usage_reserve" }, 409)
-      if (typeof requested === "string" && chatGptProfiles.resolve(requested)) {
+      if (seat && seatHold) {
+        const error = heldMessage(seat.id, seatHold)
+        return c.json({ error, code: "usage_reserve", refusal: activationRefusal("usage_reserve", seat.id, { detail: error, seat: true }) }, 409)
+      }
+      if (typeof requested === "string" && seat) {
         const activation = chatGptProfiles.activate(requested)
         if (!activation.ok) {
-          if (activation.code === "needs_login") return c.json({ error: activation.error, code: activation.code }, 409)
-          if (activation.code === "held") return profileHeldResponse(chatGptProfiles.resolve(requested)!.id)
-          return activation.status === 409
-            ? profileExcludedResponse(chatGptProfiles.resolve(requested)!.id)
-            : c.json({ error: activation.error }, 400)
+          if (activation.code === "needs_login") {
+            return c.json({ error: activation.error, code: activation.code, refusal: activationRefusal("needs_login", seat.id, { detail: activation.error, seat: true }) }, 409)
+          }
+          if (activation.code === "held") return profileHeldResponse(seat.id, { refusal: activationRefusal("held", seat.id, { seat: true }) })
+          if (activation.status !== 409) return c.json({ error: activation.error }, 400)
+          const own = parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles"))
+          const kind = own.includes(seat.id) || own.includes(seat.seat) ? "excluded" : "managed_excluded"
+          return profileExcludedResponse(seat.id, { refusal: activationRefusal(kind, seat.id, { seat: true }) })
         }
         const previous = chatGptProfiles.activeProfileId()
         setSetting("chatGptActiveSeat", activation.profile.seat)
@@ -11700,17 +12484,20 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // conflicts with the instance's operating mode, not with its input.
     const following = followStatus(getEffectiveProfiles(finalConfig.profiles).map(p => p.id))
     if (following) {
+      const error = `This instance follows ${following.url} for its active profile (MERIDIAN_FOLLOW_ACTIVE). ` +
+        `Switch there instead — a local change would be overwritten within ` +
+        `${Math.round(FOLLOW_POLL_INTERVAL_MS / 1000)}s. ` +
+        `For a single request, send the x-meridian-profile header.`
+      const requested = await c.req.json().then(body => (body as { profile?: unknown } | null)?.profile, () => undefined)
       return c.json({
-        error: `This instance follows ${following.url} for its active profile (MERIDIAN_FOLLOW_ACTIVE). ` +
-          `Switch there instead — a local change would be overwritten within ` +
-          `${Math.round(FOLLOW_POLL_INTERVAL_MS / 1000)}s. ` +
-          `For a single request, send the x-meridian-profile header.`,
+        error,
         following,
+        refusal: activationRefusal("following", typeof requested === "string" ? requested : "", { detail: error }),
       }, 409)
     }
-    let body: { profile?: string }
+    let body: { readonly profile?: string; readonly force?: unknown; readonly releaseForce?: unknown; readonly releaseForceFor?: unknown }
     try {
-      body = await c.req.json() as { profile?: string }
+      body = await c.req.json<typeof body>()
     } catch {
       return c.json({ error: "Invalid JSON in request body" }, 400)
     }
@@ -11724,24 +12511,87 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     if (!effective.find(p => p.id === body.profile)) {
       return c.json({ error: `Unknown profile: ${body.profile}. Available: ${effective.map(p => p.id).join(", ")}` }, 400)
     }
-    if (routingExcludedProfileIds().includes(body.profile)) {
-      return profileExcludedResponse(body.profile)
+    const requested = body.profile
+    const releaseTarget = releaseForceForSchema.safeParse(body.releaseForceFor)
+    if (!releaseTarget.success) {
+      return c.json({ error: "releaseForceFor must contain a non-empty profile and a finite forcedAt number" }, 400)
     }
-    if (routingHeldProfileIds().includes(body.profile)) {
-      return profileHeldResponse(body.profile)
+    const releaseForceFor = releaseTarget.data
+    const checkActivation = (): { readonly response: Response } | {
+      readonly forced: ForcedProfile | null
+      readonly forcePast: ActivationRefusal | null
+    } => {
+      const forced = liveForced()
+      const releaseAuthorized = body.releaseForce === true && (
+        !releaseForceFor || (forced?.profile === releaseForceFor.profile && forced.forcedAt === releaseForceFor.forcedAt)
+      )
+      const releaseRequired = forced && forced.profile !== requested && !releaseAuthorized ? forced : null
+      const effectiveProfiles = getEffectiveProfiles(finalConfig.profiles)
+      const excluded = canonicalRoutingExcludedProfileIds(effectiveProfiles, userRoutingExcludedProfileIds()).includes(requested)
+      const checkSupervisor = !excluded && (!releaseRequired || getSetting("allowForcingForbiddenProfile") === true)
+      const blocker: { readonly refusal: ActivationRefusal; readonly respond: (refusal: ActivationRefusal) => Response } | null =
+        !checkSupervisor ? null
+          : canonicalRoutingExcludedProfileIds(effectiveProfiles, managedRoutingExcludedProfileIds()).includes(requested)
+            ? { refusal: activationRefusal("managed_excluded", requested, { forced }), respond: refusal => profileExcludedResponse(requested, { refusal }) }
+            : routingHeldProfileIdsFor(effectiveProfiles).includes(requested)
+              ? { refusal: activationRefusal("held", requested, { forced }), respond: refusal => profileHeldResponse(requested, { refusal }) }
+              : (() => {
+                  const reserveHold = claudeReserveHold(requested, usageReserves())
+                  if (!reserveHold) return null
+                  const error = heldMessage(requested, reserveHold)
+                  return { refusal: activationRefusal("usage_reserve", requested, { detail: error, forced }), respond: (refusal: ActivationRefusal) => c.json({ error, code: "usage_reserve", refusal }, 409) }
+                })()
+      if (releaseRequired) {
+        const refusal = activationRefusal("forced_elsewhere", requested, { forced: releaseRequired, targetBlocker: blocker?.refusal })
+        return { response: c.json({ error: refusal.reason, code: "profile_forced", forced: releaseRequired, refusal }, 409) }
+      }
+      if (excluded) {
+        return { response: profileExcludedResponse(requested, { refusal: activationRefusal("excluded", requested, { forced }) }) }
+      }
+      const forcing = blocker !== null && body.force === true
+      // A page on another site must not force an account past its supervisor.
+      if (forcing && !isSameOriginRequest(c.req.raw)) {
+        return { response: c.json({ code: "forbidden_origin", error: "Forcing a profile requires a same-origin request" }, 403) }
+      }
+      if (blocker && !(forcing && blocker.refusal.forceAllowed)) {
+        if (forcing && blocker.refusal.forceable) {
+          return { response: c.json({
+            error: "Forcing a forbidden profile is off. Turn on Settings, Routing, \"Allow forcing a forbidden profile\" to activate it anyway.",
+            code: "force_disabled",
+            refusal: blocker.refusal,
+          }, 409) }
+        }
+        return { response: blocker.respond(blocker.refusal) }
+      }
+      return { forced, forcePast: forcing ? blocker.refusal : null }
     }
-    // The pointer would name a profile no work can reach: refused, so the
-    // switch is seen not to happen. A supervisor lifting a reserve on purpose
-    // writes the reserves without it first.
-    const reserveHold = claudeReserveHold(body.profile, usageReserves())
-    if (reserveHold) return c.json({ error: heldMessage(body.profile, reserveHold), code: "usage_reserve" }, 409)
-    const target = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, body.profile)
+    const beforeAuth = checkActivation()
+    if ("response" in beforeAuth) return beforeAuth.response
+    const target = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, requested)
     const auth = await reconcileClaudeProfileAuth(await getInstanceAuthStatus(target.id, target.env), target)
+    const decision = checkActivation()
+    if ("response" in decision) return decision.response
+    const { forced, forcePast } = decision
     if (auth?.loggedIn === false) {
-      return c.json({ error: `Profile "${target.id}" needs a login before it can be activated`, code: "needs_login" }, 409)
+      const error = `Profile "${target.id}" needs a login before it can be activated`
+      return c.json({ error, code: "needs_login", refusal: activationRefusal("needs_login", target.id, { detail: error, forced }) }, 409)
     }
     const previousProfile = getActiveProfileId() ?? null
-    setActiveProfile(body.profile!)
+    setActiveProfile(requested)
+    // The force follows the pointer: set for a forced switch, kept while the
+    // forced profile is activated again, ended by a switch away from it.
+    const releasedForce = forced?.profile === requested ? null : forced
+    let forcedNow = releasedForce ? null : forced
+    if (forcePast) {
+      forcedNow = forcedProfileFor(requested, Date.now())
+      setSetting("forcedActiveProfile", forcedNow)
+      claudeLog("profile.forced", { profile: requested, refusal: forcePast.kind, until: forcedNow.until })
+      plog(`[PROXY] Profile ${requested} forced active past ${forcePast.kind} until ${new Date(forcedNow.until).toISOString()}`)
+    } else if (releasedForce) {
+      setSetting("forcedActiveProfile", undefined)
+    }
+    if (releasedForce) claudeLog("profile.force_released", { profile: releasedForce.profile, source: "switch" })
+    scheduleForcedExpiry()
     // Session mappings are NOT cleared. Their keys are already scoped by
     // profile, so the new profile can never resume a session started under
     // another account's credentials. Wiping the durable store instead failed
@@ -11763,7 +12613,171 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       origin: c.req.header("origin") ?? c.req.header("referer")?.slice(0, 120) ?? null,
     })
     plog(`[PROXY] Active profile switched to: ${body.profile} (from ${previousProfile ?? "unset"}, ua: ${(c.req.header("user-agent") || "unknown").slice(0, 60)})`)
-    return c.json({ success: true, activeProfile: body.profile })
+    return c.json({ success: true, activeProfile: body.profile, ...(forcedNow ? { forced: forcedNow } : {}) })
+  })
+
+  // Ends a forced profile; the ordinary rules apply again at once, so the
+  // pointer moves off it when a supervisor still keeps it out.
+  app.post("/profiles/forced/release", (c) => {
+    const released = releaseForcedProfile("release")
+    return c.json({ success: true, released, activeProfile: getActiveProfileId() ?? null })
+  })
+
+  // Refresh on a card: re-read what Meridian can about one profile now, for a
+  // reset, top-up or re-login made outside Meridian. POST /profiles/:id/refresh
+  // re-checks the login, re-reads usage and re-lists the account's models,
+  // and answers one result per part (profileRefresh.ts); CVP access is never
+  // readable here, so its part says how old claude.ai's last reading is.
+  // POST /profiles/:id/usage/refresh is the usage part alone. Each part has
+  // its own slot in the gate, one read per profile per interval however often
+  // it is clicked; the usage slot is shared by both routes, and the seats
+  // share one because one call reads them all.
+  const usageRefreshGate = new UsageRefreshGate()
+
+  interface ClaudeRefreshTarget {
+    readonly id: string
+    readonly account: ResolvedProfile
+    /** No profiles configured: the host's own login, read without a profile id. */
+    readonly singleAccount: boolean
+  }
+
+  function claudeRefreshTarget(requested: string): ClaudeRefreshTarget | Response {
+    const profiles = getEffectiveProfiles(finalConfig.profiles)
+    const profile = profiles.find(p => p.id === requested)
+    if (profile) return { id: requested, account: resolveProfile([profile], profile.id, profile.id), singleAccount: false }
+    if (profiles.length === 0 && requested === "default") {
+      return { id: requested, account: resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, requested), singleAccount: true }
+    }
+    return Response.json({ code: "profile_not_found", error: `Profile "${requested}" does not exist on this Meridian` }, { status: 404 })
+  }
+
+  async function readClaudeUsageNow(target: ClaudeRefreshTarget) {
+    const result = await fetchOAuthUsageResult({
+      profileId: target.singleAccount ? undefined : target.id,
+      claudeConfigDir: target.account.env.CLAUDE_CONFIG_DIR,
+      force: true,
+    })
+    const fresh = result.snapshot !== null && result.snapshot.stale !== true
+    if (fresh) clearResetProfileHealth(target.id, openedWindowTypes(result.snapshot!.windows))
+    claudeLog("usage.refresh_requested", { profile: target.id, refreshed: fresh, error: result.error })
+    const read = { fresh, error: result.error, failureReason: result.failure?.reason ?? null, hadReading: (result.snapshot ?? result.lastGood) !== null }
+    return {
+      refreshed: fresh,
+      state: usageReadState(read) as RefreshPartState,
+      note: claudeRefreshNote(read),
+      usage: { ...toUsageEntry(result), spent: spentProfiles.get(target.id) ?? null },
+    }
+  }
+
+  async function readSeatUsageNow(seatProfileId: string) {
+    await refreshChatGptUsage(true)
+    const entry = chatGptProfiles?.quotaEntries().find(e => e.id === seatProfileId) ?? null
+    const refreshed = !!entry && !entry.error && !entry.stale && entry.fetchedAt !== null
+    const note = refreshed ? "Usage re-read just now."
+      : entry?.fetchedAt != null ? "ChatGPT did not answer with new figures; the last reading stays."
+      : "ChatGPT did not answer with figures, and Meridian has no reading of this seat yet."
+    return { refreshed, state: (refreshed ? "fresh" : "failed") as RefreshPartState, note, usage: entry }
+  }
+
+  // The login part: `claude auth status` again, waited for; the stored
+  // credential read the way /profiles/list reads it; and the account read
+  // again, so a login that now holds another account drops what Meridian
+  // knew about the previous one before the other parts read it afresh.
+  async function recheckClaudeLogin(target: ClaudeRefreshTarget) {
+    const { account } = target
+    const authKey = target.id !== "default" ? target.id : undefined
+    const auth = await authOwner.run(() => recheckClaudeAuthStatus(authKey, Object.keys(account.env).length > 0 ? account.env : undefined))
+    const store = credentialStoreForProfile(account)
+    const stored = store ? await readStoredCredentialSnapshot(store) : undefined
+    const presence = stored?.presence ?? "unknown"
+    const lifecycle = store && stored ? observeCredentialInBackground(store.refreshKey, stored) : undefined
+    const loggedOut = authLifecycleLoggedOut(lifecycle, stored?.accessTokenExpiresAt, Date.now())
+    const state = profileLoginState({ loggedIn: auth?.loggedIn, presence, loggedOut })
+    let email = auth?.email ?? null
+    let changed = false
+    if (state === "authenticated" && account.type === "claude-max") {
+      const before = organizationNames()[target.id]
+      const record = await refreshOrganizationNow(target.id, { claudeConfigDir: account.env.CLAUDE_CONFIG_DIR })
+      changed = accountChanged(before, record)
+      if (record?.email) email = record.email
+      if (changed) clearSignedInProfileFacts(target.id)
+    }
+    claudeLog("profile.login_rechecked", { profile: target.id, state, accountChanged: changed })
+    return {
+      needsLogin: state === "needs_login",
+      accountChanged: changed,
+      part: claudeLoginPart({ state, checkFailed: getAuthCacheInfo(authKey).isFailure, everAnswered: auth !== null, presence, email, accountChanged: changed }),
+    }
+  }
+
+  async function relistClaudeModels(account: ResolvedProfile): Promise<RefreshPart> {
+    const store = credentialStoreForProfile(account)
+    const models = await fetchAccountModels({
+      cacheKey: account.id,
+      auth: () => resolveDesignAuthHeaders({ designToken: null, profile: account, credentialStore: store, ensureFresh: ensureFreshToken }),
+      ...(store ? { refresh: () => refreshOAuthToken(store) } : {}),
+      force: true,
+    })
+    const state = accountModelsState(account.id)
+    return modelsPart({ count: models?.length ?? null, failure: state.failure, listedAt: state.listedAt }, Date.now())
+  }
+
+  function gated(key: string, label: string, read: () => Promise<RefreshPart>): Promise<RefreshPart> {
+    const claim = usageRefreshGate.claim(key)
+    return claim.ok ? read() : Promise.resolve(tooSoonPart(label, claim.retryAfterMs))
+  }
+
+  app.post("/profiles/:id/usage/refresh", async (c) => {
+    if (!isSameOriginRequest(c.req.raw)) {
+      return c.json({ code: "forbidden_origin", error: "Cross-origin usage refreshes are not allowed" }, 403)
+    }
+    const requested = c.req.param("id")
+    const seat = chatGptProfiles?.resolve(requested)
+    if (seat && chatGptProfiles) {
+      const claim = usageRefreshGate.claim("chatgpt")
+      if (!claim.ok) return usageRefreshTooSoon(seat.id, claim.retryAfterMs)
+      const read = await readSeatUsageNow(seat.id)
+      return c.json({ profile: seat.id, refreshed: read.refreshed, note: read.note, usage: read.usage })
+    }
+    const target = claudeRefreshTarget(requested)
+    if (target instanceof Response) return target
+    if (target.account.type !== "claude-max") {
+      return c.json({ code: "not_oauth", error: `Profile "${requested}" has no subscription usage to read; it uses an API key` }, 400)
+    }
+    const claim = usageRefreshGate.claim(requested)
+    if (!claim.ok) return usageRefreshTooSoon(requested, claim.retryAfterMs)
+    const read = await readClaudeUsageNow(target)
+    return c.json({ profile: requested, refreshed: read.refreshed, note: read.note, usage: read.usage })
+  })
+  function usageRefreshTooSoon(profile: string, retryAfterMs: number): Response {
+    const seconds = Math.max(1, Math.ceil(retryAfterMs / 1000))
+    return new Response(JSON.stringify({
+      code: "refresh_too_soon",
+      error: `Usage of "${profile}" was just re-read; try again in ${seconds}s.`,
+      retryAfterMs,
+    }), { status: 429, headers: { "Content-Type": "application/json", "Retry-After": String(seconds) } })
+  }
+
+  // A claude.ai model-selector reading of one Claude profile's account, from
+  // something holding that account's claude.ai session (cvpAccess.ts): the
+  // only place Anthropic says which models it holds CVP access on.
+  app.post("/profiles/:id/cvp-access", async (c) => {
+    if (!isSameOriginRequest(c.req.raw)) {
+      return c.json({ code: "forbidden_origin", error: "Cross-origin CVP readings are not allowed" }, 403)
+    }
+    const requested = c.req.param("id")
+    const effective = getEffectiveProfiles(finalConfig.profiles)
+    if (chatGptProfiles?.resolve(requested) || unknownPinnedProfile(requested, effective) !== undefined) {
+      return unknownProfileResponse(requested)
+    }
+    const parsed = cvpReadingBody.safeParse(await c.req.json().catch(() => undefined))
+    if (!parsed.success) {
+      return c.json({ code: "invalid_request", error: "Expected {models: [{id, name?, badge?: {message}, selector_badge?: {message}}]}" }, 400)
+    }
+    const profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, requested)
+    const cvpAccess = recordCvpReading(profile.id, parsed.data.models)
+    claudeLog("cvp.reading", { profile: profile.id, models: parsed.data.models.length, active: cvpAccess.filter(e => e.type === "active").map(e => e.model) })
+    return c.json({ profile: profile.id, cvpAccess })
   })
 
   app.post("/profiles/:id/warm", async (c) => {
@@ -12171,6 +13185,58 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return removeChatGptSeat(c, chatGptSeat)
   })
 
+  // Registered after the literal /profiles/chatgpt/* routes: Hono answers
+  // with the first match, so before them "chatgpt" would be taken for a
+  // profile id and seat renewal (POST /profiles/chatgpt/refresh) would 404.
+  app.post("/profiles/:id/refresh", async (c) => {
+    if (!isSameOriginRequest(c.req.raw)) {
+      return c.json({ code: "forbidden_origin", error: "Cross-origin profile refreshes are not allowed" }, 403)
+    }
+    const requested = c.req.param("id")
+    const seat = chatGptProfiles?.resolve(requested)
+    if (seat && chatGptProfiles) {
+      // A seat's login is what its usage read just found of its token.
+      const usage = await gated("chatgpt", "Usage", async () => {
+        const read = await readSeatUsageNow(seat.id)
+        return { state: read.state, note: read.note }
+      })
+      const listed = chatGptProfiles.listEntries().find(entry => entry.id === seat.id)
+      const login = listed
+        ? seatLoginPart({ loggedIn: listed.loggedIn, tokenState: listed.tokenState, email: listed.email })
+        : { state: "failed" as const, note: "Meridian no longer lists this seat." }
+      return c.json({ profile: seat.id, parts: { login, usage } })
+    }
+    const target = claudeRefreshTarget(requested)
+    if (target instanceof Response) return target
+    const subscription = target.account.type === "claude-max"
+    let login: RefreshPart
+    let needsLogin = false
+    let accountMoved = false
+    if (target.account.type === "api") {
+      login = { state: "unavailable", note: "This profile uses an API key; there is no login to re-read." }
+    } else {
+      login = await gated(`login:${target.id}`, "The login", async () => {
+        const rechecked = await recheckClaudeLogin(target)
+        needsLogin = rechecked.needsLogin
+        accountMoved = rechecked.accountChanged
+        return rechecked.part
+      })
+    }
+    const [usage, models] = await Promise.all([
+      !subscription
+        ? Promise.resolve<RefreshPart>({ state: "unavailable", note: "This profile signs in with an API key or a fixed token; Meridian reads usage only for a subscription login." })
+        : needsLogin ? Promise.resolve(SKIPPED_WITHOUT_LOGIN)
+        : gated(target.id, "Usage", async () => {
+            const read = await readClaudeUsageNow(target)
+            return { state: read.state, note: read.note }
+          }),
+      needsLogin ? Promise.resolve(SKIPPED_WITHOUT_LOGIN) : gated(`models:${target.id}`, "The model list", () => relistClaudeModels(target.account)),
+    ])
+    const cvp = subscription ? cvpPart({ lastClaudeAiReadingAt: lastClaudeAiReadingAt(target.id), forgotten: accountMoved }, Date.now()) : undefined
+    claudeLog("profile.refreshed", { profile: target.id, login: login.state, usage: usage.state, models: models.state })
+    return c.json({ profile: target.id, parts: { login, usage, models, ...(cvp ? { cvp } : {}) } })
+  })
+
   // A Claude profile is removed the way `meridian profile remove` removes it
   // (profileRemove.ts): its profiles.json entry, the credential directory it
   // owns under the profiles directory, its place in the saved order, and the
@@ -12316,6 +13382,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     spentProfiles.forget(profileId)
     rateLimitStore.clear(profileId)
     clearOAuthUsageForProfile(profileId)
+    clearAccountModels(profileId)
+  }
+
+  // A completed sign-in may hold another account, whose CVP access is its own.
+  function clearSignedInProfileFacts(profileId: string): void {
+    clearStaleProfileHealth(profileId)
+    forgetCvpAccess(profileId)
   }
 
   function clearResetProfileHealth(profileId: string, cleared: readonly string[]): void {
@@ -12393,7 +13466,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // The auth-status cache holds a 60s "not logged in" answer for this profile;
     // drop it so /profiles/list reflects the login on the UI's next poll.
     expireAuthStatusCache()
-    clearStaleProfileHealth(result.profileId)
+    clearSignedInProfileFacts(result.profileId)
     refreshClaudeFactsAfterLogin(result.profileId)
     claudeLog("profile.login_completed", {
       profile: result.profileId,
@@ -12426,7 +13499,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       return c.html(renderLoginCallbackPage({ ok: false, message: result.message }), result.status as 400)
     }
     expireAuthStatusCache()
-    clearStaleProfileHealth(result.profileId)
+    clearSignedInProfileFacts(result.profileId)
     refreshClaudeFactsAfterLogin(result.profileId)
     claudeLog("profile.login_completed", { profile: result.profileId, via: "callback" })
     plog(`[PROXY] Profile login completed for "${result.profileId}" (browser redirect)`)
@@ -12494,7 +13567,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // the list-wide cache does — drop it so the new card renders authenticated
     // on the UI's next poll rather than after the 60s TTL.
     expireAuthStatusCache()
-    clearStaleProfileHealth(result.profileId)
+    clearSignedInProfileFacts(result.profileId)
     refreshClaudeFactsAfterLogin(result.profileId, result.claudeConfigDir)
     claudeLog("profile.add_completed", {
       profile: result.profileId,
@@ -12685,6 +13758,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // off; a keyed request preserves its real history and resumes instead of
     // packing.
     const internalHeaders: Record<string, string> = {
+      ...internalClientAttributionHeaders(c.req.raw.headers),
       "Content-Type": "application/json",
       "x-meridian-agent": adapterName,
     }
@@ -12865,6 +13939,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
 
     const internalHeaders: Record<string, string> = {
+      ...internalClientAttributionHeaders(c.req.raw.headers),
       "Content-Type": "application/json",
       "x-meridian-agent": "codex",
     }
@@ -12876,6 +13951,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // subagent inherits its parent's `prompt_cache_key` — see
     // resolveCodexThreadIdentity for what each signal answers.
     const codexThread = resolveCodexThreadIdentity(rawBody, c.req.header("x-codex-turn-metadata"))
+    const clientAdapter = detectAdapter(c)
+    owner.responsesClientSessionId = clientAdapter.getClientSessionId?.(c, rawBody)
+      ?? clientAdapter.getSessionId(c, rawBody) ?? codexThread.threadId ?? null
     if (codexThread.sessionKey) internalHeaders["x-codex-session"] = codexThread.sessionKey
     if (codexThread.requestSource) internalHeaders["x-meridian-source"] = codexThread.requestSource
     const xApiKey = c.req.header("x-api-key")
@@ -12982,8 +14060,31 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // with models.ts (subscriptionIncludesExtendedContext) — an "=== max"
   // comparison here used to advertise 200k to Team accounts that Meridian was
   // already routing to opus[1m] (#826).
+  //
+  // Pinned to a Claude profile with `x-meridian-profile`, it answers that
+  // account's own Claude models instead (accountModels.ts), and
+  // `x-meridian-models-source` says whether they are the account's or the
+  // static fallback. A pin naming a ChatGPT seat keeps the unpinned answer.
+  //
+  // With `x-meridian-require: cvp` it lists only models holding Cyber
+  // Verification Program access: the pinned account's, or unpinned, those of
+  // every account unpinned work may reach, each entry carrying the deciding
+  // `cyber_verification` and the `cvp_profiles` that hold it.
   app.get("/v1/models", async (c) => {
-    const profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile)
+    const requirements = parseRoutingRequirements(c.req.header(ROUTING_REQUIRE_HEADER))
+    if (requirements.unknown.length > 0) {
+      return c.json({
+        type: "error",
+        error: { type: "invalid_request_error", message: `${ROUTING_REQUIRE_HEADER}: unknown requirement ${requirements.unknown.join(", ")}` },
+      }, 400)
+    }
+    const pin = c.req.header("x-meridian-profile")?.trim() || undefined
+    const claudePin = pin !== undefined && !chatGptProfiles?.resolve(pin) ? pin : undefined
+    if (claudePin !== undefined) {
+      const unknownPin = unknownPinnedProfile(claudePin, getEffectiveProfiles(finalConfig.profiles))
+      if (unknownPin !== undefined) return unknownProfileResponse(unknownPin)
+    }
+    const profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, claudePin)
     const profileEnvOverrides = Object.keys(profile.env).length > 0 ? profile.env : undefined
     const authStatus = await getInstanceAuthStatus(
       profile.id !== "default" ? profile.id : undefined,
@@ -12991,8 +14092,57 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     )
     const extendedContext = subscriptionIncludesExtendedContext(authStatus?.subscriptionType)
     const disable1mContext = (profile.env.CLAUDE_CODE_DISABLE_1M_CONTEXT ?? process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT) === "1"
-    const chatGptModels = chatGptModelList(await chatGptOfferedModels(), Math.floor(Date.now() / 1000))
-    return c.json({ object: "list", data: [...buildModelList(extendedContext, undefined, disable1mContext), ...chatGptModels] })
+    const now = Math.floor(Date.now() / 1000)
+    const staticModels = buildModelList(extendedContext, now, disable1mContext)
+    const accountModelList = async (account: ResolvedProfile) => {
+      const store = credentialStoreForProfile(account)
+      const accountModels = await fetchAccountModels({
+        cacheKey: account.id,
+        auth: () => resolveDesignAuthHeaders({ designToken: null, profile: account, credentialStore: store, ensureFresh: ensureFreshToken }),
+        ...(store ? { refresh: () => refreshOAuthToken(store) } : {}),
+      })
+      const data: AccountModel[] = accountModels ? toAccountModelList(accountModels, staticModels, { disable1mContext, now }) : staticModels
+      return { source: accountModels ? "account" : "static", data }
+    }
+    if (claudePin !== undefined) {
+      const { source, data } = await accountModelList(profile)
+      c.header("x-meridian-models-source", source)
+      const annotated = withCyberVerification(data, profile.id)
+      return c.json({ object: "list", data: requirements.cvp ? annotated.filter(model => model.cyber_verification?.type === "active") : annotated })
+    }
+    if (requirements.cvp) {
+      const effective = getEffectiveProfiles(finalConfig.profiles)
+      const unavailable = new Set([...cvpExcludedProfileIdsFor(effective), ...routingHeldProfileIdsFor(effective)])
+      const cvpPointer = getSetting("cvpActiveProfile")
+      const candidates = [...new Set([
+        ...(cvpPointer !== undefined ? [cvpPointer] : []),
+        ...resolvePriorityOrder(effective.map(p => p.id), cvpProfileOrderSetting()).order,
+      ])]
+        .filter(id => (effective.length === 0 || effective.some(p => p.id === id)) && !unavailable.has(id))
+      const listed = new Map<string, Record<string, unknown> & { cvp_profiles: string[] }>()
+      for (const id of candidates) {
+        if (!cvpAccessFor(id).some(entry => entry.type === "active")) continue
+        const { data } = await accountModelList(resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, id))
+        const known = new Set(data.map(model => normalizeCvpModel(model.id)))
+        const entries = [
+          ...data,
+          // A model the map holds that the account's list does not name (its
+          // read failed, so the static list stood in) still gets an entry.
+          ...cvpAccessFor(id)
+            .filter(entry => entry.type === "active" && !known.has(entry.model))
+            .map(entry => ({ id: entry.model, object: "model" as const, created: now, owned_by: "anthropic", display_name: entry.name ?? entry.model })),
+        ]
+        for (const model of withCyberVerification(entries, id)) {
+          if (model.cyber_verification?.type !== "active") continue
+          const existing = listed.get(model.id)
+          if (existing) existing.cvp_profiles.push(id)
+          else listed.set(model.id, { ...model, cvp_profiles: [id] })
+        }
+      }
+      return c.json({ object: "list", data: [...listed.values()] })
+    }
+    const chatGptModels = chatGptModelList(await chatGptOfferedModels(), now)
+    return c.json({ object: "list", data: [...staticModels, ...chatGptModels] })
   })
 
   app.post("/v1/usage/quota/reset", async (c) => {
@@ -13397,7 +14547,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       defaultProfile: finalConfig.defaultProfile,
       purpose: "work",
       explicitProfileId: requestedProfileId,
-      excludedProfileIds: routingExcludedProfileIds(),
+      excludedProfileIds: userRoutingExcludedProfileIds(),
+      managedExcludedProfileIds: managedRoutingExcludedProfileIds(),
       heldProfileIds: routingHeldProfileIds(),
     })
     switch (routingAccess.access.kind) {
@@ -13820,7 +14971,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
   const stopAuthLifecycleLog = onAuthLifecycleTransition((transition: AuthLifecycleTransition) => {
     const ids = profileIdsForCredentialKey(finalConfig, transition.key)
     const who = ids.length > 0 ? ids.map(id => `"${id}"`).join(", ") : transition.key
-    const message = `Profile ${who} ${describeAuthLifecycleEvent(transition.event, transition.record)}`
+    const message = `Profile ${who} ${describeAuthLifecycleEvent(transition.event, transition.previous)}`
     plog(`[PROXY] ${message}`)
     diagnosticLog.log({ level: transition.event.kind === "logged_out" ? "warn" : "info", category: "auth", message })
     claudeLog("auth.lifecycle", { profiles: ids, ...transition.event })

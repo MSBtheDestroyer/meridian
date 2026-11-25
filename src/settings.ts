@@ -22,6 +22,7 @@ import type { ClaudeExtraUsagePolicy, PriorityFailbackPolicy } from "./proxy/rou
 import type { UsageReserveMap } from "./proxy/usageReserve"
 import type { ClaudeExecutableMode } from "./proxy/claudeExecutablePreference"
 import type { PageLayout } from "./telemetry/pageLayout"
+import type { ForcedProfile } from "./proxy/forcedProfile"
 
 /**
  * Resolve the settings file path.
@@ -51,12 +52,39 @@ export interface MeridianSettings {
   routingExcludedProfiles?: string[]
   routingManagedExcludedProfiles?: string[]
   /**
+   * The order `x-meridian-require: cvp` work tries Claude profiles in, owned
+   * by a cybersec switcher apart from `profileOrder`; empty or unset falls
+   * back to the pool order. Unflagged work never reads it.
+   */
+  cvpProfileOrder?: string[]
+  /** The profile that leads `x-meridian-require: cvp` work when it holds access on the model. */
+  cvpActiveProfile?: string
+  /**
+   * The cybersec switcher's own managed exclusions: out of unpinned cvp work,
+   * which reads this list instead of `routingManagedExcludedProfiles`.
+   */
+  cvpManagedExcludedProfiles?: string[]
+  /**
    * Profiles held out of rotation by a supervisor, for a measured run: no
    * unpinned work, failover or warm reaches them, but a request pinned with
    * `x-meridian-profile` is served there. Written through
    * `PUT /settings/api/routing`; re-read per request.
    */
   routingHeldProfiles?: string[]
+  /**
+   * Per profile id, why the supervisor keeps it out of work, in its own
+   * words; shown when someone tries to activate it. Written through
+   * `PUT /settings/api/routing` with the lists.
+   */
+  routingManagedReasons?: Record<string, string>
+  /**
+   * The boss's override: `POST /profiles/active` with `force: true` may
+   * activate a Claude profile a supervisor keeps out (managed exclusion, hold
+   * or usage reserve). Off unless switched on in Settings, Routing.
+   */
+  allowForcingForbiddenProfile?: boolean
+  /** The profile forced active and until when (proxy/forcedProfile.ts). */
+  forcedActiveProfile?: ForcedProfile
   /**
    * Per profile id, how far work may take its 5-hour and weekly windows
    * (proxy/usageReserve.ts). Written by a supervisor through
@@ -131,8 +159,9 @@ export interface MeridianSettings {
   /** Keep idle one-hour-cache sessions warm with a few small cache-read
    *  requests (prompt-cache keepalive). Off unless switched on, because each
    *  one counts against the account's usage. MERIDIAN_CACHE_KEEPALIVE wins.
-   *  Re-read per turn and per scheduler tick. */
-  cacheKeepalive?: boolean
+   *  Re-read per turn and per scheduler tick. `"client"` tracks sessions but
+   *  beats only when a client asks (`POST /v1/sessions/:key/cache-beat`). */
+  cacheKeepalive?: boolean | "client"
   /** Name the machine Meridian runs on beside the site header's status, so
    *  several instances can be told apart at a glance. Off unless switched on,
    *  because it also publishes the hostname in the unauthenticated /health. */

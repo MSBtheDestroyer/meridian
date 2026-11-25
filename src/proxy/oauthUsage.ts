@@ -32,8 +32,10 @@ import { parseRetryAfterMs } from "./retryAfter"
 import { createPlatformCredentialStore, refreshOAuthToken, type CredentialStore } from "./tokenRefresh"
 import { followedUsageSnapshot } from "./followUsage"
 import { bundledClaudeCodeVersion } from "./models"
-import { noteApiRejected, noteProviderAccepted } from "./authLifecycle"
 import { normalizeClaudeResets, type ClaudeResets } from "./claudeResets"
+import { parseResetGrantMetadata, type OAuthBankedResetGrant, type OAuthBankedResets } from "./oauthResetGrants"
+
+export type { OAuthBankedResetGrant, OAuthBankedResets } from "./oauthResetGrants"
 
 // Policy for the query flag and User-Agent: profiles-routing.spec.md, "OAuth usage request identity".
 const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1"
@@ -88,6 +90,10 @@ interface RawOAuthUsageResponse {
   seven_day?: RawOAuthWindow | null
   seven_day_opus?: RawOAuthWindow | null
   seven_day_sonnet?: RawOAuthWindow | null
+  seven_day_fable?: RawOAuthWindow | null
+  seven_day_mythos?: RawOAuthWindow | null
+  seven_day_haiku?: RawOAuthWindow | null
+  seven_day_overage_included?: RawOAuthWindow | null
   seven_day_oauth_apps?: RawOAuthWindow | null
   seven_day_cowork?: RawOAuthWindow | null
   seven_day_omelette?: RawOAuthWindow | null
@@ -121,28 +127,9 @@ export interface OAuthExtraUsageInfo {
   exponent: number
 }
 
-export interface OAuthBankedResetGrant {
-  id: string | null
-  resetsLeft: number
-  expiresAt: number | null
-  /** Epoch ms the grant becomes usable, or null when absent/unreadable. */
-  startsAt: number | null
-  /** Provider's flags; null when absent or not a boolean. */
-  paused: boolean | null
-  usableNow: boolean | null
-}
-
-export interface OAuthBankedResets {
-  eligible: boolean
-  /** Provider's reason the account is ineligible, or null when absent/unreadable. */
-  ineligibleReason: string | null
-  /** The grant the provider would redeem next; null unless it names a listed grant. */
-  nextGrantId: string | null
-  grants: OAuthBankedResetGrant[]
-}
-
 export interface OAuthUsageSnapshot {
   windows: OAuthUsageWindow[]
+  unreadableWindowTypes?: readonly string[]
   extraUsage: OAuthExtraUsageInfo | null
   bankedResets: OAuthBankedResets | null
   claudeResets?: ClaudeResets | null
@@ -310,6 +297,10 @@ const WINDOW_TYPES: Array<keyof RawOAuthUsageResponse> = [
   "seven_day",
   "seven_day_opus",
   "seven_day_sonnet",
+  "seven_day_fable",
+  "seven_day_mythos",
+  "seven_day_haiku",
+  "seven_day_overage_included",
   "seven_day_oauth_apps",
   "seven_day_cowork",
   "seven_day_omelette",
@@ -348,13 +339,15 @@ function parseBankedResets(raw: unknown): OAuthBankedResets | null {
     if (typeof grant !== "object" || grant === null || !("resets_left" in grant)
       || typeof grant.resets_left !== "number" || !Number.isSafeInteger(grant.resets_left) || grant.resets_left < 0) continue
 
+    const id = "id" in grant && typeof grant.id === "string" ? grant.id : null
     grants.push({
-      id: "id" in grant && typeof grant.id === "string" ? grant.id : null,
+      id,
       resetsLeft: grant.resets_left,
       expiresAt: parseResetDate("ends_at" in grant ? grant.ends_at : null),
       startsAt: parseResetDate("starts_at" in grant ? grant.starts_at : null),
       paused: optionalBoolean(grant, "paused"),
       usableNow: optionalBoolean(grant, "usable_now"),
+      ...parseResetGrantMetadata(grant, id),
     })
   }
   const next: unknown = "next_grant_id" in raw ? raw.next_grant_id : null
@@ -388,7 +381,8 @@ function modelScopedWindowType(limit: RawOAuthLimit): string | null {
   if (limit.kind !== "weekly_scoped") return null
 
   const model = limit.scope?.model
-  const name = model?.display_name?.trim() || model?.id?.trim()
+  const id = model?.id?.trim()
+  const name = id?.startsWith("claude-") ? id : model?.display_name?.trim() || id
   if (!name) return null
 
   const slug = name
@@ -401,33 +395,32 @@ function modelScopedWindowType(limit: RawOAuthLimit): string | null {
 
 function buildSnapshot(raw: RawOAuthUsageResponse): OAuthUsageSnapshot {
   const windows: OAuthUsageWindow[] = []
+  const unreadable = new Set<string>()
+  const addWindow = (type: string, percent: number | null | undefined, reset: string | null | undefined) => {
+    const utilization = normalizeUtilization(percent)
+    const resetsAt = parseIsoToMs(reset)
+    if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || resetsAt === null) unreadable.add(type)
+    if (utilization === null && resetsAt === null) return
+    const prior = windows.find(window => window.type === type)
+    if (!prior) windows.push({ type, utilization, resetsAt })
+    else if (prior.utilization !== utilization || prior.resetsAt !== resetsAt) unreadable.add(type)
+  }
   for (const key of WINDOW_TYPES) {
     const w = raw[key] as RawOAuthWindow | null | undefined
     if (!w) continue
-    const utilization = normalizeUtilization(w.utilization)
-    const resetsAt = parseIsoToMs(w.resets_at)
-    if (utilization === null && resetsAt === null) continue
-    windows.push({ type: key as string, utilization, resetsAt })
+    addWindow(key, w.utilization, w.resets_at)
   }
 
-  const windowTypes = new Set(windows.map(window => window.type))
   for (const limit of raw.limits ?? []) {
     const type = modelScopedWindowType(limit)
-    if (!type || windowTypes.has(type)) continue
-
-    const utilization = normalizeUtilization(limit.percent)
-    const resetsAt = parseIsoToMs(limit.resets_at)
-    if (utilization === null && resetsAt === null) continue
-
-    windows.push({ type, utilization, resetsAt })
-    windowTypes.add(type)
+    if (type) addWindow(type, limit.percent, limit.resets_at)
   }
 
   const extra = raw.extra_usage
   const exponent = extraUsageExponent(extra?.decimal_places)
-  const extraUsage: OAuthExtraUsageInfo | null = extra
+  const extraUsage: OAuthExtraUsageInfo | null = typeof extra?.is_enabled === "boolean"
     ? {
-        isEnabled: !!extra.is_enabled,
+        isEnabled: extra.is_enabled,
         monthlyLimit: minorToMajor(extra.monthly_limit, exponent),
         usedCredits: minorToMajor(extra.used_credits, exponent),
         utilization: normalizeUtilization(extra.utilization ?? null),
@@ -442,6 +435,7 @@ function buildSnapshot(raw: RawOAuthUsageResponse): OAuthUsageSnapshot {
     bankedResets: parseBankedResets(raw.cedar_ember),
     claudeResets: normalizeClaudeResets(raw.cedar_ember),
     fetchedAt: Date.now(),
+    ...(unreadable.size > 0 ? { unreadableWindowTypes: [...unreadable] } : {}),
   }
 }
 
@@ -538,17 +532,17 @@ type UsageCallResult = Awaited<ReturnType<typeof callAnthropic>>
 async function retryAfterRateLimitRun(
   limited: UsageCallResult,
   ctx: { store: CredentialStore; refresh: RefreshFn; cacheKey: string; token: string; fetchImpl: FetchLike; owner: Promise<RawUsageResult> },
-): Promise<UsageCallResult> {
+): Promise<{ result: UsageCallResult; token: string }> {
   const runLength = countRateLimited(ctx.cacheKey, ctx.token)
-  if (!claimRateLimitRefresh(ctx.cacheKey, runLength)) return limited
+  if (!claimRateLimitRefresh(ctx.cacheKey, runLength)) return { result: limited, token: ctx.token }
   claudeLog("oauth_usage.refresh_on_429", { profile: ctx.cacheKey, runLength })
   const newToken = await refreshAndRead(ctx.store, ctx.refresh, ctx.cacheKey, "rate_limited")
-  if (!newToken || inflightByProfile.get(ctx.cacheKey) !== ctx.owner) return limited
+  if (!newToken || inflightByProfile.get(ctx.cacheKey) !== ctx.owner) return { result: limited, token: ctx.token }
   const retried = await callAnthropic(newToken, ctx.fetchImpl)
-  if (inflightByProfile.get(ctx.cacheKey) !== ctx.owner) return retried
+  if (inflightByProfile.get(ctx.cacheKey) !== ctx.owner) return { result: retried, token: newToken }
   if ("__status" in retried && retried.__status === 429) countRateLimited(ctx.cacheKey, newToken)
   else rateLimitRunByProfile.delete(ctx.cacheKey)
-  return retried
+  return { result: retried, token: newToken }
 }
 
 export interface FetchOAuthUsageOpts {
@@ -903,7 +897,6 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
   const refresh = opts?.refreshImpl ?? refreshOAuthToken
 
   async function fetchAndCacheUsage(): Promise<RawUsageResult> {
-    let startedAt = Date.now()
     try {
       let token = await tokenForCall(store, refresh, cacheKey)
       if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
@@ -922,7 +915,6 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
         const refreshed = await refresh(store)
         if (!refreshed) {
           claudeLog("oauth_usage.refresh_failed", { profile: cacheKey })
-          noteApiRejected(store.refreshKey, { startedAt })
           // Not `no_token`: the token is present, and a read-only instance
           // declines to refresh it BY DESIGN (credentialsMode.ts). Reporting
           // a missing login here would tell the operator to re-authenticate
@@ -930,7 +922,6 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
           // from touching credentials.
           return staleOr("refresh_failed", "upstream_error")
         }
-        startedAt = Date.now()
         const newToken = await readAccessToken(store)
         if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
         if (!newToken) return staleOr("no_token_after_refresh", "no_token")
@@ -939,13 +930,14 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
       }
       if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
       if ("__status" in result && result.__status === 429) {
-        result = await retryAfterRateLimitRun(result, { store, refresh, cacheKey, token, fetchImpl, owner: promise })
+        const retry = await retryAfterRateLimitRun(result, { store, refresh, cacheKey, token, fetchImpl, owner: promise })
+        result = retry.result
+        token = retry.token
       } else {
         rateLimitRunByProfile.delete(cacheKey)
       }
       if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
       if ("__status" in result) {
-        if (result.__status === 401) noteApiRejected(store.refreshKey, { startedAt })
         if (result.__status === 429) {
           // Floor at the backoff, but cap at staleMaxMs: the cooldown suppresses
           // every fetch, so one longer than the stale window would age the
@@ -971,7 +963,7 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
       rateLimitedUntilByProfile.delete(cacheKey)
       failureByProfile.delete(cacheKey)
       const snapshot = buildSnapshot(result)
-      noteProviderAccepted(store.refreshKey, { startedAt })
+      usageTokenDigests.set(snapshot, createHash("sha256").update(token).digest("hex"))
       cacheByProfile.set(cacheKey, snapshot)
       return { snapshot, error: null }
     } catch (err) {
@@ -998,6 +990,14 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
  */
 export function peekOAuthUsage(profileId?: string | null): OAuthUsageSnapshot | undefined {
   return cacheByProfile.get(profileId ?? DEFAULT_KEY)
+}
+
+const usageTokenDigests = new WeakMap<OAuthUsageSnapshot, string>()
+
+export function peekSuccessfulOAuthUsage(profileId: string, tokenDigest?: string): OAuthUsageSnapshot | undefined {
+  const snapshot = peekOAuthUsage(profileId)
+  return !snapshot || failureByProfile.has(profileId) || snapshot.stale ||
+    (tokenDigest !== undefined && usageTokenDigests.get(snapshot) !== tokenDigest) ? undefined : snapshot
 }
 
 /** Clear cached OAuth usage snapshot, failure state, and 429 cooldowns for one profile. */

@@ -59,6 +59,8 @@ export interface CodexCredentials {
 }
 
 export interface CodexAccountUsage {
+  readonly creditsProvenEmpty?: boolean
+  readonly identityConfirmed?: boolean
   windows: CodexUsageWindow[]
   planType: string | null
   email: string | null
@@ -121,6 +123,9 @@ export async function fetchCodexAccountUsage(
       email: stringOrNull(body.email) ?? credentials.email,
       resetCredits,
       credits: normalizeCredits(body.credits),
+      creditsProvenEmpty: creditsProvenEmpty(body.credits),
+      identityConfirmed: credentials.accountId !== null && claims.userId !== null &&
+        body.account_id === credentials.accountId && body.user_id === claims.userId,
       fetchedAt: now,
     },
     error: null,
@@ -138,6 +143,13 @@ function normalizeCredits(value: unknown): CodexCredits | null {
     overageLimitReached: raw.overage_limit_reached === true,
     balance: Number.isFinite(balance) ? balance : null,
   }
+}
+
+function creditsProvenEmpty(value: unknown): boolean {
+  const raw = asRecord(value)
+  if (!raw || raw.unlimited !== false || raw.overage_limit_reached !== false) return false
+  const credits = normalizeCredits(raw)
+  return credits !== null && (credits.balance === 0 || (raw.has_credits === false && credits.balance === null && raw.balance == null))
 }
 
 /**

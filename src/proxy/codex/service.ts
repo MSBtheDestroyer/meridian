@@ -28,8 +28,6 @@ import { codexAccountIdentity, readCodexPool, type CodexPoolAccount, type CodexP
 import { describeCodexPlan } from "./plan"
 import { decodeCodexToken, type CodexTokenClaims } from "./token"
 import { fetchCodexAccountUsage, fetchCodexWorkspaceNames, type CodexAccountUsage, type CodexUsageOutcome } from "./usage"
-import { noteApiRejected, noteProviderAccepted } from "../authLifecycle"
-import { chatGptAuthLifecycleKey } from "../chatgpt/refresh"
 import type { CodexPlan, CodexUsageEntry, CodexUsageError, CodexUsageFailure, CodexUsageResponse } from "./types"
 
 const SUCCESS_TTL_MS = 30_000
@@ -103,6 +101,19 @@ export interface CodexUsageDeps {
   loadPool?: () => CodexPoolResult
   fetchImpl?: typeof fetch
   now?: number
+}
+
+/** A successful usage observation still bound to the credential currently in the pool. */
+export function currentCodexUsageEvidence({ pool, error }: CodexPoolResult): ReadonlyMap<string, CodexAccountUsage> {
+  const result = new Map<string, CodexAccountUsage>()
+  if (!pool || error) return result
+  for (const seat of pool.accounts) {
+    if (!seat.accountUserId) continue
+    const key = cacheKey(seat)
+    const current = lastGood.get(key)
+    if (current && !failureRuns.has(key)) result.set(seat.accountUserId, current.usage)
+  }
+  return result
 }
 
 export async function getCodexUsage(deps: CodexUsageDeps = {}): Promise<CodexUsageResponse> {
@@ -197,9 +208,6 @@ async function obtainUsage(
     },
     { fetchImpl, now },
   )).then((outcome) => {
-    const authKey = account.accountUserId ? chatGptAuthLifecycleKey(account.accountUserId) : undefined
-    if (outcome.error === "unauthorized") noteApiRejected(authKey, { startedAt: now })
-    else if (outcome.usage) noteProviderAccepted(authKey, { startedAt: now })
     if (outcome.error) {
       const cooldown = cooldownFor(outcome.error)
       if (cooldown !== null) heldOffUntil.set(key, { until: now + cooldown, error: outcome.error })

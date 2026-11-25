@@ -66,6 +66,7 @@ interface Harness {
   calls: string[]
   events: ChatGptTurnEvent[]
   turn(): Promise<Response>
+  planSeatAvailable(seat: string): boolean
 }
 
 /** The profile id a seat is known by: `user-0` for seat 0. */
@@ -84,6 +85,7 @@ function harness(options: {
   const h: Harness = {
     calls: [], events: [],
     turn: () => backend.handle({ context: {}, endpoint: "responses", route: "/v1/responses" }),
+    planSeatAvailable: seat => backend.planSeatAvailable(seat, "gpt-5.6-luna"),
   }
   const backend = createChatGptBackend<object>({
     source: createExternalCredentialSource({ path: poolPath, now: () => NOW }),
@@ -114,6 +116,18 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
 describe("a ChatGPT seat its usage reserve holds back", () => {
+  it("does not offer a reserved or spent seat as plan availability", () => {
+    writePool([account(0), account(1), stamped(2)])
+    const h = harness({
+      windows: { [seatId(0)]: weekly(0.96), [seatId(1)]: weekly(0.94), [seatId(2)]: weekly(1) },
+      reserves: { [seatId(0)]: FLAT_WEEK_95 },
+      credits: { [seatId(2)]: PAYABLE },
+    })
+
+    expect([0, 1, 2].map(n => h.planSeatAvailable(seatId(n)))).toEqual([false, true, false])
+    expect(h.calls).toEqual([])
+  })
+
   it("is passed over while its plan has quota left", async () => {
     writePool([account(0), account(1)])
     const held = harness({ windows: { [seatId(0)]: weekly(0.96) }, reserves: { [seatId(0)]: FLAT_WEEK_95 } })

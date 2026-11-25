@@ -46,7 +46,19 @@ export interface RouteHop {
   refusedBucket?: string
 }
 
-export interface RequestMetric {
+export type RequestClient = {
+  readonly name: string
+  readonly version?: string
+  readonly installation?: string
+  readonly device?: string
+}
+
+export type RequestAttribution = {
+  readonly client?: RequestClient
+  readonly purpose?: string
+}
+
+export interface RequestMetric extends RequestAttribution {
   /** Unique request identifier */
   requestId: string
 
@@ -87,6 +99,10 @@ export interface RequestMetric {
    *  the diagnosis the refusal bookkeeping already produced — nothing extra is
    *  computed for it. */
   routeRefusedBucket?: string
+
+  /** The known requirements the request's `x-meridian-require` header named
+   *  (e.g. `["cvp"]`). Absent when it carried none. */
+  routingRequire?: string[]
 
   /** Correlates the internal hops of ONE client request. Priority routing
    *  re-enters the proxy once per candidate account, so a failover writes
@@ -145,6 +161,7 @@ export interface RequestMetric {
 
   /** SDK session ID used for this request (for correlating across turns) */
   sdkSessionId?: string
+  readonly clientSessionId?: string
 
   /** HTTP status code returned to the client */
   status: number

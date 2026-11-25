@@ -309,9 +309,11 @@ ${profileBarHtml}
   <h1 style="margin-top:40px">Event Hooks</h1>
   <p class="subtitle" style="max-width:720px;line-height:1.6">
     Tell other programs when something happens here. A <strong style="color:var(--text)">webhook</strong> gets each
-    event as a JSON <code>POST</code>; a <strong style="color:var(--text)">command</strong> runs through the shell with
-    the event as JSON on stdin, never on its command line. Each delivery is tried once, with a 5s (webhook) or 10s
-    (command) limit. The command's first line of output is shown below, so it must not print secrets.
+    event as a JSON <code>POST</code> and is edited here. A <strong style="color:var(--text)">command</strong> runs
+    through the shell as Meridian's user, with the event as JSON on stdin, so it is set only on this machine: in
+    <code>settings.json</code> (<code>hooks.commands</code>) or <code>MERIDIAN_HOOK_COMMAND</code>, and runs only for
+    the sign-in events below, never for the test button. Each delivery is tried once, with a 5s (webhook) or 10s
+    (command) limit. Below are their statuses only; what a command prints goes to Meridian's log on this machine.
     <code>oauth.callback.listening</code> and <code>oauth.callback.closed</code> announce a sign-in redirect listener
     and its public address, <code>&lt;public URL&gt;/callback/&lt;id&gt;</code>: a relay on the browser's machine can
     forward the provider's loopback redirect there, so a sign-in started from another machine finishes by itself.
@@ -545,7 +547,7 @@ async function saveChatGpt(key, value) {
   });
   if (!res.ok) {
     const err = await res.json().catch(function () { return {}; });
-    alert(err.error || 'Failed to save ChatGPT settings');
+    meridianDialog.fail('Could not save the ChatGPT settings', err, 'Meridian refused the change (HTTP ' + res.status + ').');
   } else {
     showSaved();
   }
@@ -687,7 +689,7 @@ async function putPricing(model, rates) {
   });
   if (!res.ok) {
     const err = await res.json().catch(function () { return {}; });
-    alert('Could not save pricing: ' + (err.error || ('HTTP ' + res.status)));
+    meridianDialog.fail('Could not save pricing for ' + model, err, 'Meridian refused the change (HTTP ' + res.status + ').');
     return false;
   }
   showSaved();
@@ -772,8 +774,8 @@ async function addPricingModel() {
   const name = document.getElementById('newModelName').value.trim();
   const inputRate = parseFloat(document.getElementById('newModelInput').value);
   const outputRate = parseFloat(document.getElementById('newModelOutput').value);
-  if (!name) { alert('Enter a model id'); return; }
-  if (!isFinite(inputRate) || !isFinite(outputRate)) { alert('Enter input and output rates (USD per million tokens)'); return; }
+  if (!name) { meridianDialog.tell('Add a model', 'Enter a model id.'); return; }
+  if (!isFinite(inputRate) || !isFinite(outputRate)) { meridianDialog.tell('Add a model', 'Enter input and output rates, in USD per million tokens.'); return; }
   const rates = { inputPerMTok: inputRate, outputPerMTok: outputRate };
   const cacheRead = parseFloat(document.getElementById('newModelCacheRead').value);
   const cacheWrite = parseFloat(document.getElementById('newModelCacheWrite').value);
@@ -787,6 +789,7 @@ async function addPricingModel() {
   }
 }
 
+var routingForceShown = false;
 async function loadRouting() {
   const res = await fetch('/settings/api/routing');
   const cfg = await res.json();
@@ -820,7 +823,53 @@ async function loadRouting() {
         + ' <button data-move="down" data-i="'+i+'" style="background:var(--surface);color:var(--muted);border:1px solid var(--border);border-radius:4px;padding:1px 8px;cursor:pointer"'+(i===cfg.profileOrder.length-1?' disabled':'')+'>&darr;</button>'
         + '</li>').join('')
     + '</ol></div>';
+  // Forcing: the boss may activate a profile a supervisor keeps out of work.
+  var forced = cfg.forcedActiveProfile;
+  h += '<div id="routing-force" style="margin-top:14px">' + settingRowHtml({
+    label: 'Allow forcing a forbidden profile',
+    forId: 'routing-allow-force',
+    controlHtml: '<input type="checkbox" id="routing-allow-force"' + (cfg.allowForcingForbiddenProfile ? ' checked' : '') + '>',
+    desc: 'When a routing supervisor (such as Vibeterm\u2019s fleet policy) keeps a Claude profile out of work, through its managed exclusions, its held list or a usage reserve, '
+      + 'activating that profile on Home or Profiles offers \u201cActivate anyway\u201d. A forced profile stays active for up to five hours, or until you release it, and the supervisor '
+      + 'cannot switch away from it meanwhile. Your own exclusions and a missing login are never forced past. Off by default.',
+    statusHtml: [
+      nowLine(cfg.allowForcingForbiddenProfile ? 'allowed' : 'off'),
+      forced
+        ? 'Forced now: <code>' + telemetryEsc(forced.profile) + '</code> until ' + telemetryEsc(new Date(forced.until).toLocaleString())
+          + ' <button type="button" class="reset-btn" id="routing-release-force">Release</button>'
+        : '',
+    ],
+  }) + '</div>';
   el.innerHTML = h;
+  // The refusal dialog on Home and Profiles links here; the row exists only once loaded.
+  if (location.hash === '#routing-force' && !routingForceShown) {
+    routingForceShown = true;
+    document.getElementById('routing-force').scrollIntoView({ block: 'center' });
+  }
+  document.getElementById('routing-allow-force').addEventListener('change', async (e) => {
+    const box = e.target;
+    box.disabled = true;
+    try {
+      const res = await fetch('/settings/api/routing', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ allowForcingForbiddenProfile: box.checked }) });
+      if (!res.ok) meridianDialog.fail('Could not save the forcing setting', await res.json().catch(() => null), 'Meridian refused the change (HTTP ' + res.status + ').');
+      else showSaved();
+    } catch {
+      meridianDialog.fail('Could not save the forcing setting', null, 'Could not reach Meridian.');
+    }
+    await loadRouting();
+  });
+  const releaseButton = document.getElementById('routing-release-force');
+  if (releaseButton) releaseButton.addEventListener('click', async () => {
+    releaseButton.disabled = true;
+    try {
+      const res = await fetch('/profiles/forced/release', { method: 'POST' });
+      if (!res.ok) meridianDialog.fail('Could not release the forced profile', await res.json().catch(() => null), 'Meridian refused (HTTP ' + res.status + ').');
+      else if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+    } catch {
+      meridianDialog.fail('Could not release the forced profile', null, 'Could not reach Meridian.');
+    }
+    await loadRouting();
+  });
   document.getElementById('routing-mode').addEventListener('change', async (e) => {
     await fetch('/settings/api/routing', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ routing: e.target.value }) });
     await loadRouting();
@@ -963,7 +1012,7 @@ async function putTelemetry(body) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    alert(err.error || 'Failed to save telemetry settings');
+    meridianDialog.fail('Could not save the telemetry settings', err, 'Meridian refused the change (HTTP ' + res.status + ').');
   } else {
     showSaved();
   }
@@ -1002,7 +1051,7 @@ async function putTranscripts(body) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    alert(err.error || 'Failed to save transcript retention');
+    meridianDialog.fail('Could not save transcript retention', err, 'Meridian refused the change (HTTP ' + res.status + ').');
   } else {
     showSaved();
   }
@@ -1069,7 +1118,7 @@ async function putUpdates(checkForUpdates) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    alert(err.error || 'Failed to save update settings');
+    meridianDialog.fail('Could not save the update settings', err, 'Meridian refused the change (HTTP ' + res.status + ').');
   } else {
     showSaved();
     if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
@@ -1154,12 +1203,12 @@ async function putClaudeExecutable(body) {
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      alert(err.error || 'Failed to save the Claude Code executable');
+      meridianDialog.fail('Could not save the Claude Code executable', err, 'Meridian refused the change (HTTP ' + res.status + ').');
     } else {
       showSaved();
     }
   } catch {
-    alert('Failed to save the Claude Code executable');
+    meridianDialog.fail('Could not save the Claude Code executable', null, 'Could not reach Meridian.');
   }
   await loadClaudeExecutable();
 }
@@ -1190,17 +1239,17 @@ async function putHeaderSettings(showHostname) {
     if (!res.ok) {
       checkbox.checked = !showHostname;
       const err = await res.json().catch(() => ({}));
-      alert(err.error || 'Failed to save header settings');
+      meridianDialog.fail('Could not save the header settings', err, 'Meridian refused the change (HTTP ' + res.status + ').');
     } else {
       showSaved();
       if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
     }
   } catch {
     checkbox.checked = !showHostname;
-    alert('Failed to save header settings');
+    meridianDialog.fail('Could not save the header settings', null, 'Could not reach Meridian.');
   } finally {
     try { await loadHeaderSettings(); }
-    catch { alert('Failed to reload header settings'); }
+    catch { meridianDialog.fail('Could not reload the header settings', null, 'Could not reach Meridian.'); }
     checkbox.disabled = false;
   }
 }
@@ -1245,9 +1294,15 @@ function renderHooks() {
   h += '<div style="color:var(--muted);font-size:13px;margin:6px 0 8px">Webhooks</div>'
     + hookRows('webhooks', 'url', 'https://hooks.example/meridian')
     + '<button class="reset-btn" id="hooks-add-webhook">Add webhook</button>';
-  h += '<div style="color:var(--muted);font-size:13px;margin:16px 0 8px">Commands</div>'
-    + hookRows('commands', 'command', '/path/to/program --flag')
-    + '<button class="reset-btn" id="hooks-add-command">Add command</button>';
+  const commands = cfg.commands || [];
+  h += '<div style="color:var(--muted);font-size:13px;margin:16px 0 8px">Commands (settings.json, read-only here)</div>'
+    + (commands.length
+      ? commands.map(function (c) {
+        return '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">'
+          + '<strong style="color:var(--text);font-family:var(--mono, monospace);font-size:12px">' + telemetryEsc(c.target) + '</strong>'
+          + hookEventsNote(c.events) + '</div>';
+      }).join('')
+      : '<div class="pricing-note" style="margin-top:0">None. Add one to <code>hooks.commands</code> in settings.json, or set MERIDIAN_HOOK_COMMAND.</div>');
 
   const envTargets = [cfg.environment && cfg.environment.webhook, cfg.environment && cfg.environment.command].filter(Boolean);
   if (envTargets.length) {
@@ -1281,8 +1336,7 @@ function renderHooks() {
 
   el.querySelectorAll('input[data-hook-kind]').forEach(function (input) {
     input.addEventListener('input', function () {
-      const entry = hooksState.draft[input.dataset.hookKind][Number(input.dataset.hookI)];
-      entry[input.dataset.hookKind === 'webhooks' ? 'url' : 'command'] = input.value;
+      hooksState.draft[input.dataset.hookKind][Number(input.dataset.hookI)].url = input.value;
     });
   });
   el.querySelectorAll('button[data-hook-remove]').forEach(function (btn) {
@@ -1292,7 +1346,6 @@ function renderHooks() {
     });
   });
   document.getElementById('hooks-add-webhook').addEventListener('click', function () { hooksState.draft.webhooks.push({ url: '' }); renderHooks(); });
-  document.getElementById('hooks-add-command').addEventListener('click', function () { hooksState.draft.commands.push({ command: '' }); renderHooks(); });
   document.getElementById('hooks-public-url').addEventListener('input', function (e) { hooksState.publicUrl = e.target.value; });
   document.getElementById('hooks-save').addEventListener('click', saveHooks);
   document.getElementById('hooks-test').addEventListener('click', testHooks);
@@ -1307,14 +1360,20 @@ function setHooksMsg(text, isError) {
 
 async function loadHooks() {
   const res = await fetch('/settings/api/hooks');
-  const cfg = await res.json();
+  const cfg = await res.json().catch(function () { return {}; });
+  if (!res.ok) {
+    // Refused by the management boundary (no API key and not on this
+    // machine's loopback address): say so instead of drawing an empty form.
+    document.getElementById('hooks-body').innerHTML = '<div class="pricing-note" style="margin-top:0">'
+      + telemetryEsc(cfg.error || 'Event hook settings are not available here.') + '</div>';
+    return;
+  }
   const saved = cfg.saved || {};
   hooksState = {
     cfg: cfg,
     publicUrl: (cfg.publicUrl && cfg.publicUrl.saved) || '',
     draft: {
       webhooks: (saved.webhooks || []).map(function (w) { return { url: w.url, events: w.events }; }),
-      commands: (saved.commands || []).map(function (c) { return { command: c.command, events: c.events }; }),
     },
   };
   renderHooks();
@@ -1326,7 +1385,6 @@ async function saveHooks() {
     publicUrl: hooksState.publicUrl.trim() || null,
     hooks: {
       webhooks: hooksState.draft.webhooks.filter(function (w) { return w.url.trim(); }).map(function (w) { return Object.assign({ url: w.url.trim() }, keep(w)); }),
-      commands: hooksState.draft.commands.filter(function (c) { return c.command.trim(); }).map(function (c) { return Object.assign({ command: c.command.trim() }, keep(c)); }),
     },
   };
   const res = await fetch('/settings/api/hooks', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -1345,7 +1403,7 @@ async function testHooks() {
   const data = await res.json().catch(function () { return {}; });
   await loadHooks();
   const deliveries = data.deliveries || [];
-  setHooksMsg(deliveries.length ? deliveries.length + ' target(s) tried; results below.' : 'No target takes hooks.test. Save a target first.', false);
+  setHooksMsg(deliveries.length ? deliveries.length + ' target(s) tried; results below.' : 'No webhook takes hooks.test. Save one first; commands run only for sign-in events.', false);
 }
 
 async function loadLayout() {
@@ -1369,7 +1427,7 @@ async function putLayout(layout) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    alert(err.error || 'Failed to save the layout');
+    meridianDialog.fail('Could not save the layout', err, 'Meridian refused the change (HTTP ' + res.status + ').');
   } else {
     const saved = await res.json();
     if (saved.layout === 'contained') document.documentElement.removeAttribute('data-layout');

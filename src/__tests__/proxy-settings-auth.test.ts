@@ -35,6 +35,20 @@ afterAll(() => {
 // test suite's pattern for env-sensitive imports.
 const { createProxyServer } = await import("../proxy/server")
 
+it("returns no speculative route availability through the authenticated API", async () => {
+  const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+  const response = await app.fetch(new Request("http://localhost/profiles/route-availability?provider=chatgpt&model=gpt-6.2-sol&variant=xhigh", {
+    headers: { Authorization: `Bearer ${TEST_KEY}` },
+  }))
+
+  expect(response.status).toBe(200)
+  expect(response.headers.get("cache-control")).toBe("no-store")
+  expect(await response.json()).toEqual({
+    version: 1, provider: "chatgpt", model: "gpt-6.2-sol", variant: "xhigh",
+    available: false, routable_allotment: 0, observed_at: null,
+  })
+})
+
 describe("quota reset boundary rejects before credential access", () => {
   it("requires API authentication even with valid explicit IDs", async () => {
     const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
