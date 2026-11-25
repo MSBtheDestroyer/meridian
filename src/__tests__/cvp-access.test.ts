@@ -14,6 +14,7 @@ import {
   recordCvpReading,
   recordCvpRefusal,
   resetCvpAccessCacheForTests,
+  setCvpOrganizationLookup,
 } from "../proxy/cvpAccess"
 
 const DEFENSE = { message: "CVP: Defense Access", variant: "neutral" }
@@ -22,6 +23,7 @@ const T0 = 1_800_000_000_000
 beforeEach(() => {
   rmSync(configPath("cvp-access.json"), { force: true })
   resetCvpAccessCacheForTests()
+  setCvpOrganizationLookup(() => ({}))
 })
 
 describe("claude.ai readings", () => {
@@ -108,6 +110,91 @@ describe("which source decides", () => {
     recordCvpReading("team", [{ id: "claude-opus-5-5", badge: DEFENSE }], T0 + 1)
 
     expect(cvpActive("team", "claude-opus-5-5", T0 + CLAUDE_AI_READING_FRESH_MS * 3)).toBe(true)
+  })
+})
+
+describe("organization inference", () => {
+  const ORGS = { c1: "org-sub-1", c1b: "org-sub-1", c1c: "org-sub-1", c2: "org-sub-2", personal: "org-personal", unknown: null }
+
+  beforeEach(() => {
+    setCvpOrganizationLookup(() => ORGS)
+  })
+
+  it("gives a profile with no reading its organization sibling's reading, naming the sibling", () => {
+    recordCvpReading("c1", [{ id: "claude-opus-5-5", name: "Opus 5.5", badge: DEFENSE }, { id: "claude-fable-5-2" }], T0)
+
+    expect(cvpAccessOn("c1b", "claude-opus-5-5[1m]", T0)).toEqual({
+      model: "claude-opus-5-5", type: "active", tier: "c", reason: null, source: "organization", inferredFrom: "c1", at: T0, name: "Opus 5.5",
+    })
+    expect(cvpActive("c1b", "claude-opus-5-5", T0)).toBe(true)
+    expect(cvpAccessFor("c1b", T0).map(e => [e.model, e.type, e.source, e.inferredFrom])).toEqual([
+      ["claude-fable-5-2", "inactive", "organization", "c1"],
+      ["claude-opus-5-5", "active", "organization", "c1"],
+    ])
+    expect(cvpAccessFor("c1", T0).every(e => e.source === "claude_ai" && e.inferredFrom === undefined)).toBe(true)
+  })
+
+  it("infers nothing when siblings with readings disagree", () => {
+    recordCvpReading("c1", [{ id: "claude-opus-5-5", badge: DEFENSE }], T0)
+    recordCvpRefusal("c1b", "claude-opus-5-5", { type: "inactive", reason: "not_assigned_but_organization_approved" }, T0)
+
+    expect(cvpAccessOn("c1c", "claude-opus-5-5", T0)).toBeUndefined()
+    expect(cvpAccessFor("c1c", T0)).toEqual([])
+  })
+
+  it("lets the profile's own reading outrank the inferred one", () => {
+    recordCvpReading("c1", [{ id: "claude-opus-5-5", badge: DEFENSE }], T0)
+    recordCvpRefusal("c1b", "claude-opus-5-5", { type: "inactive", reason: "not_assigned_but_organization_approved" }, T0 + 1)
+
+    expect(cvpAccessOn("c1b", "claude-opus-5-5", T0 + 1)).toMatchObject({ type: "inactive", source: "observed" })
+    expect(cvpActive("c1b", "claude-opus-5-5", T0 + 1)).toBe(false)
+  })
+
+  it("never leaks across organizations or to a profile whose organization is unknown", () => {
+    recordCvpReading("c1", [{ id: "claude-opus-5-5", badge: DEFENSE }], T0)
+
+    expect(cvpAccessOn("c2", "claude-opus-5-5", T0)).toBeUndefined()
+    expect(cvpAccessOn("personal", "claude-opus-5-5", T0)).toBeUndefined()
+    expect(cvpAccessOn("unknown", "claude-opus-5-5", T0)).toBeUndefined()
+    expect(cvpAccessOn("nobody", "claude-opus-5-5", T0)).toBeUndefined()
+  })
+
+  it("does not infer through an unknown organization shared by name only", () => {
+    setCvpOrganizationLookup(() => ({ a: null, b: null }))
+    recordCvpReading("a", [{ id: "claude-opus-5-5", badge: DEFENSE }], T0)
+
+    expect(cvpAccessOn("b", "claude-opus-5-5", T0)).toBeUndefined()
+  })
+})
+
+describe("readings under a model id that is not a Claude model", () => {
+  it("refuses to record a refusal under <synthetic>", () => {
+    expect(recordCvpRefusal("team", "<synthetic>", { type: "active", tier: "c" }, T0)).toBe(false)
+    expect(cvpAccessFor("team", T0)).toEqual([])
+  })
+
+  it("ignores stored <synthetic> entries and prunes them on the next write", () => {
+    writeFileSync(configPath("cvp-access.json"), JSON.stringify({ profiles: {
+      team: { "<synthetic>": { observed: { type: "active", tier: "c", reason: null, source: "observed", at: T0 } } },
+    } }))
+    resetCvpAccessCacheForTests()
+
+    expect(cvpAccessFor("team", T0)).toEqual([])
+    expect(cvpAccessOn("team", "<synthetic>", T0)).toBeUndefined()
+
+    recordCvpRefusal("team", "claude-opus-5-5", { type: "active", tier: "c" }, T0 + 1)
+    const stored = JSON.parse(readFileSync(configPath("cvp-access.json"), "utf-8")).profiles.team
+    expect(Object.keys(stored)).toEqual(["claude-opus-5-5"])
+  })
+
+  it("never lends a <synthetic> entry to an organization sibling", () => {
+    setCvpOrganizationLookup(() => ({ a: "org", b: "org" }))
+    writeFileSync(configPath("cvp-access.json"), JSON.stringify({ profiles: {
+      a: { "<synthetic>": { observed: { type: "active", tier: "c", reason: null, source: "observed", at: T0 } } },
+    } }))
+    resetCvpAccessCacheForTests()
+
+    expect(cvpAccessFor("b", T0)).toEqual([])
   })
 })
 

@@ -6,8 +6,10 @@
  * session (the model selector's `badge`), never to the OAuth credential
  * Meridian holds, so Meridian cannot read it itself. Two sources feed it: a
  * claude.ai reading posted by something that has that session, and the
- * `stop_details.cyber_verification` a cyber refusal carries. Policy and
- * contract: profiles-routing.spec.md, "CVP access is learned, never fetched".
+ * `stop_details.cyber_verification` a cyber refusal carries. A profile with
+ * neither reading for a model takes what the other profiles of its
+ * organization read there. Policy and contract: profiles-routing.spec.md,
+ * "CVP access is learned, never fetched".
  *
  * Leaf module: no imports from server.ts or session/.
  */
@@ -19,7 +21,8 @@ import { configPath } from "../configDir"
 
 /** CVP tiers as Anthropic names them: a specialized, b red team, c defense. */
 export type CvpTier = "a" | "b" | "c"
-export type CvpSource = "claude_ai" | "observed"
+/** Where a reading came from; "organization" is inferred from another profile's own reading, never stored. */
+export type CvpSource = "claude_ai" | "observed" | "organization"
 
 export interface CvpReading {
   readonly type: "active" | "inactive"
@@ -31,6 +34,8 @@ export interface CvpReading {
   readonly at: number
   /** claude.ai's display name for the model, when the reading named it. */
   readonly name?: string
+  /** For an "organization" reading: the profile whose own reading it is. */
+  readonly inferredFrom?: string
 }
 
 export interface CvpEntry extends CvpReading {
@@ -53,6 +58,7 @@ const modelRecord = z.object({ claude_ai: reading.optional(), observed: reading.
 const storeFile = z.object({ profiles: z.record(z.string(), z.record(z.string(), modelRecord)) })
 type StoreFile = z.infer<typeof storeFile>
 type ModelRecord = z.infer<typeof modelRecord>
+type StoredReading = z.infer<typeof reading>
 
 const cyberVerification = z.union([
   z.object({ type: z.literal("active"), tier }),
@@ -78,6 +84,24 @@ export const cvpReadingBody = z.object({ models: z.array(claudeAiModelReading).m
  */
 export function normalizeCvpModel(model: string): string {
   return model.trim().toLowerCase().replace(/\[1m\]$/, "").replace(/-20\d{6}$/, "")
+}
+
+/**
+ * Whether a model id can key the map. Claude Code's own synthetic messages
+ * carry the model `<synthetic>`, which no request ever names.
+ */
+export function isCvpModelId(model: string): boolean {
+  return /^claude-[a-z0-9][a-z0-9.-]*$/.test(normalizeCvpModel(model))
+}
+
+/** Each profile's organization UUID, null or absent when unknown. */
+export type CvpOrganizationLookup = () => Readonly<Record<string, string | null | undefined>>
+
+let organizationsOf: CvpOrganizationLookup = () => ({})
+
+/** Tell the map which profiles share an organization; server.ts supplies it so this module stays a leaf. */
+export function setCvpOrganizationLookup(lookup: CvpOrganizationLookup): void {
+  organizationsOf = lookup
 }
 
 /** The tier claude.ai's badge names ("CVP: Defense Access"); null when it names none we know. */
@@ -135,9 +159,14 @@ function save(data: StoreFile): void {
   }
 }
 
+/** The profile's records under model ids that can key the map; a stored `<synthetic>` one is left out. */
+function ownRecords(data: StoreFile, profileId: string): Record<string, ModelRecord> {
+  return Object.fromEntries(Object.entries(data.profiles[profileId] ?? {}).filter(([model]) => isCvpModelId(model)))
+}
+
 function update(profileId: string, change: (models: Record<string, ModelRecord>) => Record<string, ModelRecord>): void {
   const data = load()
-  const models = change({ ...(data.profiles[profileId] ?? {}) })
+  const models = change(ownRecords(data, profileId))
   const profiles = { ...data.profiles }
   if (Object.keys(models).length > 0) profiles[profileId] = models
   else delete profiles[profileId]
@@ -158,6 +187,7 @@ export function recordCvpReading(profileId: string, models: readonly ClaudeAiMod
       if (record.observed) next[model] = { observed: record.observed }
     }
     for (const model of models) {
+      if (!isCvpModelId(model.id)) continue
       const message = model.badge?.message ?? model.selector_badge?.message ?? null
       const active = message !== null && /\bCVP\b|cyber/i.test(message)
       const id = normalizeCvpModel(model.id)
@@ -184,8 +214,8 @@ export function recordCvpReading(profileId: string, models: readonly ClaudeAiMod
  */
 export function recordCvpRefusal(profileId: string, model: string, value: unknown, now = Date.now()): boolean {
   const parsed = cyberVerification.safeParse(value)
-  if (!parsed.success || !model.trim()) return false
-  const observed: CvpReading = parsed.data.type === "active"
+  if (!parsed.success || !isCvpModelId(model)) return false
+  const observed: StoredReading = parsed.data.type === "active"
     ? { type: "active", tier: parsed.data.tier, reason: null, source: "observed", at: now }
     : { type: "inactive", tier: null, reason: parsed.data.reason, source: "observed", at: now }
   const id = normalizeCvpModel(model)
@@ -211,31 +241,58 @@ function effective(record: ModelRecord, now: number): CvpReading | undefined {
   return claudeAi ?? observed
 }
 
-/** Every model the profile's map knows, each with the reading that decides it. */
+function ownEntry(model: string, record: ModelRecord | undefined, now: number): CvpEntry | undefined {
+  const decided = record ? effective(record, now) : undefined
+  if (!decided) return undefined
+  // A refusal names no display name; keep claude.ai's.
+  const name = decided.name ?? record?.claude_ai?.name
+  return { model, ...decided, ...(name ? { name } : {}) }
+}
+
+/**
+ * The reading the profile's organization siblings agree on, from their own
+ * readings only; undefined when its organization is unknown, no sibling has
+ * one, or they disagree on active and inactive. The freshest names the source.
+ */
+function inferredEntry(data: StoreFile, organizations: ReturnType<CvpOrganizationLookup>, profileId: string, model: string, now: number): CvpEntry | undefined {
+  const organization = organizations[profileId]
+  if (!organization) return undefined
+  const readings = Object.keys(data.profiles).flatMap(id => {
+    if (id === profileId || organizations[id] !== organization) return []
+    const entry = ownEntry(model, ownRecords(data, id)[model], now)
+    return entry ? [{ id, entry }] : []
+  })
+  if (readings.length === 0 || readings.some(({ entry }) => entry.type !== readings[0]!.entry.type)) return undefined
+  const freshest = readings.reduce((best, next) => next.entry.at > best.entry.at ? next : best)
+  return { ...freshest.entry, source: "organization", inferredFrom: freshest.id }
+}
+
+/** Every model the profile's map knows, each with the reading that decides it: its own, else its organization's. */
 export function cvpAccessFor(profileId: string, now = Date.now()): CvpEntry[] {
-  const models = load().profiles[profileId] ?? {}
-  return Object.entries(models).flatMap(([model, record]) => {
-    const decided = effective(record, now)
-    if (!decided) return []
-    // A refusal names no display name; keep claude.ai's.
-    const name = decided.name ?? record.claude_ai?.name
-    return [{ model, ...decided, ...(name ? { name } : {}) }]
+  const data = load()
+  const organizations = organizationsOf()
+  const own = ownRecords(data, profileId)
+  const organization = organizations[profileId]
+  const siblingModels = organization
+    ? Object.keys(data.profiles).filter(id => id !== profileId && organizations[id] === organization).flatMap(id => Object.keys(ownRecords(data, id)))
+    : []
+  return [...new Set([...Object.keys(own), ...siblingModels])].flatMap(model => {
+    const entry = ownEntry(model, own[model], now) ?? inferredEntry(data, organizations, profileId, model, now)
+    return entry ? [entry] : []
   }).sort((a, b) => a.model.localeCompare(b.model))
 }
 
-/** What the profile's map says about one model; undefined when it knows nothing. */
+/** What the profile's map says about one model, its own reading else its organization's; undefined when neither says. */
 export function cvpAccessOn(profileId: string, model: string, now = Date.now()): CvpEntry | undefined {
   const id = normalizeCvpModel(model)
-  const record = load().profiles[profileId]?.[id]
-  const decided = record ? effective(record, now) : undefined
-  if (!decided) return undefined
-  const name = decided.name ?? record?.claude_ai?.name
-  return { model: id, ...decided, ...(name ? { name } : {}) }
+  if (!isCvpModelId(id)) return undefined
+  const data = load()
+  return ownEntry(id, ownRecords(data, profileId)[id], now) ?? inferredEntry(data, organizationsOf(), profileId, id, now)
 }
 
 /** When the profile's latest claude.ai reading arrived, whether or not it decides any model now; null when none has. */
 export function lastClaudeAiReadingAt(profileId: string): number | null {
-  const times = Object.values(load().profiles[profileId] ?? {}).flatMap(record => record.claude_ai ? [record.claude_ai.at] : [])
+  const times = Object.values(ownRecords(load(), profileId)).flatMap(record => record.claude_ai ? [record.claude_ai.at] : [])
   return times.length > 0 ? Math.max(...times) : null
 }
 
@@ -243,7 +300,7 @@ export function lastClaudeAiReadingAt(profileId: string): number | null {
 export type CyberVerificationField = Omit<CvpEntry, "model" | "name">
 
 export function cyberVerificationField(entry: CvpEntry): CyberVerificationField {
-  return { type: entry.type, tier: entry.tier, reason: entry.reason, source: entry.source, at: entry.at }
+  return { type: entry.type, tier: entry.tier, reason: entry.reason, source: entry.source, at: entry.at, ...(entry.inferredFrom ? { inferredFrom: entry.inferredFrom } : {}) }
 }
 
 /** True only when the map says the profile holds CVP access on this model. */

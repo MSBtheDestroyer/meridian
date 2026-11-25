@@ -60,7 +60,7 @@ function tableFacts(input: Input, format: {
 
 type ForkInput = Input & {
   readonly profile?: { readonly cvpAccess?: readonly {
-    readonly model: string; readonly name?: string; readonly type: 'active' | 'inactive'; readonly tier?: string | null; readonly reason?: string | null
+    readonly model: string; readonly name?: string; readonly type: 'active' | 'inactive'; readonly tier?: string | null; readonly reason?: string | null; readonly inferredFrom?: string
   }[] }
   readonly forced?: { readonly until: number } | null
   readonly resetView?: FreeResetView | null
@@ -82,7 +82,8 @@ function addForkTableFacts(input: ForkInput, esc: (text: string) => string): Rec
     fableReset: resets('fable'),
     otherReset: resets('unknown'),
     cvp: { value: cvp.length === 0 ? null : cvp.map(entry => (entry.name || entry.model) + ': ' + entry.type
-      + (entry.tier ? ' (tier ' + entry.tier.toUpperCase() + ')' : '') + (entry.reason ? ' - ' + entry.reason : '')).join('; ') },
+      + (entry.tier ? ' (tier ' + entry.tier.toUpperCase() + ')' : '') + (entry.reason ? ' - ' + entry.reason : '')
+      + (entry.inferredFrom ? ' via ' + entry.inferredFrom : '')).join('; ') },
   }
 }
 

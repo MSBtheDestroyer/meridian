@@ -267,13 +267,32 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   Specialized `a`), an unbadged one `inactive`, and it replaces that
   profile's previous reading. A refusal's `stop_details.cyber_verification`
   (`{type: "active", tier}` or `{type: "inactive", reason}`, subagent rows
-  included) is recorded for the model the refusal names. A claude.ai reading
-  under 24 hours old decides; past that the newer of the two does. Model ids
-  are compared lowercase without `[1m]` or a `-YYYYMMDD` snapshot date, and
-  never by family: Mythos holds access where Fable, its tier, does not. A
-  Meridian sign-in forgets the profile's map, since it may be another
-  account; a token refresh does not. `/profiles/list` lists each profile's
-  map as `cvpAccess`.
+  included) is recorded for the model the refusal names, or for the
+  requested model when the row names none or one that is not a Claude model
+  id: Claude Code's synthetic messages carry `<synthetic>`, which no request
+  names. Entries already stored under such an id are ignored on read and
+  pruned on the profile's next write. A claude.ai reading under 24 hours old
+  decides; past that the newer of the two does. Model ids are compared
+  lowercase without `[1m]` or a `-YYYYMMDD` snapshot date, and never by
+  family: Mythos holds access where Fable, its tier, does not. A Meridian
+  sign-in forgets the profile's map, since it may be another account; a token
+  refresh does not. `/profiles/list` lists each profile's map as `cvpAccess`.
+- **A profile without a reading takes its organization's.** CVP access is
+  granted to an organization, and the claude.ai reading reaches Meridian only
+  for the accounts of whoever runs the reader, so a profile with neither a
+  claude.ai nor an observed reading for a model takes the effective reading
+  that the other profiles of the same organization (equal `organizationUuid`
+  in `organizations.json`, never the name) hold there from their own
+  readings, never from an inferred one. When those siblings disagree on
+  `active` and `inactive` nothing is inferred; a profile whose organization
+  is unknown infers nothing. The freshest sibling reading supplies tier,
+  reason and time, with `source: "organization"` and `inferredFrom` naming
+  that sibling. The map is a routing hint, not a grant: Anthropic checks
+  access on every request, so the first cyber refusal on an inferred holder
+  records the profile's own observed reading, which decides from then on.
+  Inference is computed on read and never stored. It applies everywhere the
+  map is read: `cvpAccess` on `/profiles/list`, `cyber_verification` on
+  `/v1/models`, `cvpHolders`, cvp routing and the pin check.
 - **`x-meridian-require: cvp` routes unpinned work to CVP access, in its own
   order.** Two switchers run side by side: the general one owns
   `activeProfile`, `profileOrder` and `routingManagedExcludedProfiles`, a
@@ -306,7 +325,10 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   when unset), `cvpEffectiveProfileOrder` (what cvp work walks),
   `cvpActiveProfile` (`null` when unset), `cvpManagedExcludedProfiles` and
   `cvpHolders` (per normalized model, the profiles whose map shows `active`
-  access, in the effective order, exclusions not applied). `PUT` takes each
+  access, in the effective order, exclusions not applied) with
+  `cvpInferredHolders` (per model, those of them holding it by organization
+  inference, each mapped to its `inferredFrom` sibling; capability
+  `cvp-organization-inference`). `PUT` takes each
   independently, atomically with the rest of the body: the order and the
   pointer name Claude profiles only (400 otherwise; `null` clears the pointer,
   `[]` the order), the managed list any strings. A rename rewrites the order

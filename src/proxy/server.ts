@@ -158,7 +158,7 @@ import { resolveReachabilityThresholds } from "./upstreamReachabilityConfig"
 import type { AnthropicSseEvent } from "./openai"
 import { translateOpenAiToAnthropic, translateAnthropicToOpenAi, buildModelList, createSseTranslator, translateAnthropicSseError } from "./openai"
 import { accountModelReadDue, accountModelsState, accountOffersModelEffort, clearAccountModels, fetchAccountModels, toAccountModelList, type AccountModel } from "./accountModels"
-import { cvpAccessFor, cvpReadingBody, cvpAccessOn, lastClaudeAiReadingAt, cvpActive, cyberVerificationField, cyberVerificationOf, forgetCvpAccess, normalizeCvpModel, parseRoutingRequirements, recordCvpReading, routingRequireOf, recordCvpRefusal, ROUTING_REQUIRE_HEADER, type CyberVerificationField } from "./cvpAccess"
+import { cvpAccessFor, cvpReadingBody, cvpAccessOn, lastClaudeAiReadingAt, cvpActive, cyberVerificationField, cyberVerificationOf, forgetCvpAccess, isCvpModelId, normalizeCvpModel, parseRoutingRequirements, recordCvpReading, routingRequireOf, recordCvpRefusal, ROUTING_REQUIRE_HEADER, setCvpOrganizationLookup, type CyberVerificationField } from "./cvpAccess"
 import { normalizeJcodeSessionId } from "./adapters/jcode"
 import { extractLettaConversationId, LETTA_CONVERSATION_HEADER } from "./adapters/letta"
 import { isClaudeCodeClient } from "./adapters/claudecode"
@@ -903,6 +903,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     authOwner.run(() => getClaudeAuthStatusAsync(profileId, envOverrides))
   const finalConfig = resolveBackendConfig(config)
   const claudeProviderFacts = new ClaudeProviderFacts()
+  setCvpOrganizationLookup(() => Object.fromEntries(Object.entries(organizationNames()).map(([id, record]) => [id, record.organizationUuid ?? null])))
   const pendingSystemPromptResets = new PendingSystemPromptResets()
   const antigravity = finalConfig.backend === "combined" ? createAntigravityServer({ ...finalConfig, profiles: undefined, defaultProfile: undefined }) : undefined
   // Decided once per instance. Absent means GPT model names keep meaning
@@ -2189,7 +2190,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   function noteCvpRefusal(profileId: string, row: { readonly message?: unknown }, requestedModel: unknown): void {
     const found = cyberVerificationOf(row)
     if (!found) return
-    const model = found.model ?? (typeof requestedModel === "string" ? requestedModel : "")
+    const model = found.model !== null && isCvpModelId(found.model) ? found.model : typeof requestedModel === "string" ? requestedModel : ""
     if (recordCvpRefusal(profileId, model, found.value)) {
       claudeLog("cvp.observed", { profile: profileId, model: normalizeCvpModel(model), access: cvpAccessOn(profileId, model)?.type ?? null })
     }
@@ -10626,15 +10627,22 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     renewalHours: (seat) => getChatGptFeatures().seatRenewalHours[seat] ?? null,
   }) : undefined
   const claudeProfileIds = (): string[] => listProfiles(finalConfig.profiles, finalConfig.defaultProfile).map(p => p.id)
-  /** Per model, the profiles whose CVP map shows active access, in `order`. */
-  const cvpHoldersByModel = (order: readonly string[]): Record<string, string[]> => {
+  /**
+   * Per model, the profiles whose CVP map shows active access, in `order`, and
+   * of those the ones holding it by organization inference, each with the
+   * sibling whose reading it is.
+   */
+  const cvpHoldersByModel = (order: readonly string[]): { holders: Record<string, string[]>; inferred: Record<string, Record<string, string>> } => {
     const holders: Record<string, string[]> = {}
+    const inferred: Record<string, Record<string, string>> = {}
     for (const id of order) {
       for (const entry of cvpAccessFor(id)) {
-        if (entry.type === "active") (holders[entry.model] ??= []).push(id)
+        if (entry.type !== "active") continue
+        ;(holders[entry.model] ??= []).push(id)
+        if (entry.inferredFrom) (inferred[entry.model] ??= {})[id] = entry.inferredFrom
       }
     }
-    return holders
+    return { holders, inferred }
   }
   const orderableProfileIds = (): string[] => [
     ...claudeProfileIds(),
@@ -11232,6 +11240,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   app.get("/settings/api/routing", (c) => {
     const profileIds = orderableProfileIds()
     const cvpEffectiveOrder = resolvePriorityOrder(claudeProfileIds(), cvpProfileOrderSetting()).order
+    const cvpHolders = cvpHoldersByModel(cvpEffectiveOrder)
     return c.json({
       routing: getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing")),
       modes: ROUTING_MODES,
@@ -11253,10 +11262,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       cvpEffectiveProfileOrder: cvpEffectiveOrder,
       cvpActiveProfile: getSetting("cvpActiveProfile") ?? null,
       cvpManagedExcludedProfiles: cvpManagedExcludedProfileIds(),
-      cvpHolders: cvpHoldersByModel(cvpEffectiveOrder),
+      cvpHolders: cvpHolders.holders,
+      cvpInferredHolders: cvpHolders.inferred,
       // What a supervisor may rely on this build doing; read rather than
       // guessed from a version, which forks share.
-      capabilities: ["managed-exclusion-no-routable", "managed-exclusion-evidence-v1", "managed-chatgpt-exclusion-evidence-v1", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order", "forced-active-profile", "managed-exclusion-reasons", "usage-refresh", "profile-refresh"],
+      capabilities: ["managed-exclusion-no-routable", "managed-exclusion-evidence-v1", "managed-chatgpt-exclusion-evidence-v1", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order", "cvp-organization-inference", "forced-active-profile", "managed-exclusion-reasons", "usage-refresh", "profile-refresh"],
       profiles: profileIds,
       saved: {
         routing: getSetting("routing") ?? null,

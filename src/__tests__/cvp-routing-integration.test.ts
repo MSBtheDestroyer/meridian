@@ -4,7 +4,7 @@
  * `x-meridian-require: cvp` steering unpinned work to an account that holds it.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { rmSync } from "node:fs"
+import { rmSync, writeFileSync } from "node:fs"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
@@ -13,6 +13,7 @@ import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
 
 let served: string[] = []
 let refuseWith: unknown = undefined
+let refusalModel = "claude-opus-5-5"
 let failTokens = new Set<string>()
 
 installSdkMock(() => ({
@@ -24,7 +25,7 @@ installSdkMock(() => ({
     return (async function* () {
       const message = assistantMessage([{ type: "text", text: `ok from ${token}` }]) as any
       if (refuseWith !== undefined) {
-        message.message = { ...message.message, model: "claude-opus-5-5", stop_reason: "refusal", stop_details: { type: "refusal", category: "cyber", cyber_verification: refuseWith } }
+        message.message = { ...message.message, model: refusalModel, stop_reason: "refusal", stop_details: { type: "refusal", category: "cyber", cyber_verification: refuseWith } }
       }
       yield { ...message, session_id: sessionId }
     })()
@@ -79,8 +80,10 @@ const savedEnv: Record<string, string | undefined> = {}
 beforeEach(async () => {
   served = []
   refuseWith = undefined
+  refusalModel = "claude-opus-5-5"
   failTokens = new Set()
   rmSync(configPath("cvp-access.json"), { force: true })
+  rmSync(configPath("organizations.json"), { force: true })
   resetCvpAccessCacheForTests()
   clearAccountModels()
   await clearSessionCache()
@@ -151,6 +154,12 @@ async function models(target: TestApp, headers: Record<string, string>) {
   const response = await target.fetch(new Request("http://localhost/v1/models", { headers }))
   const body = await response.json() as { data?: Array<Record<string, any>> }
   return { response, data: body.data ?? [] }
+}
+
+/** Record each profile's organization as `/api/oauth/profile` would have answered it. */
+function organizations(byProfile: Record<string, string>) {
+  writeFileSync(configPath("organizations.json"), JSON.stringify(Object.fromEntries(Object.entries(byProfile).map(([id, organizationUuid]) =>
+    [id, { name: `Org ${organizationUuid}`, fetchedAt: 1, accountUuid: `account-${id}`, organizationUuid }]))))
 }
 
 async function cvpAccessOf(target: TestApp, profile: string) {
@@ -306,7 +315,63 @@ describe("x-meridian-require: cvp on /v1/messages", () => {
   })
 })
 
+describe("CVP access inferred from the organization", () => {
+  it("routes unpinned cvp work to a profile whose organization sibling holds access", async () => {
+    organizations({ max: "org-personal", team: "org-sub", team2: "org-sub" })
+    setSetting("routingExcludedProfiles", ["team"])
+    const server = app()
+    await postReading(server, "team", TEAM_READING)
+
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(200)
+    expect(served).toEqual(["token-team2"])
+  })
+
+  it("names the sibling on /profiles/list, /v1/models and the routing settings", async () => {
+    organizations({ max: "org-personal", team: "org-sub", team2: "org-sub" })
+    const server = app()
+    await postReading(server, "team", TEAM_READING)
+
+    expect(await cvpAccessOf(server, "team2")).toContainEqual(expect.objectContaining({ model: "claude-opus-5-5", type: "active", tier: "c", source: "organization", inferredFrom: "team" }))
+    expect(await cvpAccessOf(server, "max")).toEqual([])
+
+    const pinned = await models(server, { "x-meridian-profile": "team2" })
+    expect(pinned.data.find(m => m.id === "claude-opus-5-5")?.cyber_verification).toMatchObject({ type: "active", source: "organization", inferredFrom: "team" })
+
+    const body = await routingSettings(server)
+    expect(body.cvpHolders["claude-opus-5-5"]).toEqual(["team", "team2"])
+    expect(body.cvpInferredHolders).toEqual({ "claude-opus-5-5": { team2: "team" }, "claude-mythos-5-2": { team2: "team" } })
+  })
+
+  it("lets a refusal on the inferred profile decide it from then on", async () => {
+    organizations({ max: "org-personal", team: "org-sub", team2: "org-sub" })
+    setSetting("routingExcludedProfiles", ["team"])
+    const server = app()
+    await postReading(server, "team", TEAM_READING)
+    refuseWith = { type: "inactive", reason: "not_assigned_but_organization_approved" }
+
+    await message(server, { "x-meridian-require": "cvp" })
+    refuseWith = undefined
+    served = []
+
+    expect(await cvpAccessOf(server, "team2")).toContainEqual(expect.objectContaining({ model: "claude-opus-5-5", type: "inactive", source: "observed" }))
+    expect((await message(server, { "x-meridian-require": "cvp" })).status).toBe(429)
+    expect(served).toEqual([])
+  })
+})
+
 describe("refusals teach the map", () => {
+  it("records a refusal on a <synthetic> row under the requested model", async () => {
+    const server = app()
+    refuseWith = { type: "active", tier: "c" }
+    refusalModel = "<synthetic>"
+
+    await message(server, { "x-meridian-profile": "team" }, "claude-opus-5-5")
+
+    expect(await cvpAccessOf(server, "team")).toEqual([
+      expect.objectContaining({ model: "claude-opus-5-5", type: "active", tier: "c", source: "observed" }),
+    ])
+  })
+
   it("records stop_details.cyber_verification for the account that refused", async () => {
     const server = app()
     refuseWith = { type: "inactive", reason: "organization_not_approved" }
@@ -359,6 +424,7 @@ interface CvpRoutingSettings {
   cvpActiveProfile: string | null
   cvpManagedExcludedProfiles: string[]
   cvpHolders: Record<string, string[]>
+  cvpInferredHolders: Record<string, Record<string, string>>
 }
 
 async function routingSettings(target: TestApp): Promise<CvpRoutingSettings> {
