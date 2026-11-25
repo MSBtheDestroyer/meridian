@@ -25,6 +25,7 @@
  * `hooks` option; see ChatGptHooks.
  */
 import { randomUUID } from "node:crypto"
+import { readClientAttribution } from "../clientIdentity"
 import { AssignmentStore, type ProfileExhaustion } from "../routing"
 import { isImageEndpoint, type UpstreamBackend, type UpstreamRequest } from "../upstream/backend"
 import { adaptResponsesBody, type BodyAdaptation, type ReasoningSummaryLevel } from "../chatgpt/body"
@@ -36,6 +37,7 @@ import type { CodexCredits, CodexUsageWindow } from "../codex/types"
 import type { ChatGptCreditsPolicy, ChatGptFreeSeatOrder } from "../chatgpt/features"
 import { seatWindows } from "../chatgpt/profiles"
 import type { ChatGptCredentialSource, SeatUnavailableReason } from "../chatgpt/source"
+import type { RequestAttribution } from "../../telemetry/types"
 import { retryAfterHeaders, retryAfterSeconds } from "../retryAfter"
 import { chatGptRefusalBinding, chatGptRefusalPoolKey, chatGptRouteRefusalResponse, type ChatGptRefusalInput, type ChatGptRouteRefusalReason } from "../chatgpt/routeRefusal"
 import {
@@ -65,7 +67,7 @@ export interface ChatGptAttempt {
 }
 
 /** One per client turn, success or failure. Carries no credential. */
-export interface ChatGptTurnEvent {
+export interface ChatGptTurnEvent extends RequestAttribution {
   requestId: string
   startedAt: number
   requestModel: string | null
@@ -396,6 +398,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
 
       const model = typeof parsed.model === "string" ? parsed.model : undefined
       const requestSource = inbound.headers.get("x-meridian-source")?.slice(0, 64) || undefined
+      const attribution = readClientAttribution(inbound.headers)
       const turn: ChatGptTurnInfo = { requestId, model, body: parsed, headers: inbound.headers }
       // An image request goes as the client wrote it: the Responses
       // adaptations (forced stream, store=false) mean nothing to that endpoint.
@@ -410,7 +413,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
           clientSessionId: request.clientSessionId,
           stream: adapted.clientWantsStream, adaptations: adapted.applied, attempts,
           usage: null, ttfbMs: null, durationMs: now() - startedAt, error: null,
-          reasoningSummaryEvents: 0, ...(requestSource ? { requestSource } : {}), ...fields,
+          reasoningSummaryEvents: 0, ...(requestSource ? { requestSource } : {}), ...attribution, ...fields,
         })
       }
       const fail = (response: Response, error: string) => {
