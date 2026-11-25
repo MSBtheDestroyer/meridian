@@ -2,6 +2,7 @@ import type { RequestAttribution } from "../telemetry/types"
 
 const clientHeader = /^([a-z][a-z0-9-]{0,31})(?:\/([A-Za-z0-9._+-]{1,64}))?$/
 const installationHeader = /^[A-Za-z0-9._:-]{1,64}$/
+const sessionHeader = /^[A-Za-z0-9._:-]{1,128}$/
 const purposes: ReadonlySet<string> = new Set(["chat", "title", "compaction", "summary", "subagent", "review", "helper", "test"])
 const attributionHeaders: readonly string[] = [
   "x-meridian-client", "x-meridian-installation", "x-meridian-device", "x-meridian-purpose", "x-meridian-session",
@@ -10,6 +11,13 @@ const attributionHeaders: readonly string[] = [
 export function isClientAttributionHeader(name: string): boolean {
   return attributionHeaders.includes(name)
 }
+
+export function readClientSessionId(headers: Headers): string | undefined {
+  const id = headers.get("x-meridian-session")
+  return id && sessionHeader.test(id) ? id : undefined
+}
+
+export const meridianWarmAttribution = { client: { name: "meridian" }, purpose: "warm" } as const
 
 export function readClientAttribution(headers: Headers): RequestAttribution {
   const suppliedPurpose = headers.get("x-meridian-purpose")

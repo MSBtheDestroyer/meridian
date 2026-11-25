@@ -6,7 +6,7 @@ import { ClaudeProviderFacts, disabledProvider, providerSnapshot } from './backe
 import { chatGptProvider, CHATGPT_ADAPTER } from './backends/chatgptStatus'
 import { chatGptVerdict, combineBackendVerdicts, type BackendStatus } from './chatgpt/health'
 import { createChatGptBackend, type ChatGptSeatCreditState, type ChatGptSeatRefusal, type ChatGptTurnEvent, type ObservedSeatLimits } from './backends/chatgpt'
-import { internalClientAttributionHeaders, readClientAttribution } from "./clientIdentity"
+import { internalClientAttributionHeaders, meridianWarmAttribution, readClientAttribution, readClientSessionId } from "./clientIdentity"
 import { sanitizeClaudeEgressEnv } from "./claudeEgress"
 import { resolveChatGptSource } from './chatgpt/config'
 import { startRenewalSchedule } from './chatgpt/owned'
@@ -1274,6 +1274,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // exempted by a per-instance token rather than a fixed header name, so the
   // exemption can never be claimed from the wire.
   const internalHopToken = randomUUID()
+  const isMeridianWarm = (headers: Headers): boolean =>
+    headers.get("x-meridian-internal-hop") === internalHopToken && headers.get("x-meridian-routing-purpose") === "warm"
 
   // Work-routing exclusions: accounts an operator has taken out of rotation.
   // `routingExcludedProfiles` is the manual list edited from /settings;
@@ -2920,7 +2922,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   ) => {
     const requestStartAt = requestMeta.queueEnteredAt
     const routingRequire = routingRequireOf(c.req.header(ROUTING_REQUIRE_HEADER))
-    const attribution = readClientAttribution(c.req.raw.headers)
+    const attribution = isMeridianWarm(c.req.raw.headers) ? meridianWarmAttribution : readClientAttribution(c.req.raw.headers)
     const requestSignal = options.turnWatchdogSignal
       ? AbortSignal.any([c.req.raw.signal, options.turnWatchdogSignal])
       : c.req.raw.signal
@@ -3355,8 +3357,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // no way to tell. Warm hops are exempt by design — keeping an excluded
         // account's prompt cache alive is the whole reason for excluding it
         // from work instead of removing it.
-        const warmProfileId = c.req.header("x-meridian-internal-hop") === internalHopToken
-          && c.req.header("x-meridian-routing-purpose") === "warm"
+        const warmProfileId = isMeridianWarm(c.req.raw.headers)
           ? c.req.header("x-meridian-profile")
           : undefined
         const requestedProfileId = options.forcedProfileId || warmProfileId || c.req.header("x-meridian-profile") || undefined
@@ -10341,9 +10342,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const synthesizedSession = c.req.header("x-meridian-internal-hop") === internalHopToken
         && c.req.header(SYNTHESIZED_SESSION_HEADER) === "1"
       const responsesClientSessionId = inheritedOwner?.responsesClientSessionId
-      const clientSessionId = responsesClientSessionId !== undefined
+      const resolvedClientSessionId = responsesClientSessionId !== undefined
         ? responsesClientSessionId ?? undefined
         : synthesizedSession ? undefined : adapter.getClientSessionId?.(c, body) ?? agentSessionId
+      const clientSessionId = resolvedClientSessionId ?? readClientSessionId(c.req.raw.headers)
       if (Array.isArray(body?.messages)) {
         routingTurnIdentity = adapter.getRoutingTurnIdentity?.(c, body)
         auxiliaryRequest = agentSessionId !== undefined && adapter.isAuxiliaryRequest?.(c, body) === true
@@ -10840,8 +10842,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // Only an internal hop carrying this instance's token may claim to be a
     // warm, which is what lets it use a seat excluded from work.
     route: (turn) => {
-      const warm = turn.headers.get("x-meridian-internal-hop") === internalHopToken
-        && turn.headers.get("x-meridian-routing-purpose") === "warm"
+      const warm = isMeridianWarm(turn.headers)
       const route = chatGptProfiles!.route(turn.headers.get("x-meridian-profile") ?? undefined, warm ? "warm" : "work")
       if (route.kind === "unknown") return { kind: "refuse", error: "unknown_profile", response: unknownProfileResponse(route.id) }
       if (route.kind !== "refuse") return warm ? { ...route, spendCredits: false, warm: true } : route
@@ -11047,6 +11048,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const key = adapterKey ?? cacheKey
     const clientSessionId = adapter.getClientSessionId?.(c, body) ?? adapterKey
       ?? resolveCodexThreadIdentity(body ?? {}, c.req.header("x-codex-turn-metadata")).threadId
+      ?? readClientSessionId(c.req.raw.headers)
     return { key, parent: key ? adapter.getParentSessionId?.(c, body) : undefined, clientSessionId }
   }
 
@@ -11125,7 +11127,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           parentKey: session.parent,
           abort: (reason) => controller.abort(reason),
         }) : undefined
-        const response = await backend.handle({ context: c, endpoint, route, clientSessionId: session.clientSessionId })
+        const response = await backend.handle({
+          context: c, endpoint, route, clientSessionId: session.clientSessionId,
+          meridianWarm: isMeridianWarm(c.req.raw.headers),
+        })
         return completeUpstreamResponse(response, controller.signal, complete)
       } catch (error) {
         complete()

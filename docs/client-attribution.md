@@ -8,7 +8,7 @@ If your app calls Meridian, you can label its requests so the operator can tell 
 | `x-meridian-installation` | Random ID generated and stored once per installation, matching `^[A-Za-z0-9._:-]{1,64}$`. An invalid ID is ignored. | `20261124T0612Z-x7f9qp` |
 | `x-meridian-device` | Optional human-readable label. Meridian removes characters outside printable ASCII, trims it, keeps at most 64 characters, and omits it if empty. | `Kitchen tablet` |
 | `x-meridian-purpose` | `chat`, `title`, `compaction`, `summary`, `subagent`, `review`, `helper`, or `test`. Other non-empty values are recorded as `other`; empty or missing values are omitted. Purpose can be recorded without a client. | `chat` |
-| `x-meridian-session` | Optional app conversation or thread ID, matching `^[A-Za-z0-9._:-]{1,128}$`. Reserved for telemetry; this build does not use it as a conversation fallback. | `thread-27` |
+| `x-meridian-session` | Optional app conversation or thread ID, matching `^[A-Za-z0-9._:-]{1,128}$`. Recorded as `clientSessionId` only when no native client conversation ID was resolved; never used to resume or route a request. | `thread-27` |
 
 The receiving Meridian instance records the metadata on its existing request history. `GET /telemetry/requests` includes `client: {name, version?, installation?, device?}` when attributed and `purpose` when supplied. For Antigravity in a combined service, read `/antigravity/telemetry/requests`. Older records and requests without attribution fields omit those fields.
 

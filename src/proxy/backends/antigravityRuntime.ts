@@ -24,6 +24,7 @@ import type { AntigravityOptions } from "../types"
 type AgToolReply = AgResult & { clientMessages?: AgMessage[] }
 
 export interface AgExchange extends RequestAttribution {
+  readonly clientSessionId?: string
   requestId: string; timestamp: number; durationMs: number; model: string; status: number; error?: string;
   inputTokens: number; outputTokens: number; cacheReadTokens: number; conversationId?: string; continuation?: string;
 }
@@ -31,6 +32,7 @@ const exchangeSchema = z.object({
   conversationId: z.string().optional(), continuation: z.string().optional(), requestId: z.string(), timestamp: z.number(), durationMs: z.number(), model: z.string(), status: z.number(), error: z.string().optional(), inputTokens: z.number(), outputTokens: z.number(), cacheReadTokens: z.number(),
   client: z.object({ name: z.string(), version: z.string().optional(), installation: z.string().optional(), device: z.string().optional() }).optional(),
   purpose: z.string().optional(),
+  clientSessionId: z.string().optional(),
 })
 const nativeSchema = z.object({ runId: z.string(), name: z.string(), state: z.string(), timestamp: z.number() })
 const quotaSchema = z.object({ command: z.object({ data: z.object({ groups: z.array(z.object({

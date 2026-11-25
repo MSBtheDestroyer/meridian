@@ -51,6 +51,7 @@ export interface UpstreamRequest<Ctx> {
   /** The route the client called, preserved verbatim. */
   readonly route: string
   readonly clientSessionId?: string
+  readonly meridianWarm?: boolean
 }
 
 export interface UpstreamBackend<Ctx> {

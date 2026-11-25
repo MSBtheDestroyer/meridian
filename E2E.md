@@ -2428,6 +2428,29 @@ opencode run --model anthropic/claude-sonnet-4-5 --session "$SESSION_ID" --forma
 
 **Verifies:** Telemetry dashboard and API endpoints return data after requests.
 
+### Client attribution on the fork
+
+On a deployed m4max `@dev`, first check that `/health` reports the expected `build.sha`. Then send one live request and check only its attribution fields. Use a new installation and thread ID if rerunning the gate.
+
+```sh
+curl -fsS --max-time 60 http://127.0.0.1:3457/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-meridian-client: vibeterm-test/1' \
+  -H 'x-meridian-installation: verify-client-id' \
+  -H 'x-meridian-device: m4max' \
+  -H 'x-meridian-purpose: test' \
+  -H 'x-meridian-session: verify-1' \
+  --data '{"model":"claude-haiku-5-5","max_tokens":10,"messages":[{"role":"user","content":"Reply with the single word ok."}]}' \
+  | jq -e '.content[] | select(.type == "text") | .text'
+
+curl -fsS 'http://127.0.0.1:3457/telemetry/requests?limit=50' \
+  | jq -e 'first(.[] | select(.client.installation == "verify-client-id" and .clientSessionId == "verify-1")) | {id: .requestId, adapter, client, purpose, clientSessionId, status}'
+```
+
+Pass: the response contains `ok` and the matching request row has status `200`, client `{name: "vibeterm-test", version: "1", installation: "verify-client-id", device: "m4max"}`, purpose `test`, and `clientSessionId: "verify-1"`. This live gate checks telemetry at ingress; the mocked capture suites independently check the provider boundary.
+
+### Request history and metrics
+
 ```bash
 # Dashboard HTML
 curl -s http://127.0.0.1:3456/telemetry | head -3

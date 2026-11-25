@@ -62,7 +62,7 @@ for (const { backend, prefix, endpoint, input } of targets) {
         const telemetry = new Request(`http://localhost${prefix}/telemetry/requests`)
         const rows = await (await proxy.app.fetch(telemetry)).json()
         expect(rows).toEqual([expect.objectContaining({ provider: "antigravity", model, client, purpose: "other" })])
-        expect(JSON.stringify(rows)).not.toContain(headers["x-meridian-session"])
+        expect(rows).toMatchObject([{ clientSessionId: headers["x-meridian-session"] }])
         expect(JSON.stringify(rows)).not.toContain(headers["X-Meridian-Attribution-Probe"])
 
         if (statePath) {

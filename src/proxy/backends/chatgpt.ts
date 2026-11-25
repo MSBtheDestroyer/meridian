@@ -25,7 +25,7 @@
  * `hooks` option; see ChatGptHooks.
  */
 import { randomUUID } from "node:crypto"
-import { readClientAttribution } from "../clientIdentity"
+import { meridianWarmAttribution, readClientAttribution } from "../clientIdentity"
 import { AssignmentStore, type ProfileExhaustion } from "../routing"
 import { isImageEndpoint, type UpstreamBackend, type UpstreamRequest } from "../upstream/backend"
 import { adaptResponsesBody, type BodyAdaptation, type ReasoningSummaryLevel } from "../chatgpt/body"
@@ -398,7 +398,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
 
       const model = typeof parsed.model === "string" ? parsed.model : undefined
       const requestSource = inbound.headers.get("x-meridian-source")?.slice(0, 64) || undefined
-      const attribution = readClientAttribution(inbound.headers)
+      const attribution = request.meridianWarm ? meridianWarmAttribution : readClientAttribution(inbound.headers)
       const turn: ChatGptTurnInfo = { requestId, model, body: parsed, headers: inbound.headers }
       // An image request goes as the client wrote it: the Responses
       // adaptations (forced stream, store=false) mean nothing to that endpoint.

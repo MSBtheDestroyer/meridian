@@ -255,6 +255,7 @@ describe("telemetry", () => {
 
     for (const requestKind of ["turn", "compact"]) {
       await (await post(app, codexBody("gpt-5.6-sol"), {
+        "x-meridian-session": "unused-fallback",
         "user-agent": "codex_cli_rs/0.150.0",
         "x-opencode-session": "",
         "x-codex-turn-metadata": JSON.stringify({ thread_id: "child-thread", request_kind: requestKind }),
@@ -279,6 +280,17 @@ describe("telemetry", () => {
     const rows: unknown = await response.json()
     expect(rows).toMatchObject([{ adapter: "chatgpt" }])
     expect(rows).not.toMatchObject([{ clientSessionId: expect.any(String) }])
+  })
+
+  it("records the telemetry fallback without using it as the Responses cache key", async () => {
+    const { app } = makeServer()
+    upstream = () => streamResponse(completedStream("gpt-5.6-sol"))
+    await (await post(app, { ...codexBody("gpt-5.6-sol"), prompt_cache_key: "native-cache-key" }, {
+      "user-agent": "generic-client", "x-opencode-session": "", "x-meridian-session": "diagnostics-only",
+    })).text()
+    expect(calls.map(call => call.body.prompt_cache_key)).toEqual(["native-cache-key"])
+    const response = await app.fetch(new Request("http://localhost/telemetry/requests?limit=1"))
+    expect(await response.json()).toMatchObject([{ adapter: "chatgpt", clientSessionId: "diagnostics-only" }])
   })
 
   it("records provider tokens with cached and reasoning tokens counted once, and values them at the built-in OpenAI rate", async () => {
@@ -335,7 +347,7 @@ describe("Fallback Model", () => {
     upstream = (call) => call.body.model === "gpt-5.4"
       ? streamResponse(completedStream("gpt-5.4"))
       : new Response(JSON.stringify({ error: { message: "upstream exploded" } }), { status: 503, headers: { "content-type": "application/json" } })
-    const res = await post(app, codexBody("gpt-5.6-sol"))
+    const res = await post(app, codexBody("gpt-5.6-sol"), { "x-meridian-client": "voice-ai/0.9.3", "x-meridian-purpose": "test" })
     expect(res.status).toBe(200)
     expect(res.headers.get("x-meridian-fallback-model")).toBe("gpt-5.4")
     await res.text()
@@ -347,6 +359,10 @@ describe("Fallback Model", () => {
     expect(served?.model).toBe("gpt-5.4")
     expect(served?.requestModel).toBe("gpt-5.6-sol")
     expect(served?.fallbackFromModel).toBe("gpt-5.6-sol")
+    expect(rows.map(row => ({ client: row.client, purpose: row.purpose }))).toEqual([
+      { client: { name: "voice-ai", version: "0.9.3" }, purpose: "test" },
+      { client: { name: "voice-ai", version: "0.9.3" }, purpose: "test" },
+    ])
     // Valued at the model that did the work: gpt-5.4 is $2.50 / $0.25 / $15 per 1M.
     const summary = telemetryStore.summarize(3_600_000)
     expect(summary.costEstimate?.totalUsd).toBeCloseTo((600 * 2.5 + 400 * 0.25 + 200 * 15) / 1e6, 9)
