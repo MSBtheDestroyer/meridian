@@ -85,10 +85,18 @@ export interface CodexPlan {
 }
 
 export interface CodexResetCredit {
+  /** The vendor's credit id, which a redemption names; null when absent or unreadable. */
+  id: string | null
   /** Vendor status; only "available" credits are listed. */
   status: string
   /** Epoch milliseconds, or null when unparseable. */
   expiresAt: number | null
+  /** When the credit was granted, epoch milliseconds; null when absent or unparseable. */
+  grantedAt: number | null
+  /** The vendor's `reset_type` slug, e.g. "codex_rate_limits"; null when absent or unreadable. */
+  resetType: string | null
+  /** The vendor's `title`, cleaned for display; null when absent. */
+  title: string | null
 }
 
 /**

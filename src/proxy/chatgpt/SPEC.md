@@ -14,8 +14,9 @@ Serve OpenAI models from the operator's **ChatGPT subscription seats** (opt-in):
 `/v1/responses` turns for OpenAI model ids and the OpenAI Images routes are
 passed through to the Codex backend on one seat, with seat failover, plan/credit
 policy, usage and cost telemetry. Also owns seat sign-in and renewal, the
-`meridian chatgpt-migrate` and `meridian instance-import` commands, and the
-read-only oc-codex usage view on the dashboard.
+`meridian chatgpt-migrate` and `meridian instance-import` commands, the
+read-only oc-codex usage view on the dashboard, and listing and redeeming a
+seat's banked rate-limit reset credits.
 
 Code: `src/proxy/chatgpt/` (incl. `migrate/`), `src/proxy/codex/`,
 `src/proxy/upstream/`, `src/proxy/instanceImport/`, `backends/chatgpt*.ts`.
@@ -58,6 +59,37 @@ Code: `src/proxy/chatgpt/` (incl. `migrate/`), `src/proxy/codex/`,
     failure leaves; an attempt that never reached the provider records
     nothing. The history is never a credential, so a malformed entry is
     dropped on read rather than failing the store. Owner approval pending.
+- **Banked resets are listed for every seat and spent only on an owned one**
+  (owner-requested 2026-11-26, Portal AI_TODO #762). Each seat's
+  `/v1/usage/quota/all` entry carries `bankedResets` in the Claude shape
+  (`chatgpt/resetCredits.ts`), built from the credit list the usage read
+  already fetches: one grant per available credit, `resetsLeft: 1`,
+  `kind: "full"`, `clears` the seat's reported `five_hour`/`seven_day`
+  windows, `percentUsed` their current reading, `startsAt` the grant time,
+  `usableNow` the seat-wide `applicable_available_count > 0` (null when
+  unstated; the vendor does not say which credits it counts), `nextGrantId`
+  the soonest-expiring credit, and `unreadableGrants` for credits it holds but
+  cannot list (no id, or the list unreadable while the usage payload states a
+  count). Credit ids do not fit the route's grant-id format, so each is listed
+  as `credit_` plus 24 hex of its SHA-256, which Meridian resolves by reading
+  the list again. A followed seat (`follow-external`) lists them with
+  `eligible: false, ineligibleReason: "external_owner"`, and the reset route
+  answers it 400 `not_owned`: its sign-in belongs to oc-codex-multi-auth,
+  whose own `codex-reset` spends them.
+  Redemption is the Claude route's contract (explicit only, one per profile in
+  flight, dispatched outcomes replayed per request ID; `quotaReset.ts`). Before
+  the consume POST, Meridian reads usage and the credit list with the seat's
+  token and requires the read to confirm the seat's account and user, the
+  named credit to still be listed available, and the seat to state a credit
+  applies now (else `not_limited`, nothing sent). The vendor's
+  `redeem_request_id` is a UUID derived from the seat, credit and request ID,
+  so a retried request is one redemption upstream too. A 4xx refusal spent
+  nothing and answers `unavailable` with only the vendor's code; 5xx, timeout
+  or transport loss after dispatch is `indeterminate`. A dispatched outcome
+  drops the seat's cached usage and reads it again; a confirmed reset also
+  drops its last response's windows and a quota bench, never a token or
+  provider-fault bench. `codex/` stays read-only: the consume POST lives in
+  `chatgpt/resetCredits.ts`.
 - Seats are profiles with `type: "chatgpt"` and their own active pointer; they
   never live in Claude's profile config. All additions are absent unless
   ChatGPT is enabled, and existing fields keep their meaning

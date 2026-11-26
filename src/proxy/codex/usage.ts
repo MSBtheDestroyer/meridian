@@ -36,6 +36,9 @@ const RESET_CREDITS_URL = `${CHATGPT_ORIGIN}/backend-api/wham/rate-limit-reset-c
 const WORKSPACES_URL = `${CHATGPT_ORIGIN}/backend-api/wham/accounts/check`
 const DEFAULT_TIMEOUT_MS = 10_000
 const WORKSPACE_NAME_MAX_CHARS = 64
+const CREDIT_TITLE_MAX_CHARS = 80
+const CREDIT_ID_FORMAT = /^[\x21-\x7e]{1,256}$/
+const RESET_TYPE_FORMAT = /^[A-Za-z0-9_.:-]{1,64}$/
 
 /**
  * The client identity oc-codex-multi-auth's `createCodexHeaders` sends to
@@ -179,7 +182,7 @@ export async function fetchCodexWorkspaceNames(
   for (const entry of accounts) {
     const account = asRecord(entry)
     const id = stringOrNull(account?.id)
-    const name = workspaceDisplayName(account?.name)
+    const name = vendorDisplayText(account?.name, WORKSPACE_NAME_MAX_CHARS)
     if (!id || !name) continue
     if (account?.structure !== undefined && account.structure !== "workspace") continue
     names.set(id, name)
@@ -187,7 +190,8 @@ export async function fetchCodexWorkspaceNames(
   return names
 }
 
-function workspaceDisplayName(value: unknown): string | null {
+/** Vendor-chosen text for a page: control, bidi and zero-width characters dropped, length bounded. */
+function vendorDisplayText(value: unknown, maxChars: number): string | null {
   if (typeof value !== "string") return null
   const cleaned = value
     .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
@@ -195,7 +199,7 @@ function workspaceDisplayName(value: unknown): string | null {
     .trim()
   if (!cleaned) return null
   const chars = [...cleaned]
-  return chars.length > WORKSPACE_NAME_MAX_CHARS ? `${chars.slice(0, WORKSPACE_NAME_MAX_CHARS - 1).join("")}\u2026` : cleaned
+  return chars.length > maxChars ? `${chars.slice(0, maxChars - 1).join("")}\u2026` : cleaned
 }
 
 type UsableToken = { token: string; claims: CodexTokenClaims } | { error: CodexUsageError }
@@ -227,13 +231,8 @@ interface JsonResult {
   error: CodexRemoteError | null
 }
 
-async function getJson(
-  doFetch: typeof fetch,
-  url: string,
-  token: string,
-  accountId: string | null,
-  timeoutMs: number | undefined,
-): Promise<JsonResult> {
+/** The headers every `/wham/*` request sends: the bearer token and the Codex CLI's identity. */
+export function codexRequestHeaders(token: string, accountId: string | null): Record<string, string> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     Accept: "application/json",
@@ -244,12 +243,21 @@ async function getJson(
   // Without this header the endpoint answers with an empty account_id, which
   // would fail validation below.
   if (accountId) headers["ChatGPT-Account-ID"] = accountId
+  return headers
+}
 
+async function getJson(
+  doFetch: typeof fetch,
+  url: string,
+  token: string,
+  accountId: string | null,
+  timeoutMs: number | undefined,
+): Promise<JsonResult> {
   let response: Response
   try {
     response = await doFetch(url, {
       method: "GET",
-      headers,
+      headers: codexRequestHeaders(token, accountId),
       // A bearer credential must never be replayed to a redirect target.
       redirect: "error",
       signal: AbortSignal.timeout(timeoutMs ?? DEFAULT_TIMEOUT_MS),
@@ -339,8 +347,8 @@ async function collectResetCredits(
 
 /**
  * The credits still available to redeem, soonest expiry first. One whose
- * expiry cannot be read is kept, last, with a null expiry: it is still a
- * banked reset, and dropping it would understate what the seat holds.
+ * expiry or id cannot be read is kept, with a null in its place: it is still
+ * a banked reset, and dropping it would understate what the seat holds.
  */
 function availableCredits(value: unknown): CodexResetCredit[] {
   const raw = asRecord(value)
@@ -350,11 +358,24 @@ function availableCredits(value: unknown): CodexResetCredit[] {
   for (const entry of raw.credits) {
     const credit = asRecord(entry)
     if (credit?.status !== "available") continue
-    const expiresAtRaw = stringOrNull(credit.expires_at)
-    const parsed = expiresAtRaw ? Date.parse(expiresAtRaw) : Number.NaN
-    credits.push({ status: "available", expiresAt: Number.isFinite(parsed) ? parsed : null })
+    const id = typeof credit.id === "string" ? credit.id.trim() : ""
+    const resetType = typeof credit.reset_type === "string" ? credit.reset_type.trim() : ""
+    credits.push({
+      id: CREDIT_ID_FORMAT.test(id) ? id : null,
+      status: "available",
+      expiresAt: timestampOrNull(credit.expires_at),
+      grantedAt: timestampOrNull(credit.granted_at),
+      resetType: RESET_TYPE_FORMAT.test(resetType) ? resetType : null,
+      title: vendorDisplayText(credit.title, CREDIT_TITLE_MAX_CHARS),
+    })
   }
   return credits.sort((a, b) => (a.expiresAt ?? Number.POSITIVE_INFINITY) - (b.expiresAt ?? Number.POSITIVE_INFINITY))
+}
+
+function timestampOrNull(value: unknown): number | null {
+  const raw = stringOrNull(value)
+  const parsed = raw ? Date.parse(raw) : Number.NaN
+  return Number.isFinite(parsed) ? parsed : null
 }
 
 function countOrNull(value: unknown): number | null {

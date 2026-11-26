@@ -56,6 +56,17 @@ const failureRuns = new Map<string, CodexUsageFailure>()
 const workspaceNames = new Map<string, { name: string | null; until: number }>()
 const workspaceLookups = new Map<string, Promise<void>>()
 
+/**
+ * Drop everything cached about one account, so its next read reaches upstream:
+ * once a reset credit was spent, its figures and credits are out of date.
+ */
+export function forgetCodexUsage(accountUserId: string): void {
+  const prefix = `${accountUserId}|`
+  for (const cache of [lastGood, inFlight, heldOffUntil, failureRuns]) {
+    for (const key of [...cache.keys()]) if (key.startsWith(prefix)) cache.delete(key)
+  }
+}
+
 export function resetCodexUsageCache(): void {
   lastGood.clear()
   inFlight.clear()

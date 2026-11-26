@@ -475,7 +475,9 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   default-context refresh never served, so the keepalive skips it and requests
   refresh it.
 - **Banked resets are explicit-only** (owner-approved 2026-10-26, #1429).
-  `GET /v1/usage/quota/all` lists each Claude profile's grants; only
+  `GET /v1/usage/quota/all` lists each Claude profile's grants, and each
+  ChatGPT seat's reset credits in the same shape
+  ([chatgpt-backend](chatgpt/SPEC.md)); only
   `POST /v1/usage/quota/reset` with an explicit `profile`, `grantId` and
   `requestId` redeems one. Meridian never redeems automatically (not on a
   refusal, failover, cooldown or poll) and never retries the mutation: a reset
@@ -500,7 +502,8 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   the expected window. Uncleared weekly/model buckets, independent overage
   state, unknown-bucket and non-quota refusals, and other profiles are
   untouched; `already_used`, other results and uncertain outcomes clear
-  nothing.
+  nothing. A ChatGPT seat's confirmed reset also drops its last response's
+  windows and a quota bench, since a credit clears both of its windows.
 - **Usage reads resolve the profile type first.** `/v1/usage/quota`,
   `/v1/usage/quota/all`, cooldown refinement and redemption run
   `resolveProfile` before touching credentials, so a profile whose type is
@@ -542,7 +545,9 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
 - **Grant-selection fields are passed through, not computed.** `bankedResets`
   exposes the provider's `nextGrantId` (null unless it names a listed grant)
   and `ineligibleReason`, and per grant `startsAt`, `paused` and `usableNow`;
-  malformed values become `null`. Meridian never picks a grant itself.
+  malformed values become `null`. Meridian never picks a grant itself. A
+  ChatGPT seat's vendor states neither, so for seats they are derived as the
+  chatgpt-backend spec describes.
 
 ### Banked reset scope
 

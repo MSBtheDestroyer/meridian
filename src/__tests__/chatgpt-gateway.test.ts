@@ -1917,3 +1917,135 @@ describe("owned mode signs its own seats in", () => {
     expect(codeExchanges).toBe(0)
   })
 })
+
+describe("a seat's reset credits on the quota routes", () => {
+  type Grant = { id: string; usableNow: boolean | null; kind: string; clears: string[]; expiresAt: number | null }
+  type Banked = { eligible: boolean; ineligibleReason: string | null; nextGrantId: string | null; grants: Grant[]; unreadableGrants: number }
+  type QuotaBody = { profiles: Array<{ id: string; type: string; bankedResets?: Banked | null }> }
+  type App = { fetch: (r: Request) => Response | Promise<Response> }
+  const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url")
+  const jwt = (n: number) => `${part({ alg: "none" })}.${part({
+    exp: Math.floor(NOW / 1000) + 3600,
+    "https://api.openai.com/auth": { chatgpt_account_id: `workspace-${n}`, chatgpt_account_user_id: `user-${n}__workspace-${n}`, chatgpt_user_id: `user-${n}`, chatgpt_plan_type: "pro" },
+  })}.sig`
+  const expiry = (days: number) => new Date(NOW + days * 86_400_000).toISOString()
+  let credits: Array<Record<string, unknown>>
+  let consumed: Array<Record<string, unknown>>
+  const seatQuota = async (app: App) => {
+    const quota = await (await app.fetch(new Request("http://localhost/v1/usage/quota/all"))).json() as QuotaBody
+    return quota.profiles.find(profile => profile.type === "chatgpt")!
+  }
+  const reset = (app: App, body: Record<string, unknown>) => app.fetch(new Request("http://localhost/v1/usage/quota/reset", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  }))
+  const rateLimited = (headers: Record<string, string>) =>
+    new Response(JSON.stringify({ detail: "usage limit" }), { status: 429, headers: { "content-type": "application/json", ...headers } })
+
+  beforeEach(() => {
+    resetCodexUsageCache()
+    credits = [
+      { id: "RateLimitResetCredit_late", status: "available", reset_type: "codex_rate_limits", granted_at: expiry(-1), expires_at: expiry(20), title: "Rate limit reset" },
+      { id: "RateLimitResetCredit_soon", status: "available", reset_type: "codex_rate_limits", granted_at: expiry(-1), expires_at: expiry(5), title: "Rate limit reset" },
+      { id: "RateLimitResetCredit_used", status: "redeemed", expires_at: expiry(9) },
+    ]
+    consumed = []
+    const available = () => credits.filter(credit => credit.status === "available")
+    wham = (url) => {
+      if (url.endsWith("/wham/usage")) {
+        return Response.json({
+          user_id: "user-0", account_id: "workspace-0", plan_type: "pro",
+          rate_limit: {
+            primary_window: { used_percent: consumed.length > 0 ? 0 : 40, limit_window_seconds: 18_000, reset_at: Math.floor(NOW / 1000) + 3600 },
+            secondary_window: { used_percent: consumed.length > 0 ? 0 : 20, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 86_400 },
+          },
+          credits: { has_credits: false, unlimited: false, overage_limit_reached: false, balance: "0" },
+          rate_limit_reset_credits: { available_count: available().length, applicable_available_count: consumed.length > 0 ? 0 : available().length },
+        })
+      }
+      if (url.endsWith("/wham/rate-limit-reset-credits")) return Response.json({ available_count: available().length, credits })
+      return undefined
+    }
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === `${WHAM_PREFIX}rate-limit-reset-credits/consume`) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        consumed.push({ ...body, authorization: new Headers(init?.headers).get("authorization") })
+        const credit = credits.find(entry => entry.id === body.credit_id)
+        if (credit) credit.status = "redeemed"
+        return Response.json({ code: "ok", credit: { id: body.credit_id, status: "redeemed" } })
+      }
+      return mockFetch(input, init)
+    }) as typeof fetch
+  })
+
+  it("lists an owned seat's credits, and a reset puts the benched seat back to work", async () => {
+    const storePath = join(dir, "chatgpt-accounts.json")
+    process.env.MERIDIAN_CHATGPT_STORE_PATH = storePath
+    writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [{
+      accountUserId: "user-0__workspace-0", accountId: "workspace-0", email: "seat0@example.test", refreshToken: "rt-0",
+      accessToken: jwt(0), expiresAt: NOW + 3_600_000, tokenRotatedAt: null, exchangeStartedAt: null,
+    }] }))
+    const { chatGptCreditGrantId } = await import("../proxy/chatgpt/resetCredits")
+    const soon = chatGptCreditGrantId("RateLimitResetCredit_soon")
+    const late = chatGptCreditGrantId("RateLimitResetCredit_late")
+    const proxy = await server("owned")
+    await proxy.chatGpt!.acquire()
+    try {
+      const before = await seatQuota(proxy.app)
+      expect(before.bankedResets).toMatchObject({ eligible: true, ineligibleReason: null, nextGrantId: soon, unreadableGrants: 0 })
+      expect(before.bankedResets!.grants.map(grant => [grant.id, grant.usableNow, grant.kind, grant.clears])).toEqual([
+        [soon, true, "full", ["five_hour", "seven_day"]],
+        [late, true, "full", ["five_hour", "seven_day"]],
+      ])
+      const listed = await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as { profiles: Array<{ id: string; resets?: { available: number; expiresAt: Array<number | null> | null } }> }
+      const listedSeat = listed.profiles.find(profile => profile.id === before.id)!
+      expect(listedSeat.resets).toEqual({ available: 2, expiresAt: before.bankedResets!.grants.map(grant => grant.expiresAt) })
+
+      // A weekly refusal benches the seat: the next turn is refused here, without reaching chatgpt.com.
+      respond = () => rateLimited(codexWindows([{ minutes: 10080, used: 100, resetInS: 3 * 86400 }]))
+      expect((await proxy.app.fetch(responses(LUNA))).status).toBe(429)
+      expect((await proxy.app.fetch(responses(LUNA))).status).toBe(429)
+      expect(upstreamCalls).toHaveLength(1)
+
+      const request = { profile: before.id, grantId: soon, requestId: "portal-reset-1" }
+      const answer = await reset(proxy.app, request)
+      expect(answer.status).toBe(200)
+      expect(await answer.json()).toEqual({ ...request, result: "reset", reason: null, resetsLeft: 1, cleared: ["five_hour", "seven_day"], weeklyResetsAt: null, cooldownUntil: null, replayed: false })
+      expect(consumed).toHaveLength(1)
+      expect(consumed[0]).toMatchObject({ credit_id: "RateLimitResetCredit_soon", authorization: `Bearer ${jwt(0)}` })
+
+      respond = () => completed()
+      expect((await proxy.app.fetch(responses(LUNA))).status).toBe(200)
+      expect(upstreamCalls).toHaveLength(2)
+
+      const after = await seatQuota(proxy.app)
+      expect(after.bankedResets).toMatchObject({ nextGrantId: late, grants: [{ id: late, usableNow: false }] })
+
+      const replay = await reset(proxy.app, request)
+      expect(await replay.json()).toMatchObject({ result: "reset", replayed: true })
+      const conflict = await reset(proxy.app, { ...request, grantId: late })
+      expect(conflict.status).toBe(409)
+      expect(await conflict.json()).toMatchObject({ code: "request_id_conflict" })
+      expect(consumed).toHaveLength(1)
+
+      const unknown = await reset(proxy.app, { ...request, profile: "nobody", requestId: "portal-reset-2" })
+      expect(unknown.status).toBe(404)
+      expect(await unknown.json()).toMatchObject({ code: "profile_not_found" })
+      expect(tokenCalls).toBe(0)
+    } finally {
+      proxy.chatGpt!.release()
+    }
+  })
+
+  it("lists a followed seat's credits as not redeemable here, and refuses to spend one", async () => {
+    writePool([account(0, { accessToken: jwt(0) })])
+    const { app } = await server("follow-external")
+    const seat = await seatQuota(app)
+    expect(seat.bankedResets).toMatchObject({ eligible: false, ineligibleReason: "external_owner" })
+    expect(seat.bankedResets!.grants).toHaveLength(2)
+    const answer = await reset(app, { profile: seat.id, grantId: seat.bankedResets!.grants[0]!.id, requestId: "portal-reset-1" })
+    expect(answer.status).toBe(400)
+    expect(await answer.json()).toMatchObject({ code: "not_owned" })
+    expect(consumed).toHaveLength(0)
+  })
+})

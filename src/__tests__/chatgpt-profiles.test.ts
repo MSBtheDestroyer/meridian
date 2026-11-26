@@ -304,7 +304,8 @@ describe("banked resets on the card", () => {
   })
 
   it("prefers the credit list's count and lists one expiry per reset, soonest first", () => {
-    const credits = [{ status: "available", expiresAt: NOW + 11 }, { status: "available", expiresAt: null }, { status: "available", expiresAt: NOW + 3 }]
+    const credit = (expiresAt: number | null) => ({ id: null, status: "available", expiresAt, grantedAt: null, resetType: null, title: null })
+    const credits = [credit(NOW + 11), credit(null), credit(NOW + 3)]
     expect(chatGptResetsView(resets({ availableCount: 1, listedCount: 3, credits }))).toEqual({ available: 3, expiresAt: [NOW + 3, NOW + 11, null] })
     expect(chatGptResetsView(resets({ listedCount: 2, credits }))).toEqual({ available: 2, expiresAt: [NOW + 3, NOW + 11] })
     expect(chatGptResetsView(resets({ listedCount: 2, credits: [credits[2]!] }))).toEqual({ available: 2, expiresAt: [NOW + 3, null] })
@@ -427,7 +428,10 @@ describe("list entries", () => {
       entry("user-a__ws-aaaaaa", {
         fetchedAt: NOW - 20_000,
         workspaceName: "Acme Workspace",
-        resetCredits: { availableCount: 1, applicableAvailableCount: 0, listedCount: 1, credits: [{ status: "available", expiresAt: NOW + 13 * 86_400_000 }], error: null },
+        resetCredits: {
+          availableCount: 1, applicableAvailableCount: 0, listedCount: 1, error: null,
+          credits: [{ id: "RateLimitResetCredit_a", status: "available", expiresAt: NOW + 13 * 86_400_000, grantedAt: NOW - 86_400_000, resetType: "codex_rate_limits", title: "Rate limit reset" }],
+        },
       }),
       entry("user-b__ws-bbbbbb", { error: "token_expired", failure: { reason: "token_expired", consecutiveFailures: 3, lastFailureAt: NOW - 5_000 } }),
       entry("user-c__ws-cccccc", { error: "unauthorized" }),

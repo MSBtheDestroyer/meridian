@@ -26,8 +26,9 @@ import { createCodexClientVersion } from './chatgpt/clientVersion'
 import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
 import { chatGptNameProblem, seatWindows, type ChatGptProfile } from './chatgpt/profiles'
 import { applyChatGptRemoval, applyChatGptRename } from './chatgpt/seatOps'
-import { currentCodexUsageEvidence, getCodexUsage } from './codex/service'
-import type { CodexUsageResponse } from './codex/types'
+import { createChatGptResetRedeemer } from './chatgpt/resetCredits'
+import { currentCodexUsageEvidence, forgetCodexUsage, getCodexUsage } from './codex/service'
+import type { CodexResetCredits, CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, isImageEndpoint, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
 import { createClaudeBackend } from './upstream/claude'
 import { providerForModel } from './upstream/provider'
@@ -73,7 +74,8 @@ import { AdmissionHold, parseDrainOptions, type AdmissionReservation } from "./a
 import { DrainBodyError, readDrainBody } from "./drainBody"
 import { isGenerationSubmission, onGenerationResponseSettled } from "./generationAdmission"
 import { closeServerWithGracePeriod, joinShutdownCleanup, ShutdownProgress, trackServerConnections, waitForShutdownIdle, withShutdownDeadline } from "./shutdown"
-import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage, peekSuccessfulOAuthUsage, clearOAuthUsageForProfile, quotaResetBody, redeemOAuthQuotaResetOnce } from "./oauthUsage"
+import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage, peekSuccessfulOAuthUsage, clearOAuthUsageForProfile, redeemOAuthQuotaResetOnce } from "./oauthUsage"
+import { quotaResetBody, type QuotaResetAttempt, type QuotaResetRequest, type QuotaResetResult } from "./quotaReset"
 import { isSameOriginRequest } from "../sameOrigin"
 import { resolveSdkWorkingDirectory } from "./cwd"
 import type { Context } from "hono"
@@ -10589,6 +10591,20 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return chatGptUsageRefresh
   }
 
+  // Once a reset credit's consume went out, the seat is read again so the next
+  // quota read and the answer's `resetsLeft` show the credit spent. A refresh
+  // already running may have read the seat before the consume, so it finishes
+  // first; then the seat's cached reading is dropped and read anew.
+  const rereadSeatAfterReset = async (seat: string): Promise<CodexResetCredits | null> => {
+    const startedAt = Date.now()
+    while (chatGptUsageRefresh) await chatGptUsageRefresh
+    forgetCodexUsage(seat)
+    await refreshChatGptUsage(true)
+    const entry = chatGptUsage?.entries.find(candidate => candidate.id === seat)
+    return entry && !entry.error && !entry.stale && entry.fetchedAt !== null && entry.fetchedAt >= startedAt ? entry.resetCredits : null
+  }
+  const chatGptResets = chatGptSource ? createChatGptResetRedeemer({ source: chatGptSource, reread: rereadSeatAfterReset }) : undefined
+
   // What /v1/models, /providers and the Fallback Model choices offer: the
   // backend's own model catalog (chatgpt/catalog.ts), read hourly off the
   // request path. Routing never consults it. It is read for the newest Codex
@@ -14163,6 +14179,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const profiles = getEffectiveProfiles(finalConfig.profiles)
     const profile = profiles.find(p => p.id === body.profile)
     const singleAccount = profiles.length === 0 && body.profile === "default"
+    const seat = profile || singleAccount ? undefined : chatGptProfiles?.resolve(body.profile)
+    if (seat) return redeemSeatReset(c, body, seat)
     if (!profile && !singleAccount) {
       return c.json({ code: "profile_not_found", error: "Profile not found" }, 404)
     }
@@ -14175,6 +14193,30 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       claudeConfigDir: resolved?.env.CLAUDE_CONFIG_DIR,
       store: resolved ? credentialStoreForProfile(resolved) : undefined,
     })
+    return quotaResetResponse(c, body, attempt, cleared => clearResetProfileHealth(body.profile, cleared))
+  })
+
+  // A ChatGPT seat's reset credit (chatgpt/resetCredits.ts), spent only with a
+  // sign-in this Meridian owns. The ledger is keyed by the seat's profile id,
+  // so a renamed seat's former id cannot run a second redemption beside it.
+  async function redeemSeatReset(c: Context, body: QuotaResetRequest, seat: ChatGptProfile): Promise<Response> {
+    if (!chatGptResets || chatGptSource?.mode !== "owned") {
+      return c.json({ code: "not_owned", error: "This Meridian does not own this ChatGPT seat's sign-in, so it does not redeem its resets" }, 400)
+    }
+    const attempt = await chatGptResets.redeemOnce({ ...body, profile: seat.id }, seat.seat)
+    return quotaResetResponse(c, body, attempt, cleared => {
+      chatGptBackend?.resetCleared(seat.seat)
+      clearResetProfileHealth(seat.id, cleared)
+    })
+  }
+
+  /** The reset route's answer to an attempt; `onReset` clears local state for a fresh confirmed reset only. */
+  function quotaResetResponse(
+    c: Context,
+    body: QuotaResetRequest,
+    attempt: QuotaResetAttempt<QuotaResetResult>,
+    onReset: (cleared: readonly string[]) => void,
+  ): Response {
     if (attempt.kind === "in_progress") {
       return c.json({ code: "reset_in_progress", error: "Another reset for this profile is still in progress", indeterminate: false }, 409)
     }
@@ -14185,9 +14227,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     if (!result.ok) {
       return c.json({ code: result.code, error: result.message, indeterminate: result.indeterminate, replayed }, result.status)
     }
-    if (!replayed && result.outcome.result === "reset") clearResetProfileHealth(body.profile, result.outcome.cleared)
+    if (!replayed && result.outcome.result === "reset") onReset(result.outcome.cleared)
     return c.json({ ...body, ...result.outcome, replayed })
-  })
+  }
 
   // --- Subscription Quota ---
   // Returns the most recent SDK-reported quota state for the Claude Max

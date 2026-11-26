@@ -136,7 +136,10 @@ Record what Meridian did and show it to the operator:
   used up) for two minutes, so the poll that follows does not wipe it. The
   route clears the profile's cached usage after a reset, so the next read of
   `/v1/usage/quota/all` (the page's refresh, or Vibeterm's re-check) shows
-  the new state.
+  the new state. A ChatGPT seat's entry carries `bankedResets` too
+  (chatgpt-backend), for supervisors such as Portal; these pages keep showing
+  a seat's resets from `/profiles/list` `resets` and offer no redeem button
+  for a seat.
 
 - **Refresh is one click per card.** Every profile card and ChatGPT seat on
   `/` and `/profiles` carries a refresh icon that posts

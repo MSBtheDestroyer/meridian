@@ -34,6 +34,7 @@ import { followedUsageSnapshot } from "./followUsage"
 import { bundledClaudeCodeVersion } from "./models"
 import { normalizeClaudeResets, type ClaudeResets } from "./claudeResets"
 import { parseResetGrantMetadata, type OAuthBankedResetGrant, type OAuthBankedResets } from "./oauthResetGrants"
+import { QUOTA_RESET_RESULTS, QuotaResetLedger, type QuotaResetAttempt, type QuotaResetFailure, type QuotaResetRequest, type QuotaResetResult } from "./quotaReset"
 
 export type { OAuthBankedResetGrant, OAuthBankedResets } from "./oauthResetGrants"
 
@@ -560,17 +561,10 @@ export interface FetchOAuthUsageOpts {
   refreshImpl?: RefreshFn
 }
 
-export const quotaResetBody = z.object({
-  profile: z.string().min(1),
-  grantId: z.string().regex(/^[a-z0-9_-]{1,40}$/),
-  requestId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
-}).strict()
-
-export type OAuthQuotaResetRequest = z.infer<typeof quotaResetBody>
 const quotaResetIdentity = z.object({ organization: z.object({ uuid: z.string().uuid() }) })
 
 const quotaResetOutcome = z.object({
-  result: z.enum(["reset", "already_used", "not_limited", "cooldown", "ineligible", "unavailable"]),
+  result: z.enum(QUOTA_RESET_RESULTS),
   reason: z.unknown().optional(),
   resets_left: z.unknown().optional(),
   cleared: z.unknown().transform(raw => Array.isArray(raw) ? raw.filter((entry: unknown): entry is string => typeof entry === "string") : []).default([]),
@@ -581,27 +575,9 @@ const quotaResetOutcome = z.object({
 export type OAuthResetFailureCode = "no_token" | "no_organization"
   | "upstream_auth" | "rate_limited" | "upstream_error" | "invalid_response" | "reset_indeterminate"
 
-type OAuthResetFailure = {
-  ok: false
-  status: 429 | 502 | 503
-  code: OAuthResetFailureCode
-  message: string
-  indeterminate: boolean
-  /** The mutation POST was handed to fetch; its outcome is then tied to the request ID. */
-  dispatched: boolean
-}
+type OAuthResetFailure = QuotaResetFailure<OAuthResetFailureCode>
 
-export type OAuthResetResult = OAuthResetFailure | {
-  ok: true
-  outcome: {
-    result: z.infer<typeof quotaResetOutcome>["result"]
-    reason: string | null
-    resetsLeft: number | null
-    cleared: string[]
-    weeklyResetsAt: number | null
-    cooldownUntil: number | null
-  }
-}
+export type OAuthResetResult = QuotaResetResult<OAuthResetFailureCode>
 
 function invalidateResetUsage(profileId?: string | null): void {
   clearOAuthUsageForProfile(profileId)
@@ -624,7 +600,7 @@ function httpFailure(status: number): OAuthResetFailure {
 
 /** One explicit mutation; request IDs are caller-owned, not a promise of provider deduplication. */
 export async function redeemOAuthQuotaReset(
-  input: OAuthQuotaResetRequest,
+  input: QuotaResetRequest,
   opts?: Pick<FetchOAuthUsageOpts, "store" | "profileId" | "claudeConfigDir" | "fetchImpl" | "refreshImpl">,
 ): Promise<OAuthResetResult> {
   const fetchImpl = opts?.fetchImpl ?? globalThis.fetch
@@ -694,64 +670,18 @@ export async function redeemOAuthQuotaReset(
   }
 }
 
-const RESET_LEDGER_MAX_ENTRIES = 256
-const RESET_LEDGER_TTL_MS = 15 * 60_000
-/** Redemption currently running per ledger scope (profile). */
-const resetInflightByScope = new Map<string, { requestId: string; grantId: string }>()
-/** Settled, dispatched outcomes keyed by scope + request ID, oldest first. */
-const resetLedger = new Map<string, { grantId: string; result: OAuthResetResult; settledAt: number }>()
-
-function resetLedgerKey(scope: string, requestId: string): string {
-  return `${scope}\u0000${requestId}`
-}
-
-function pruneResetLedger(now: number): void {
-  for (const [key, entry] of resetLedger) {
-    if (now - entry.settledAt < RESET_LEDGER_TTL_MS && resetLedger.size <= RESET_LEDGER_MAX_ENTRIES) break
-    resetLedger.delete(key)
-  }
-}
-
-export type OAuthResetAttempt =
-  | { kind: "settled"; result: OAuthResetResult; replayed: boolean }
-  | { kind: "in_progress" }
-  | { kind: "request_id_conflict" }
+const resetLedger = new QuotaResetLedger<OAuthResetResult>()
 
 /**
  * The route's entry point: at most one redemption per profile at a time, and a
  * request ID whose mutation was dispatched replays its remembered outcome
- * instead of reaching Anthropic again. See profiles-routing.spec.md.
+ * instead of reaching Anthropic again (quotaReset.ts).
  */
 export async function redeemOAuthQuotaResetOnce(
-  input: OAuthQuotaResetRequest,
+  input: QuotaResetRequest,
   opts?: Parameters<typeof redeemOAuthQuotaReset>[1],
-): Promise<OAuthResetAttempt> {
-  const scope = input.profile
-  const key = resetLedgerKey(scope, input.requestId)
-  pruneResetLedger(Date.now())
-  const settled = resetLedger.get(key)
-  if (settled) {
-    return settled.grantId === input.grantId
-      ? { kind: "settled", result: settled.result, replayed: true }
-      : { kind: "request_id_conflict" }
-  }
-  const running = resetInflightByScope.get(scope)
-  if (running) {
-    return running.requestId === input.requestId && running.grantId !== input.grantId
-      ? { kind: "request_id_conflict" }
-      : { kind: "in_progress" }
-  }
-  resetInflightByScope.set(scope, { requestId: input.requestId, grantId: input.grantId })
-  try {
-    const result = await redeemOAuthQuotaReset(input, opts)
-    if (result.ok || result.dispatched) {
-      resetLedger.set(key, { grantId: input.grantId, result, settledAt: Date.now() })
-      pruneResetLedger(Date.now())
-    }
-    return { kind: "settled", result, replayed: false }
-  } finally {
-    resetInflightByScope.delete(scope)
-  }
+): Promise<QuotaResetAttempt<OAuthResetResult>> {
+  return resetLedger.redeemOnce(input, () => redeemOAuthQuotaReset(input, opts))
 }
 
 /**
@@ -1019,6 +949,5 @@ export function resetOAuthUsageCache(): void {
   failureByProfile.clear()
   rateLimitRunByProfile.clear()
   lastRateLimitRefreshAtByProfile.clear()
-  resetInflightByScope.clear()
   resetLedger.clear()
 }

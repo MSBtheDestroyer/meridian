@@ -218,6 +218,12 @@ export interface ChatGptBackend<Ctx> extends UpstreamBackend<Ctx> {
   reserveHold(seat: string): UsageReserveState | null
   /** Drop everything learned about a removed seat: observed windows, credits, refusals, bench. */
   forgetSeat(seat: string): void
+  /**
+   * A reset credit was confirmed spent on the seat: drop the windows its last
+   * response reported and a bench for spent quota, which both predate it. A
+   * bench for a refused token or a provider fault stays.
+   */
+  resetCleared(seat: string): void
 }
 
 /** How long a spent seat sits out when the refusal named no reset. */
@@ -368,6 +374,13 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       for (const map of [reserveRefusedUntil, modelRefusedUntil]) {
         for (const key of [...map.keys()]) if (key.startsWith(`${seat}\u0000`)) map.delete(key)
       }
+    },
+
+    resetCleared(seat) {
+      observed.delete(seat)
+      lastServedOnCredits.delete(seat)
+      const benched = exhaustion.snapshot().find(mark => mark.id === seat)
+      if (benched && (benched.reason === "rate_limited" || benched.reason === "quota_spent")) exhaustion.forget(seat)
     },
 
     seatCreditState(seat) {

@@ -38,6 +38,7 @@ import {
   type ObservedRateLimit,
 } from "./profiles"
 import { chatGptAuthLifecycleKey } from "./refresh"
+import { chatGptBankedResets } from "./resetCredits"
 import type { CreditBurn } from "./creditRates"
 import type { ChatGptCreditsPolicy, ChatGptFreeSeatOrder } from "./features"
 import type { ChatGptCredentialSource } from "./source"
@@ -437,6 +438,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           windowsReported: reading.windowsReported,
           windowSource: reading.source,
           extraUsage: null,
+          bankedResets: chatGptBankedResets(usage?.resetCredits, reading.windows, deps.source.mode === "owned"),
           credits: usage?.credits ?? null,
           creditsPolicy: policy?.policy ?? null,
           creditsPolicySource: policy?.source ?? null,

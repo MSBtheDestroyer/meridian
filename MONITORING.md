@@ -63,6 +63,20 @@ no grants. Read reset data with the profile's `fetchedAt`, `stale` and `failure`
 fields, just like its usage windows. This endpoint only lists grants; it
 does not redeem them.
 
+ChatGPT seats list their banked rate-limit reset credits in the same shape.
+Each credit is one grant: `resetsLeft: 1`, `kind: "full"`, `clears` the
+seat's `five_hour` and `seven_day` windows as the seat reports them, and
+`percentUsed` their current reading. `id` is `credit_` plus 24 hex characters,
+a stable alias of the vendor's credit id. ChatGPT states how many credits
+apply right now, not which, so `usableNow` is the same for all of a seat's
+credits: `true` while any applies (normally only while the seat is limited),
+`null` when the vendor did not say. `nextGrantId` is the credit expiring
+soonest. A seat's entry also has `unreadableGrants`: credits it holds that
+cannot be listed, for example when the credit list could not be read but the
+usage reading states a count. A seat whose sign-in belongs to
+oc-codex-multi-auth (`follow-external`) lists its credits with
+`eligible: false` and `ineligibleReason: "external_owner"`.
+
 Subscription limits, context occupancy, and API-equivalent cost are different measures. A cache hit does not mean zero subscription usage, and a large context window does not mean that much quota remains.
 
 ### Redeeming a banked reset
@@ -134,6 +148,23 @@ uncertain outcomes, but server-side deduplication is not guaranteed.
 
 Every Claude OAuth usage, identity and reset request identifies itself as the
 Claude Code version installed with Meridian.
+
+A ChatGPT seat's credit is redeemed with the same request, naming the seat's
+profile ID and one of its grant IDs. Only a seat whose sign-in Meridian owns
+can redeem; a followed seat answers HTTP 400 `not_owned`. Before spending
+anything, Meridian reads the seat's usage and credit list with the seat's own
+token. It sends nothing when the read does not confirm the seat's account
+(HTTP 502 `identity_mismatch`), when the credit is no longer available
+(`result: "unavailable"`, `reason: "credit_not_available"`), or when ChatGPT
+says no credit applies right now (`result: "not_limited"`). A refusal from
+ChatGPT spends nothing and answers `result: "unavailable"` with ChatGPT's code
+as `reason` when it gave one. A confirmed reset answers `result: "reset"`,
+`cleared` the windows the credit clears, and `resetsLeft` from a fresh read of
+the seat (`null` if that read did not land). `weeklyResetsAt` and
+`cooldownUntil` are always `null` for a seat. Single-flight, replay,
+`request_id_conflict` and `indeterminate` behave exactly as for Claude; the
+request sent to ChatGPT carries an idempotency key derived from the seat,
+credit and `requestId`.
 
 
 ## Reading Token and Cache Metrics

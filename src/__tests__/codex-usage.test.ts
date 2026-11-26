@@ -319,6 +319,25 @@ describe("fetchCodexAccountUsage — reset credits", () => {
     expect(result.usage?.resetCredits?.listedCount).toBe(3)
   })
 
+  test("keeps each credit's id, grant time, type and a display-safe title", async () => {
+    const impl = recordingFetch((url) =>
+      url.includes("/wham/usage")
+        ? jsonResponse(usagePayload())
+        : jsonResponse({
+          available_count: 2,
+          credits: [
+            { id: " RateLimitResetCredit_1 ", status: "available", reset_type: "codex_rate_limits", granted_at: "2026-11-01T00:00:00Z", expires_at: "2026-12-01T00:00:00Z", title: "Reset\u202e\u0007  ok" },
+            { id: "has space", status: "available", reset_type: "not a slug", granted_at: "soon", title: 7 },
+          ],
+        })).impl
+
+    const result = await fetchCodexAccountUsage(credentials(), { fetchImpl: impl })
+    expect(result.usage?.resetCredits?.credits).toEqual([
+      { id: "RateLimitResetCredit_1", status: "available", expiresAt: Date.parse("2026-12-01T00:00:00Z"), grantedAt: Date.parse("2026-11-01T00:00:00Z"), resetType: "codex_rate_limits", title: "Reset ok" },
+      { id: null, status: "available", expiresAt: null, grantedAt: null, resetType: null, title: null },
+    ])
+  })
+
   test("counts the credits as the list states them, like codex-reset status", async () => {
     const listed = (body: unknown) => recordingFetch((url) =>
       url.includes("/wham/usage") ? jsonResponse(usagePayload()) : jsonResponse(body)).impl
